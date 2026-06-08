@@ -84,7 +84,7 @@ describe("buildHandoffDocument", () => {
     strandedAgentName: "claude-coder",
     strandedAdapterType: "claude_local",
     fallbackAdapterType: "codex_local",
-    sourceIssueLink: "[VANA-1](/VANA/issues/VANA-1)",
+    sourceIssueLink: "[source-issue](/issues/source-issue)",
     runLink: "[run](/VANA/agents/a/runs/r)",
     redact: (s: string) => s,
   };

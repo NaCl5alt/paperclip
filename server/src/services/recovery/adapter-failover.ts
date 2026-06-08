@@ -11,8 +11,8 @@ export const RECOVERY_FALLBACK_AGENT_CONFIG_KEY = "recoveryFallbackAgentId";
 
 /**
  * Adapter type that a failover routes work to. Today this is fixed to
- * `codex_local` per the CEO-approved VANA-462 plan; it also doubles as the
- * loop-guard marker (a run already on this adapter must not failover again).
+ * `codex_local` per the approved recovery-failover design; it also doubles as
+ * the loop-guard marker (a run already on this adapter must not failover again).
  */
 export const FAILOVER_FALLBACK_ADAPTER_TYPE = "codex_local" as const;
 

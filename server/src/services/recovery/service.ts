@@ -1875,7 +1875,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   /**
-   * Adapter-aware failover plan (VANA-471): when the stranded run failed on a
+   * Adapter-aware failover plan: when the stranded run failed on a
    * transient upstream condition and its agent has `recoveryFallbackAgentId`
    * configured, route recovery ownership to the codex fallback so work
    * continues across the usage/rate-limit outage. Returns null to fall through
