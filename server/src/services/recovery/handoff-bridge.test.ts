@@ -43,13 +43,15 @@ describe("parseClaudeSessionTranscript", () => {
   });
 });
 
+const identity = (s: string) => s;
+
 describe("renderHandoffMarkdown", () => {
   it("keeps recent turns full and summarizes older turns", () => {
     const turns = Array.from({ length: 10 }, (_, i) => ({
       role: "user" as const,
       text: `turn ${i}`,
     }));
-    const body = renderHandoffMarkdown({ turns, header: "# H", recentTurns: 3 });
+    const body = renderHandoffMarkdown({ turns, header: "# H", redact: identity, recentTurns: 3 });
     expect(body).toContain("7 earlier turn(s) omitted");
     expect(body).toContain("turn 9");
     expect(body).toContain("turn 7");
@@ -59,10 +61,21 @@ describe("renderHandoffMarkdown", () => {
   it("enforces the byte budget by dropping oldest full turns", () => {
     const big = "x".repeat(50_000);
     const turns = Array.from({ length: 20 }, (_, i) => ({ role: "user" as const, text: `${i} ${big}` }));
-    const body = renderHandoffMarkdown({ turns, header: "# H", recentTurns: 20, maxBytes: 120_000 });
+    const body = renderHandoffMarkdown({ turns, header: "# H", redact: identity, recentTurns: 20, maxBytes: 120_000 });
     expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(120_000);
     // Most recent turn must survive.
     expect(body).toContain("19 ");
+  });
+
+  it("applies the injected redactor to the assembled body", () => {
+    const turns = [{ role: "user" as const, text: "token=abc123" }];
+    const body = renderHandoffMarkdown({
+      turns,
+      header: "# H",
+      redact: (s) => s.replace("abc123", "***"),
+    });
+    expect(body).toContain("token=***");
+    expect(body).not.toContain("abc123");
   });
 });
 
@@ -73,6 +86,7 @@ describe("buildHandoffDocument", () => {
     fallbackAdapterType: "codex_local",
     sourceIssueLink: "[VANA-1](/VANA/issues/VANA-1)",
     runLink: "[run](/VANA/agents/a/runs/r)",
+    redact: (s: string) => s,
   };
 
   it("captures transcript when resolvable", async () => {

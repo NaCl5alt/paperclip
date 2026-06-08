@@ -1946,6 +1946,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         fallbackAdapterType: input.plan.fallbackAdapterType,
         sourceIssueLink: input.sourceIssueLink,
         runLink: input.runLink,
+        redact: redactSensitiveText,
       });
       await documentService(db).upsertIssueDocument({
         issueId: input.recoveryIssueId,

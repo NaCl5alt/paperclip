@@ -1,7 +1,26 @@
 import { readdir, readFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
-import { claudeConfigDir } from "@paperclipai/adapter-claude-local/server";
-import { redactSensitiveText } from "../../redaction.js";
+
+/**
+ * Redactor applied to handoff bodies before they are persisted. Injected by the
+ * caller (the recovery service passes `redactSensitiveText`) rather than
+ * imported here: that keeps this module's graph free of the heavy
+ * `@paperclipai/adapter-utils` barrel and makes the unit tests hermetic.
+ */
+export type Redactor = (input: string) => string;
+
+/**
+ * Resolve the Claude Code config dir. Mirrors `claudeConfigDir()` in
+ * `@paperclipai/adapter-claude-local/server` (quota.ts) — inlined so the
+ * recovery hot path does not pull the adapter's heavy execute/pty module graph
+ * just to read a directory. Keep in sync with that source of truth.
+ */
+function claudeConfigDir(): string {
+  const fromEnv = process.env.CLAUDE_CONFIG_DIR;
+  if (typeof fromEnv === "string" && fromEnv.trim().length > 0) return fromEnv.trim();
+  return path.join(os.homedir(), ".claude");
+}
 
 /**
  * Document key for the cross-adapter context handoff attached to a failover
@@ -127,6 +146,7 @@ function renderTurn(turn: TranscriptTurn): string {
 export function renderHandoffMarkdown(input: {
   turns: TranscriptTurn[];
   header: string;
+  redact: Redactor;
   recentTurns?: number;
   maxBytes?: number;
 }): string {
@@ -143,7 +163,7 @@ export function renderHandoffMarkdown(input: {
     }
     sections.push("## Recent transcript\n");
     for (const turn of recent) sections.push(renderTurn(turn));
-    return redactSensitiveText(sections.join("\n\n"));
+    return input.redact(sections.join("\n\n"));
   };
 
   let body = assemble();
@@ -210,6 +230,7 @@ export async function buildHandoffDocument(input: {
   fallbackAdapterType: string;
   sourceIssueLink: string;
   runLink: string;
+  redact: Redactor;
   recentTurns?: number;
   maxBytes?: number;
   readTranscript?: (sessionId: string) => Promise<string | null>;
@@ -257,6 +278,7 @@ export async function buildHandoffDocument(input: {
   const body = renderHandoffMarkdown({
     turns,
     header: guidance,
+    redact: input.redact,
     recentTurns: input.recentTurns,
     maxBytes: input.maxBytes,
   });
