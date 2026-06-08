@@ -18,6 +18,19 @@ describe("recovery model profile policy", () => {
     expect(recoveryAssigneeAdapterOverrides("status_only")).toEqual({ modelProfile: "cheap" });
   });
 
+  it("supports adapter-aware failover overrides (normal model + adapter type)", () => {
+    // Failover recovery does deliverable work on the fallback adapter: no cheap
+    // pin, explicit adapter override.
+    expect(recoveryAssigneeAdapterOverrides("normal_model", { adapterType: "codex_local" })).toEqual({
+      adapterType: "codex_local",
+    });
+    expect(recoveryAssigneeAdapterOverrides("normal_model")).toEqual({});
+    // Blank adapter types are ignored.
+    expect(recoveryAssigneeAdapterOverrides("status_only", { adapterType: "  " })).toEqual({
+      modelProfile: "cheap",
+    });
+  });
+
   it("scrubs inherited cheap hints from normal model source-work retries", () => {
     expect(withRecoveryModelProfileHint({
       issueId: "issue-1",

@@ -60,6 +60,26 @@ export function withRecoveryModelProfileHint<T extends Record<string, unknown>>(
   };
 }
 
-export function recoveryAssigneeAdapterOverrides(_workClass: Extract<RecoveryModelProfileWorkClass, "status_only">) {
-  return { modelProfile: RECOVERY_MODEL_PROFILE_KEY };
+/**
+ * Build assignee adapter overrides for a recovery issue.
+ *
+ * - `status_only` pins the cheap status model (legacy default).
+ * - `normal_model` allows deliverable work (no cheap pin) — used by
+ *   adapter-aware failover so the codex fallback owner can continue the work.
+ * - `adapterType` forces the recovery run onto a specific adapter (e.g.
+ *   `codex_local` for failover), independent of model profile.
+ */
+export function recoveryAssigneeAdapterOverrides(
+  workClass: RecoveryModelProfileWorkClass,
+  options?: { adapterType?: string | null },
+): Record<string, unknown> {
+  const overrides: Record<string, unknown> = {};
+  if (workClass === "status_only") {
+    overrides.modelProfile = RECOVERY_MODEL_PROFILE_KEY;
+  }
+  const adapterType = options?.adapterType;
+  if (typeof adapterType === "string" && adapterType.trim().length > 0) {
+    overrides.adapterType = adapterType.trim();
+  }
+  return overrides;
 }

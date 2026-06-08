@@ -36,6 +36,7 @@ import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { issueService } from "../issues.js";
+import { documentService } from "../documents.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
@@ -59,6 +60,16 @@ import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
+import {
+  decideRecoveryFailover,
+  isTransientUpstreamFailure,
+  resolveRecoveryFallbackAgentId,
+} from "./adapter-failover.js";
+import {
+  HANDOFF_DOCUMENT_KEY,
+  HANDOFF_DOCUMENT_TITLE,
+  buildHandoffDocument,
+} from "./handoff-bridge.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
@@ -98,7 +109,16 @@ type RecoveryWakeup = (
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
-  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState"
+  | "id"
+  | "agentId"
+  | "status"
+  | "error"
+  | "errorCode"
+  | "contextSnapshot"
+  | "livenessState"
+  | "resultJson"
+  | "sessionIdAfter"
+  | "sessionIdBefore"
 > | null;
 type SuccessfulLatestIssueRun = NonNullable<LatestIssueRun> & { status: "succeeded" };
 
@@ -425,6 +445,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         errorCode: heartbeatRuns.errorCode,
         contextSnapshot: heartbeatRuns.contextSnapshot,
         livenessState: heartbeatRuns.livenessState,
+        resultJson: heartbeatRuns.resultJson,
+        sessionIdAfter: heartbeatRuns.sessionIdAfter,
+        sessionIdBefore: heartbeatRuns.sessionIdBefore,
       })
       .from(heartbeatRuns)
       .where(
@@ -1851,6 +1874,99 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ].join("\n");
   }
 
+  /**
+   * Adapter-aware failover plan: when the stranded run failed on a
+   * transient upstream condition and its agent has `recoveryFallbackAgentId`
+   * configured, route recovery ownership to the codex fallback so work
+   * continues across the usage/rate-limit outage. Returns null to fall through
+   * to the legacy manager/creator/executive owner selection.
+   */
+  async function resolveFailoverRecoveryPlan(
+    issue: typeof issues.$inferSelect,
+    latestRun: LatestIssueRun,
+  ): Promise<{
+    ownerAgentId: string;
+    fallbackAdapterType: string;
+    strandedAgentName: string;
+    strandedAdapterType: string;
+    sessionId: string | null;
+  } | null> {
+    if (!latestRun?.agentId || !isTransientUpstreamFailure(latestRun)) return null;
+    const strandedAgent = await getAgent(latestRun.agentId);
+    const fallbackId = resolveRecoveryFallbackAgentId(strandedAgent);
+    if (!fallbackId) return null;
+
+    const fallbackAgent = await getAgent(fallbackId);
+    let fallbackInvokable = false;
+    if (fallbackAgent && strandedAgent && fallbackAgent.companyId === strandedAgent.companyId) {
+      const budgetBlock = await budgets.getInvocationBlock(fallbackAgent.companyId, fallbackAgent.id, {
+        issueId: issue.id,
+        projectId: issue.projectId,
+      });
+      fallbackInvokable = isAgentInvokable(fallbackAgent) && !budgetBlock;
+    }
+
+    const decision = decideRecoveryFailover({
+      transient: true,
+      strandedAgent,
+      fallbackAgent,
+      fallbackAgentInvokable: fallbackInvokable,
+    });
+    if (!decision.failover) {
+      if (decision.reason === "loop_guard") {
+        logger.warn(
+          { issueId: issue.id, strandedAgentId: strandedAgent?.id, runId: latestRun.id },
+          "recovery failover suppressed by codex→codex loop guard; escalating via management line",
+        );
+      }
+      return null;
+    }
+
+    return {
+      ownerAgentId: decision.fallbackAgentId,
+      fallbackAdapterType: decision.fallbackAdapterType,
+      strandedAgentName: strandedAgent?.name ?? "unknown",
+      strandedAdapterType: strandedAgent?.adapterType ?? "unknown",
+      sessionId: latestRun.sessionIdAfter ?? latestRun.sessionIdBefore ?? null,
+    };
+  }
+
+  async function attachFailoverHandoffDocument(input: {
+    recoveryIssueId: string;
+    ownerAgentId: string;
+    plan: NonNullable<Awaited<ReturnType<typeof resolveFailoverRecoveryPlan>>>;
+    sourceIssueLink: string;
+    runLink: string;
+  }) {
+    try {
+      const handoff = await buildHandoffDocument({
+        sessionId: input.plan.sessionId,
+        strandedAgentName: input.plan.strandedAgentName,
+        strandedAdapterType: input.plan.strandedAdapterType,
+        fallbackAdapterType: input.plan.fallbackAdapterType,
+        sourceIssueLink: input.sourceIssueLink,
+        runLink: input.runLink,
+        redact: redactSensitiveText,
+      });
+      await documentService(db).upsertIssueDocument({
+        issueId: input.recoveryIssueId,
+        key: HANDOFF_DOCUMENT_KEY,
+        title: HANDOFF_DOCUMENT_TITLE,
+        format: "markdown",
+        body: handoff.body,
+        baseRevisionId: null,
+        changeSummary: `Failover context handoff (${handoff.note})`,
+        createdByAgentId: input.ownerAgentId,
+      });
+    } catch (error) {
+      // Never let handoff capture failure block the failover recovery itself.
+      logger.warn(
+        { issueId: input.recoveryIssueId, error: error instanceof Error ? error.message : String(error) },
+        "failed to attach failover handoff document",
+      );
+    }
+  }
+
   async function ensureStrandedIssueRecoveryIssue(input: {
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
@@ -1863,34 +1979,59 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const existing = await findOpenStrandedIssueRecoveryIssue(input.issue.companyId, input.issue.id);
     if (existing) return existing;
 
-    const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
+    // Failover applies only to the genuine stranded-run cause, not the
+    // successful-run missing-disposition handoff (which is not an adapter crash).
+    const failoverPlan = (input.recoveryCause ?? "stranded_assigned_issue") === SUCCESSFUL_RUN_MISSING_STATE_REASON
+      ? null
+      : await resolveFailoverRecoveryPlan(input.issue, input.latestRun);
+    const ownerAgentId = failoverPlan?.ownerAgentId
+      ?? await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
     if (!ownerAgentId) return null;
+
+    const assigneeAdapterOverrides = failoverPlan
+      ? recoveryAssigneeAdapterOverrides("normal_model", { adapterType: failoverPlan.fallbackAdapterType })
+      : recoveryAssigneeAdapterOverrides("status_only");
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
     const sourceAssignee = input.issue.assigneeAgentId ? await getAgent(input.issue.assigneeAgentId) : null;
     const recoveryCause = input.recoveryCause ?? "stranded_assigned_issue";
+    const sourceIssueLink = issueUiLink({ identifier: input.issue.identifier, id: input.issue.id }, prefix);
+    const runLink = input.latestRun
+      ? runUiLink({ id: input.latestRun.id, agentId: input.latestRun.agentId }, prefix)
+      : "none";
+    const baseDescription = buildStrandedIssueRecoveryDescription({
+      issue: input.issue,
+      latestRun: input.latestRun,
+      previousStatus: input.previousStatus,
+      prefix,
+      recoveryCause,
+      successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
+      sourceAssignee,
+    });
+    const description = failoverPlan
+      ? [
+          baseDescription,
+          "",
+          "## Adapter-aware failover",
+          "",
+          `- The stopped run failed on a transient upstream usage/rate-limit condition and was failed over from \`${failoverPlan.strandedAdapterType}\` to \`${failoverPlan.fallbackAdapterType}\`.`,
+          `- **Read the \`${HANDOFF_DOCUMENT_KEY}\` document attached to this recovery issue first** (Documents tab) to reconstruct the prior conversation context, then continue the work.`,
+        ].join("\n")
+      : baseDescription;
     let recovery: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
       recovery = await issuesSvc.create(input.issue.companyId, {
         title: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
           ? `Recover missing next step ${input.issue.identifier ?? input.issue.title}`
           : `Recover stalled issue ${input.issue.identifier ?? input.issue.title}`,
-        description: buildStrandedIssueRecoveryDescription({
-          issue: input.issue,
-          latestRun: input.latestRun,
-          previousStatus: input.previousStatus,
-          prefix,
-          recoveryCause,
-          successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
-          sourceAssignee,
-        }),
+        description,
         status: "todo",
         priority: input.issue.priority,
         parentId: input.issue.id,
         projectId: input.issue.projectId,
         goalId: input.issue.goalId,
         assigneeAgentId: ownerAgentId,
-        assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
+        assigneeAdapterOverrides,
         originKind: STRANDED_ISSUE_RECOVERY_ORIGIN_KIND,
         originId: input.issue.id,
         originRunId: input.latestRun?.id ?? null,
@@ -1911,19 +2052,40 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       return raced;
     }
 
+    if (failoverPlan) {
+      await attachFailoverHandoffDocument({
+        recoveryIssueId: recovery.id,
+        ownerAgentId,
+        plan: failoverPlan,
+        sourceIssueLink,
+        runLink,
+      });
+    }
+
+    // Failover recovery performs deliverable work on the fallback adapter, so
+    // wake with the normal model (not the cheap status-only profile) and point
+    // the codex owner at the handoff document.
+    const failoverWakeFields = failoverPlan
+      ? { failover: true, handoffDocumentKey: HANDOFF_DOCUMENT_KEY }
+      : {};
+    const applyWakeHint = <T extends Record<string, unknown>>(obj: T) =>
+      failoverPlan
+        ? withRecoveryModelProfileHint(obj, "normal_model")
+        : withRecoveryModelProfileHint(obj, "status_only");
     await deps.enqueueWakeup(ownerAgentId, {
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
-      payload: withRecoveryModelProfileHint({
+      payload: applyWakeHint({
         issueId: recovery.id,
         sourceIssueId: input.issue.id,
         strandedRunId: input.latestRun?.id ?? null,
         recoveryCause,
-      }, "status_only"),
+        ...failoverWakeFields,
+      }),
       requestedByActorType: "system",
       requestedByActorId: null,
-      contextSnapshot: withRecoveryModelProfileHint({
+      contextSnapshot: applyWakeHint({
         issueId: recovery.id,
         taskId: recovery.id,
         wakeReason: "issue_assigned",
@@ -1931,7 +2093,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         sourceIssueId: input.issue.id,
         strandedRunId: input.latestRun?.id ?? null,
         recoveryCause,
-      }, "status_only"),
+        ...failoverWakeFields,
+      }),
     });
 
     return recovery;
