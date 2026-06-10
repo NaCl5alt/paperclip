@@ -645,6 +645,41 @@ describe("renderPaperclipWakePrompt", () => {
     expect(prompt).toContain("named unblock owner/action");
   });
 
+  it("renders the resolved interaction outcome and reason with reject guidance", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "issue_commented",
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-227",
+        title: "Confirm launch",
+        status: "in_progress",
+      },
+      interactionKind: "request_confirmation",
+      interactionStatus: "rejected",
+      interactionOutcome: "rejected",
+      interactionReason: "Hold off — the staging numbers regressed.",
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      comments: [],
+      fallbackFetchNeeded: false,
+    });
+
+    expect(prompt).toContain("- interaction outcome: rejected");
+    expect(prompt).toContain("- interaction reason: Hold off — the staging numbers regressed.");
+    expect(prompt).toContain("the board declined your request");
+  });
+
+  it("omits interaction guidance when there is no outcome or reason", () => {
+    const prompt = renderPaperclipWakePrompt({
+      reason: "issue_assigned",
+      issue: { id: "issue-1", identifier: "PAP-1", title: "Work", status: "in_progress" },
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      comments: [],
+      fallbackFetchNeeded: false,
+    });
+    expect(prompt).not.toContain("- interaction outcome:");
+    expect(prompt).not.toContain("- interaction reason:");
+  });
+
   it("preserves Chinese, Japanese, and Hindi issue and comment text in scoped wake prompts", () => {
     const title = "验证中文任务";
     const commentBody = [
