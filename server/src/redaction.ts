@@ -9,8 +9,11 @@ const COMMAND_PAYLOAD_KEY_RE =
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
 const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
 const CLI_SECRET_FLAG_RE = new RegExp(String.raw`^-{1,2}${SECRET_FIELD_NAME_PATTERN}$`, "i");
+// The value class excludes `\\` so a secret value abutting an escaped quote
+// (`\"`) inside escaped JSON does not swallow the backslash and corrupt the
+// JSON; the dedicated ESCAPED_JSON regex below handles the `\"`-delimited form.
 const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
-  String.raw`((?:"|')?${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` + "`" + String.raw`\r\n]+((?:"|'))`,
+  String.raw`((?:"|')?${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` + "`" + String.raw`\\\r\n]+((?:"|'))`,
   "gi",
 );
 const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(

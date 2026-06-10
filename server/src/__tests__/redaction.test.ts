@@ -135,4 +135,37 @@ describe("redaction", () => {
     expect(result?.args).toEqual(["--api-key", "not-a-command-secret"]);
     expect(result?.argv).toEqual(["--api-key", REDACTED_EVENT_VALUE]);
   });
+
+  it("keeps escaped JSON parseable after redacting an Authorization: Bearer header (VANA-648)", () => {
+    // A run-log ndjson line where the command value contains an escaped inner
+    // quote right after the bearer token: `...Bearer eyJ...\""`. Redaction must
+    // not swallow the `\` of the closing `\"`, which would corrupt the JSON.
+    const line = JSON.stringify({
+      type: "event",
+      command: `curl -H "Authorization: Bearer eyJabc.def.ghi"`,
+    });
+    expect(() => JSON.parse(line)).not.toThrow();
+
+    const redacted = redactSensitiveText(line);
+
+    expect(() => JSON.parse(redacted)).not.toThrow();
+    const parsed = JSON.parse(redacted) as { command: string };
+    expect(parsed.command).not.toContain("eyJabc.def.ghi");
+    expect(parsed.command).toContain(REDACTED_EVENT_VALUE);
+  });
+
+  it("keeps escaped JSON parseable after redacting secret fields and CLI flags (VANA-648)", () => {
+    const line = JSON.stringify({
+      command: `acp --api-key "sk-inline-secret-value" --safe ok`,
+      env: { TOKEN: "live-token-value" },
+    });
+    expect(() => JSON.parse(line)).not.toThrow();
+
+    const redacted = redactSensitiveText(line);
+
+    expect(() => JSON.parse(redacted)).not.toThrow();
+    expect(redacted).not.toContain("sk-inline-secret-value");
+    expect(redacted).not.toContain("live-token-value");
+    expect(redacted).toContain(REDACTED_EVENT_VALUE);
+  });
 });

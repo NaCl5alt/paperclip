@@ -3,15 +3,22 @@ export const REDACTED_COMMAND_TEXT_VALUE = "***REDACTED***";
 const SECRET_NAME_PATTERN =
   String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|(?:access[-_]?|auth[-_]?)?token|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)[A-Za-z0-9_-]*`;
 
+// NOTE: the secret value character classes below intentionally exclude `\\`
+// (backslash) so that, when redacting inside escaped JSON (e.g. a run-log
+// ndjson chunk where `"` is serialized as `\"`), the match stops before the
+// backslash of an adjacent `\"` and leaves the escape intact. Without this the
+// trailing `\` of `...token\"` is consumed into the redaction, dropping the
+// escape and producing unparseable JSON. Secret token formats (JWT/bearer/api
+// keys) never contain backslashes, so excluding it does not weaken redaction.
 const COMMAND_CLI_SECRET_OPTION_RE = new RegExp(
-  String.raw`(\B-{1,2}${SECRET_NAME_PATTERN}(?:\s+|=)(["']?))[^\s"'` + "`" + String.raw`]+(\2)`,
+  String.raw`(\B-{1,2}${SECRET_NAME_PATTERN}(?:\s+|=)(["']?))[^\s"'` + "`" + String.raw`\\]+(\2)`,
   "gi",
 );
 const COMMAND_ENV_SECRET_ASSIGNMENT_RE = new RegExp(
-  String.raw`(\b${SECRET_NAME_PATTERN}\s*=\s*)(?:(["'])([^"'` + "`" + String.raw`\r\n]*)\2|([^\s"'` + "`" + String.raw`]+))`,
+  String.raw`(\b${SECRET_NAME_PATTERN}\s*=\s*)(?:(["'])([^"'` + "`" + String.raw`\\\r\n]*)\2|([^\s"'` + "`" + String.raw`\\]+))`,
   "gi",
 );
-const COMMAND_AUTHORIZATION_BEARER_RE = /(\bAuthorization\s*:\s*Bearer\s+)[^\s"'`]+/gi;
+const COMMAND_AUTHORIZATION_BEARER_RE = /(\bAuthorization\s*:\s*Bearer\s+)[^\s"'`\\]+/gi;
 const COMMAND_OPENAI_KEY_RE = /\bsk-[A-Za-z0-9_-]{12,}\b/g;
 const COMMAND_GITHUB_TOKEN_RE = /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g;
 const COMMAND_JWT_RE =
