@@ -28,6 +28,7 @@ import {
   type Ref,
   type ReactNode,
 } from "react";
+import { copyToClipboard } from "@/lib/clipboard";
 import { Link, useLocation } from "@/lib/router";
 import type {
   Agent,
@@ -1072,7 +1073,7 @@ function CopyablePreBlock({ children, className }: { children: string; className
         title="Copy"
         aria-label="Copy"
         onClick={() => {
-          void navigator.clipboard.writeText(children).then(() => {
+          void copyToClipboard(children).then(() => {
             setCopied(true);
             setTimeout(() => setCopied(false), 2000);
           });
@@ -1440,7 +1441,7 @@ function IssueChatUserMessage({
                   .filter((p): p is { type: "text"; text: string } => p.type === "text")
                   .map((p) => p.text)
                   .join("\n\n");
-                void navigator.clipboard.writeText(text).then(() => {
+                void copyToClipboard(text).then(() => {
                   setCopied(true);
                   setTimeout(() => setCopied(false), 2000);
                 });
@@ -1673,7 +1674,7 @@ function IssueChatAssistantMessage({
                   title="Copy message"
                   aria-label="Copy message"
                   onClick={() => {
-                    void navigator.clipboard.writeText(copyText).then(() => {
+                    void copyToClipboard(copyText).then(() => {
                       setCopied(true);
                       setTimeout(() => setCopied(false), 2000);
                     });
@@ -1717,7 +1718,7 @@ function IssueChatAssistantMessage({
                   <DropdownMenuContent align="end">
                     <DropdownMenuItem
                       onClick={() => {
-                        void navigator.clipboard.writeText(copyText);
+                        void copyToClipboard(copyText);
                       }}
                     >
                       <Copy className="mr-2 h-3.5 w-3.5" />
@@ -2406,7 +2407,7 @@ function SystemNoticeCommentRow({
   });
 
   const handleCopy = () => {
-    void navigator.clipboard.writeText(bodyText).then(() => {
+    void copyToClipboard(bodyText).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     });
@@ -2415,7 +2416,7 @@ function SystemNoticeCommentRow({
   const handleCopyLink = () => {
     if (!anchorId || typeof window === "undefined") return;
     const url = `${window.location.origin}${window.location.pathname}#${anchorId}`;
-    void navigator.clipboard.writeText(url).then(() => {
+    void copyToClipboard(url).then(() => {
       setCopiedLink(true);
       setTimeout(() => setCopiedLink(false), 2000);
     });
