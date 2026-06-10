@@ -9,6 +9,35 @@ import {
 const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|unauthorized|authentication\s+required)/i;
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
 
+// Tool-call markup that the model is supposed to emit as a structured tool_use
+// block but occasionally writes into a plain assistant `text` block instead. When
+// that happens the tool is never executed yet the run still reports
+// subtype=success (see VANA-644). Detect the markup so the adapter can refuse to
+// mark such a run as succeeded. The `antml:` prefix variant is also matched.
+const TOOL_INVOKE_RE = /<(?:antml:)?invoke\s+name\s*=/i;
+const TOOL_PARAMETER_RE = /<(?:antml:)?parameter\s+name\s*=/i;
+const TOOL_FUNCTION_CALLS_RE = /<(?:antml:)?function_calls\s*>/i;
+
+// Only inspect the tail of the message: a genuine "tool emitted as text" failure
+// terminates inside/just after the markup, so the signature lives near the very
+// end. Bounding the window keeps the check conservative — earlier prose that
+// merely *describes* the syntax (a code explanation) does not trip it.
+const INCOMPLETE_TOOL_CALL_TAIL_CHARS = 2000;
+
+export function detectIncompleteToolCall(text: string | null | undefined): boolean {
+  if (!text) return false;
+  const tail = text.length > INCOMPLETE_TOOL_CALL_TAIL_CHARS
+    ? text.slice(-INCOMPLETE_TOOL_CALL_TAIL_CHARS)
+    : text;
+  const hasInvoke = TOOL_INVOKE_RE.test(tail);
+  const hasParameter = TOOL_PARAMETER_RE.test(tail);
+  const hasFunctionCalls = TOOL_FUNCTION_CALLS_RE.test(tail);
+  // Require co-occurring invoke+parameter (a full malformed tool call), or the
+  // explicit <function_calls> wrapper alongside at least one inner tag. A lone
+  // tag is not enough — that keeps false positives on prose/code samples low.
+  return (hasInvoke && hasParameter) || (hasFunctionCalls && (hasInvoke || hasParameter));
+}
+
 const CLAUDE_TRANSIENT_UPSTREAM_RE =
   /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached)/i;
 const CLAUDE_EXTRA_USAGE_RESET_RE =
@@ -54,6 +83,8 @@ export function parseClaudeStreamJson(stdout: string) {
     }
   }
 
+  const lastAssistantText = assistantTexts.length > 0 ? assistantTexts[assistantTexts.length - 1] ?? "" : "";
+
   if (!finalResult) {
     return {
       sessionId,
@@ -62,6 +93,7 @@ export function parseClaudeStreamJson(stdout: string) {
       usage: null as UsageSummary | null,
       summary: assistantTexts.join("\n\n").trim(),
       resultJson: null as Record<string, unknown> | null,
+      incompleteToolCall: detectIncompleteToolCall(lastAssistantText),
     };
   }
 
@@ -73,6 +105,7 @@ export function parseClaudeStreamJson(stdout: string) {
   };
   const costRaw = finalResult.total_cost_usd;
   const costUsd = typeof costRaw === "number" && Number.isFinite(costRaw) ? costRaw : null;
+  const resultText = asString(finalResult.result, "");
   const summary = asString(finalResult.result, assistantTexts.join("\n\n")).trim();
 
   return {
@@ -82,6 +115,8 @@ export function parseClaudeStreamJson(stdout: string) {
     usage,
     summary,
     resultJson: finalResult,
+    incompleteToolCall:
+      detectIncompleteToolCall(resultText) || detectIncompleteToolCall(lastAssistantText),
   };
 }
 
