@@ -734,6 +734,39 @@ function isExplicitResumeCapableStatus(status: string | null | undefined) {
   return status === "done" || status === "blocked" || status === "todo" || status === "in_progress";
 }
 
+const INTERACTION_WAKE_REASON_MAX_LENGTH = 2000;
+
+// Summarize a resolved interaction so the continuation wake can surface the
+// board's decision (accept/reject + reason) instead of just "an interaction
+// resolved" (VANA-589). `outcome` falls back to the interaction status for
+// kinds without an explicit result.outcome; `reason` collapses the per-kind
+// reason fields and is truncated to keep the wake payload small.
+function summarizeResolvedInteractionResult(interaction: {
+  status: string;
+  result?: unknown;
+}): { interactionOutcome: string | null; interactionReason: string | null } {
+  let outcome: string | null = null;
+  let reason: string | null = null;
+  const result = interaction.result;
+  if (result && typeof result === "object") {
+    const record = result as Record<string, unknown>;
+    if (typeof record.outcome === "string" && record.outcome.trim().length > 0) {
+      outcome = record.outcome.trim();
+    }
+    const rawReason = record.reason ?? record.rejectionReason ?? record.cancellationReason;
+    if (typeof rawReason === "string" && rawReason.trim().length > 0) {
+      reason = rawReason.trim();
+    }
+  }
+  if (!outcome) {
+    outcome = readNonEmptyString(interaction.status);
+  }
+  if (reason && reason.length > INTERACTION_WAKE_REASON_MAX_LENGTH) {
+    reason = `${reason.slice(0, INTERACTION_WAKE_REASON_MAX_LENGTH)}… [truncated]`;
+  }
+  return { interactionOutcome: outcome, interactionReason: reason };
+}
+
 function queueResolvedInteractionContinuationWakeup(input: {
   heartbeat: ReturnType<typeof heartbeatService>;
   issue: { id: string; assigneeAgentId: string | null; status: string };
@@ -744,6 +777,7 @@ function queueResolvedInteractionContinuationWakeup(input: {
     continuationPolicy: string;
     sourceCommentId?: string | null;
     sourceRunId?: string | null;
+    result?: unknown;
   };
   actor: { actorType: "user" | "agent"; actorId: string };
   source: string;
@@ -763,6 +797,7 @@ function queueResolvedInteractionContinuationWakeup(input: {
 
   const forceFreshSession = input.forceFreshSession === true;
   const workspaceRefreshReason = readNonEmptyString(input.workspaceRefreshReason);
+  const { interactionOutcome, interactionReason } = summarizeResolvedInteractionResult(input.interaction);
   void input.heartbeat.wakeup(input.issue.assigneeAgentId, {
     source: "automation",
     triggerDetail: "system",
@@ -772,6 +807,8 @@ function queueResolvedInteractionContinuationWakeup(input: {
       interactionId: input.interaction.id,
       interactionKind: input.interaction.kind,
       interactionStatus: input.interaction.status,
+      interactionOutcome,
+      interactionReason,
       sourceCommentId: input.interaction.sourceCommentId ?? null,
       sourceRunId: input.interaction.sourceRunId ?? null,
       mutation: "interaction",
@@ -784,6 +821,8 @@ function queueResolvedInteractionContinuationWakeup(input: {
       interactionId: input.interaction.id,
       interactionKind: input.interaction.kind,
       interactionStatus: input.interaction.status,
+      interactionOutcome,
+      interactionReason,
       sourceCommentId: input.interaction.sourceCommentId ?? null,
       sourceRunId: input.interaction.sourceRunId ?? null,
       wakeReason: "issue_commented",

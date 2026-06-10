@@ -431,6 +431,8 @@ type PaperclipWakePayload = {
   livenessContinuation: PaperclipWakeLivenessContinuation | null;
   interactionKind: string | null;
   interactionStatus: string | null;
+  interactionOutcome: string | null;
+  interactionReason: string | null;
   childIssueSummaries: PaperclipWakeChildIssueSummary[];
   childIssueSummaryTruncated: boolean;
   commentIds: string[];
@@ -642,6 +644,8 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
     livenessContinuation,
     interactionKind: asString(payload.interactionKind, "").trim() || null,
     interactionStatus: asString(payload.interactionStatus, "").trim() || null,
+    interactionOutcome: asString(payload.interactionOutcome, "").trim() || null,
+    interactionReason: asString(payload.interactionReason, "").trim() || null,
     childIssueSummaries,
     childIssueSummaryTruncated: asBoolean(payload.childIssueSummaryTruncated, false),
     commentIds,
@@ -744,6 +748,19 @@ export function renderPaperclipWakePrompt(
     if (acceptedPlanContinuation) {
       lines.push(
         "- accepted-plan continuation: you may create child implementation issues from the approved plan, but must not start implementation work on the planning issue itself",
+      );
+    }
+  }
+  if (normalized.interactionOutcome || normalized.interactionReason) {
+    if (normalized.interactionOutcome) {
+      lines.push(`- interaction outcome: ${normalized.interactionOutcome}`);
+    }
+    if (normalized.interactionReason) {
+      lines.push(`- interaction reason: ${normalized.interactionReason}`);
+    }
+    if (normalized.interactionOutcome === "rejected") {
+      lines.push(
+        "- interaction guidance: the board declined your request. Read the reason above before re-asking; do not recreate the same card without addressing it, and cancel/supersede any of your other open pending requests on this issue.",
       );
     }
   }

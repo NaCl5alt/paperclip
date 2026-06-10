@@ -904,6 +904,64 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
   });
 
+  it("auto-supersedes an agent's own prior pending confirmation with the same target signature (VANA-589)", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Pending accumulation guard");
+    const agentId = randomUUID();
+    const otherAgentId = randomUUID();
+
+    await db.insert(agents).values([
+      {
+        id: agentId,
+        companyId,
+        name: "OrchPlatform",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "OtherAgent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    const makeConfirmation = (prompt: string, actor: { agentId?: string }) =>
+      interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        continuationPolicy: "wake_assignee",
+        payload: { version: 1, prompt },
+      }, actor);
+
+    // A different agent's pending confirmation must never be touched.
+    const otherAgentPending = await makeConfirmation("Other agent question?", { agentId: otherAgentId });
+    const first = await makeConfirmation("First question?", { agentId });
+    const second = await makeConfirmation("Second question?", { agentId });
+
+    const listed = await interactionsSvc.listForIssue(issueId);
+    const byId = new Map(listed.map((entry) => [entry.id, entry]));
+
+    expect(byId.get(first.id)).toMatchObject({
+      status: "expired",
+      result: {
+        version: 1,
+        outcome: "superseded_by_new_request",
+        supersededByInteractionId: second.id,
+      },
+      resolvedByAgentId: agentId,
+    });
+    expect(byId.get(second.id)?.status).toBe("pending");
+    expect(byId.get(otherAgentPending.id)?.status).toBe("pending");
+  });
+
   it("returns agent-authored request confirmations to the creating agent when a board user accepts", async () => {
     const companyId = randomUUID();
     const goalId = randomUUID();

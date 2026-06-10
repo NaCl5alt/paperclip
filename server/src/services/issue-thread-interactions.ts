@@ -86,6 +86,17 @@ function isRequestConfirmationLikeKind(kind: string): kind is RequestConfirmatio
   return (REQUEST_CONFIRMATION_INTERACTION_KINDS as readonly string[]).includes(kind);
 }
 
+// Two pending confirmations from the same agent on the same issue collide when
+// they bind to the same target (or both are targetless). Creating a new one
+// auto-supersedes the old to prevent unbounded pending accumulation (VANA-589).
+function requestConfirmationTargetSignature(
+  target: RequestConfirmationTarget | null | undefined,
+): string {
+  if (!target) return "targetless";
+  if (target.type === "issue_document") return `issue_document:${target.key}`;
+  return `custom:${target.key}`;
+}
+
 function isIssueThreadInteractionIdempotencyConflict(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   const err = error as { code?: string; constraint?: string; constraint_name?: string };
@@ -183,6 +194,67 @@ function shouldReturnAcceptedConfirmationToCreatorAgent(args: {
 
 function shouldSupersedeRequestConfirmationOnUserComment(interaction: RequestConfirmationLikeInteraction) {
   return interaction.payload.supersedeOnUserComment === true;
+}
+
+// When an agent creates a fresh request-confirmation-like interaction, expire
+// its own prior pending confirmations on the same issue that share the new
+// target signature. This is the pending-accumulation guard (VANA-589): the
+// resolved-interaction wake for the new card carries the live decision, while
+// stale duplicates are closed out with `superseded_by_new_request`.
+async function supersedePriorPendingConfirmations(args: {
+  db: Db;
+  issue: { id: string; companyId: string };
+  newInteraction: IssueThreadInteractionRow;
+  actorAgentId: string;
+}): Promise<IssueThreadInteraction[]> {
+  const newInteraction = hydrateInteraction(args.newInteraction) as RequestConfirmationLikeInteraction;
+  const newSignature = requestConfirmationTargetSignature(newInteraction.payload.target ?? null);
+
+  const rows = await args.db
+    .select()
+    .from(issueThreadInteractions)
+    .where(and(
+      eq(issueThreadInteractions.companyId, args.issue.companyId),
+      eq(issueThreadInteractions.issueId, args.issue.id),
+      eq(issueThreadInteractions.createdByAgentId, args.actorAgentId),
+      inArray(issueThreadInteractions.kind, [...REQUEST_CONFIRMATION_INTERACTION_KINDS]),
+      eq(issueThreadInteractions.status, "pending"),
+    ));
+
+  const stale = rows.filter((row) => {
+    if (row.id === args.newInteraction.id) return false;
+    const interaction = hydrateInteraction(row) as RequestConfirmationLikeInteraction;
+    return requestConfirmationTargetSignature(interaction.payload.target ?? null) === newSignature;
+  });
+  if (stale.length === 0) return [];
+
+  const now = new Date();
+  const superseded: IssueThreadInteraction[] = [];
+  for (const row of stale) {
+    const [updated] = await args.db
+      .update(issueThreadInteractions)
+      .set({
+        status: "expired",
+        result: {
+          version: 1,
+          outcome: "superseded_by_new_request",
+          supersededByInteractionId: args.newInteraction.id,
+        },
+        resolvedByAgentId: args.actorAgentId,
+        resolvedAt: now,
+        updatedAt: now,
+      })
+      .where(and(
+        eq(issueThreadInteractions.id, row.id),
+        eq(issueThreadInteractions.status, "pending"),
+      ))
+      .returning();
+    if (updated) superseded.push(hydrateInteraction(updated));
+  }
+  if (superseded.length > 0) {
+    await touchIssue(args.db, args.issue.id);
+  }
+  return superseded;
 }
 
 function normalizeCreateInteractionInput(input: CreateIssueThreadInteraction): CreateIssueThreadInteraction {
@@ -849,6 +921,15 @@ export function issueThreadInteractionService(db: Db) {
           });
         }
         return hydrateInteraction(existing);
+      }
+
+      if (actor.agentId && isRequestConfirmationLikeKind(data.kind)) {
+        await supersedePriorPendingConfirmations({
+          db,
+          issue,
+          newInteraction: created,
+          actorAgentId: actor.agentId,
+        });
       }
 
       await touchIssue(db, issue.id);
