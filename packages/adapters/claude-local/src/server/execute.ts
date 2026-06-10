@@ -880,10 +880,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     const clearSessionForMaxTurns = isClaudeMaxTurnsResult(parsed);
     const parsedIsError = asBoolean(parsed.is_error, false);
-    const failed = (proc.exitCode ?? 0) !== 0 || parsedIsError;
-    const errorMessage = failed
-      ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
-      : null;
+    // A well-formed success run whose final assistant turn emitted tool-call
+    // markup as plain text (so the tool never actually ran) must NOT be recorded
+    // as succeeded — the requested mutation is missing. Treat it as a failure so
+    // the heartbeat surfaces it and re-wakes for completion (VANA-644/647).
+    const incompleteToolCall =
+      parsedStream.incompleteToolCall &&
+      !parsedIsError &&
+      (proc.exitCode ?? 0) === 0 &&
+      asString(parsed.subtype, "") === "success";
+    const failed = (proc.exitCode ?? 0) !== 0 || parsedIsError || incompleteToolCall;
+    const errorMessage = !failed
+      ? null
+      : incompleteToolCall
+        ? "incomplete: tool-call emitted as text, not executed"
+        : describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`;
     const transientUpstream =
       failed &&
       !loginMeta.requiresLogin &&
@@ -908,10 +919,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? "max_turns_exhausted"
       : transientUpstream
       ? "claude_transient_upstream"
+      : incompleteToolCall
+      ? "incomplete_tool_call"
       : null;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
+      ...(incompleteToolCall ? { incompleteToolCall: true, stopReason: "incomplete_tool_call" } : {}),
       ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
