@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { copyToClipboard } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 
 interface CopyTextProps {
@@ -30,28 +31,8 @@ export function CopyText({
   useEffect(() => () => clearTimeout(timerRef.current), []);
 
   const handleClick = useCallback(async () => {
-    try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        // Fallback for non-secure contexts (e.g. HTTP on non-localhost)
-        const textarea = document.createElement("textarea");
-        textarea.value = text;
-        textarea.style.position = "fixed";
-        textarea.style.left = "-9999px";
-        document.body.appendChild(textarea);
-        try {
-          textarea.select();
-          const success = document.execCommand("copy");
-          if (!success) throw new Error("execCommand copy failed");
-        } finally {
-          document.body.removeChild(textarea);
-        }
-      }
-      setLabel(copiedLabel);
-    } catch {
-      setLabel("Copy failed");
-    }
+    const success = await copyToClipboard(text);
+    setLabel(success ? copiedLabel : "Copy failed");
     clearTimeout(timerRef.current);
     setVisible(true);
     timerRef.current = setTimeout(() => setVisible(false), 1500);
