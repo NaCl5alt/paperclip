@@ -499,9 +499,11 @@ export interface CreateConfigValues {
   defaultEnvironmentId?: string;
   maxTurnsPerRun: number;
   /**
-   * Optional codex recovery fallback agent id. When set, recovery ownership for
-   * transient-upstream failures fails over to this agent instead of the legacy
-   * manager/creator/executive selection. Empty/unset preserves legacy behavior.
+   * Optional recovery fallback agent id. When set, transient-upstream failures
+   * fail over to this agent: it becomes the top-priority stranded-recovery
+   * owner candidate, and the issue is handed off to it when bounded transient
+   * retries are exhausted or the upstream retryNotBefore (e.g. a session-limit
+   * reset) is too far away. Empty/unset preserves legacy behavior.
    */
   recoveryFallbackAgentId?: string;
   heartbeatEnabled: boolean;
