@@ -245,6 +245,11 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
+// When a transient-upstream failure carries a retryNotBefore (e.g. a session-limit
+// reset) further away than this threshold, hand the issue off to the assignee's
+// configured recovery fallback agent instead of waiting for the deferred retry.
+export const TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_DEFERRAL_THRESHOLD_MS = 30 * 60 * 1000;
+const TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_WAKE_SOURCE = "heartbeat.transient_upstream_recovery_fallback";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
 const WORKSPACE_VALIDATION_RECOVERY_CAUSE = "workspace_validation_failed";
@@ -5923,6 +5928,144 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { outcome: "promoted", run: promoted };
   }
 
+  // VANA-775: hand a transient-upstream-failed issue off to the assignee's
+  // configured `recoveryFallbackAgentId` when bounded retries are exhausted or
+  // the upstream-provided retryNotBefore is too far away to keep waiting.
+  async function failoverTransientUpstreamRunToRecoveryFallback(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: typeof agents.$inferSelect;
+    now: Date;
+    trigger: "retry_exhausted" | "retry_not_before_deferred";
+    retryNotBefore: Date | null;
+    attempt: number;
+    maxAttempts: number;
+  }): Promise<
+    | { outcome: "failed_over"; fallbackAgentId: string; issueId: string }
+    | { outcome: "skipped"; reason: string }
+  > {
+    const { run, agent } = input;
+    const fallbackAgentId = readNonEmptyString(parseObject(agent.adapterConfig).recoveryFallbackAgentId);
+    if (!fallbackAgentId) return { outcome: "skipped", reason: "no_fallback_configured" };
+    if (fallbackAgentId === agent.id) return { outcome: "skipped", reason: "self_reference" };
+
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    const skipWithEvent = async (reason: string, details: Record<string, unknown> = {}) => {
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "Transient-upstream recovery fallback handoff was skipped",
+        payload: {
+          trigger: input.trigger,
+          fallbackAgentId,
+          reason,
+          ...details,
+        },
+      });
+      return { outcome: "skipped" as const, reason };
+    };
+
+    if (!issueId) return skipWithEvent("no_issue_context");
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!issue) return skipWithEvent("issue_not_found", { issueId });
+    if (issue.assigneeAgentId !== agent.id) {
+      return skipWithEvent("issue_reassigned", {
+        issueId,
+        currentAssigneeAgentId: issue.assigneeAgentId,
+      });
+    }
+    if (issue.status !== "in_progress" && issue.status !== "todo") {
+      return skipWithEvent("issue_not_live", { issueId, issueStatus: issue.status });
+    }
+
+    const fallbackAgent = await getAgent(fallbackAgentId);
+    if (!fallbackAgent || fallbackAgent.companyId !== run.companyId) {
+      return skipWithEvent("fallback_agent_unavailable", { issueId });
+    }
+    const invokability = await getAgentInvokability(fallbackAgent);
+    if (!invokability.invokable) {
+      return skipWithEvent("fallback_agent_not_invokable", {
+        issueId,
+        invokabilityReason: invokability.reason,
+      });
+    }
+    const budgetBlock = await budgets.getInvocationBlock(run.companyId, fallbackAgent.id, {
+      issueId,
+      projectId: issue.projectId,
+    });
+    if (budgetBlock) return skipWithEvent("fallback_agent_budget_blocked", { issueId });
+
+    try {
+      await issuesSvc.update(issueId, { assigneeAgentId: fallbackAgent.id });
+    } catch (err) {
+      return skipWithEvent("issue_reassignment_failed", {
+        issueId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    await appendRunEvent(run, await nextRunEventSeq(run.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: "Issue was handed off to the configured recovery fallback agent after transient upstream failures",
+      payload: {
+        trigger: input.trigger,
+        issueId,
+        fallbackAgentId: fallbackAgent.id,
+        previousAssigneeAgentId: agent.id,
+        scheduledRetryAttempt: input.attempt,
+        maxAttempts: input.maxAttempts,
+        ...(input.retryNotBefore ? { retryNotBefore: input.retryNotBefore.toISOString() } : {}),
+      },
+    });
+
+    try {
+      await issuesSvc.addComment(
+        issueId,
+        [
+          "Transient upstream failures kept the assigned agent from making progress, so this issue was handed off to the configured recovery fallback agent.",
+          "",
+          `- Trigger: \`${input.trigger}\``,
+          `- New assignee: [${fallbackAgent.name}](/agents/${fallbackAgent.id})`,
+          ...(input.retryNotBefore
+            ? [`- Upstream retry window opens at: \`${input.retryNotBefore.toISOString()}\``]
+            : []),
+        ].join("\n"),
+        { agentId: agent.id, runId: run.id },
+      );
+    } catch {
+      // The handoff itself already succeeded; a missing comment is non-fatal.
+    }
+
+    await enqueueWakeup(fallbackAgent.id, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: {
+        issueId,
+        mutation: "transient_upstream_recovery_fallback",
+        retryOfRunId: run.id,
+      },
+      requestedByActorType: "system",
+      requestedByActorId: null,
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_assigned",
+        source: TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_WAKE_SOURCE,
+      },
+    });
+
+    return { outcome: "failed_over", fallbackAgentId: fallbackAgent.id, issueId };
+  }
+
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -5975,10 +6118,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           maxAttempts,
         },
       });
+      // VANA-775 Fix B(a): with bounded retries exhausted, fail the issue over
+      // to the assignee's configured recovery fallback agent when one exists.
+      const recoveryFallback = transientRecovery
+        ? await failoverTransientUpstreamRunToRecoveryFallback({
+            run,
+            agent,
+            now,
+            trigger: "retry_exhausted",
+            retryNotBefore: transientRetryNotBefore,
+            attempt: nextAttempt,
+            maxAttempts,
+          })
+        : null;
       return {
         outcome: "retry_exhausted" as const,
         attempt: nextAttempt,
         maxAttempts,
+        ...(recoveryFallback ? { recoveryFallback } : {}),
       };
     }
 
@@ -6021,6 +6178,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
+    // VANA-775 Fix B(b): when the upstream retry window (e.g. a session-limit
+    // reset) is too far away, hand the issue off to the configured recovery
+    // fallback agent now instead of scheduling a long-deferred retry. When the
+    // handoff is skipped (no fallback, guard failed), fall through to the
+    // normal deferred schedule.
+    if (
+      transientRecovery &&
+      transientRetryNotBefore &&
+      transientRetryNotBefore.getTime() - now.getTime() > TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_DEFERRAL_THRESHOLD_MS
+    ) {
+      const recoveryFallback = await failoverTransientUpstreamRunToRecoveryFallback({
+        run,
+        agent,
+        now,
+        trigger: "retry_not_before_deferred",
+        retryNotBefore: transientRetryNotBefore,
+        attempt: nextAttempt,
+        maxAttempts,
+      });
+      if (recoveryFallback.outcome === "failed_over") {
+        return {
+          outcome: "failed_over_to_recovery_fallback" as const,
+          attempt: nextAttempt,
+          maxAttempts,
+          fallbackAgentId: recoveryFallback.fallbackAgentId,
+          issueId: recoveryFallback.issueId,
+        };
+      }
+    }
     if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) {
       const gate = await evaluateScheduledRetryGate({ run, agent, contextSnapshot, retryReason });
       if (!gate.allowed) {

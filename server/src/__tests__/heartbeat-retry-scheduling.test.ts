@@ -11,6 +11,7 @@ import {
   environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueRelations,
   issues,
 } from "@paperclipai/db";
@@ -22,6 +23,7 @@ import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
+  TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_DEFERRAL_THRESHOLD_MS,
   heartbeatService,
 } from "../services/heartbeat.ts";
 
@@ -48,6 +50,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(environmentLeases);
+    await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
@@ -74,6 +77,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     resultJson?: Record<string, unknown> | null;
     adapterType?: "codex_local" | "claude_local";
     agentName?: string;
+    issueId?: string;
   }) {
     const adapterType = input.adapterType ?? "codex_local";
     const agentName = input.agentName ?? (adapterType === "claude_local" ? "ClaudeCoder" : "CodexCoder");
@@ -122,7 +126,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
           : {}),
       },
       contextSnapshot: {
-        issueId: randomUUID(),
+        issueId: input.issueId ?? randomUUID(),
         wakeReason: "issue_assigned",
       },
       updatedAt: input.now,
@@ -1336,5 +1340,201 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect((wakeupRequest?.payload as Record<string, unknown> | null)?.transientRetryNotBefore).toBe(
       retryNotBefore.toISOString(),
     );
+  });
+
+  async function seedRecoveryFallbackFixture(input: {
+    companyId: string;
+    agentId: string;
+    runId: string;
+    issueId: string;
+    now: Date;
+    retryNotBefore?: string | null;
+    scheduledRetryAttempt?: number;
+  }) {
+    await seedRetryFixture({
+      runId: input.runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      now: input.now,
+      errorCode: "claude_transient_upstream",
+      errorFamily: "transient_upstream",
+      adapterType: "claude_local",
+      retryNotBefore: input.retryNotBefore ?? null,
+      scheduledRetryAttempt: input.scheduledRetryAttempt,
+      issueId: input.issueId,
+    });
+
+    const issuePrefix = `T${input.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: input.issueId,
+      companyId: input.companyId,
+      title: "Transient upstream failover source",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: input.agentId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+
+    const fallbackAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: fallbackAgentId,
+      companyId: input.companyId,
+      name: "RecoveryFallback",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+    await db
+      .update(agents)
+      .set({ adapterConfig: { recoveryFallbackAgentId: fallbackAgentId } })
+      .where(eq(agents.id, input.agentId));
+
+    return { fallbackAgentId };
+  }
+
+  it("hands the issue off to the recovery fallback agent when transient retries are exhausted", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-04-21T09:00:00.000Z");
+    const { fallbackAgentId } = await seedRecoveryFallbackFixture({
+      companyId,
+      agentId,
+      runId,
+      issueId,
+      now,
+      scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+    });
+
+    const exhausted = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(exhausted.outcome).toBe("retry_exhausted");
+    if (exhausted.outcome !== "retry_exhausted") return;
+    expect(exhausted.recoveryFallback).toEqual({
+      outcome: "failed_over",
+      fallbackAgentId,
+      issueId,
+    });
+
+    const issue = await db
+      .select({ assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.assigneeAgentId).toBe(fallbackAgentId);
+
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, fallbackAgentId))
+      .then((rows) =>
+        rows.find((row) => {
+          const payload = row.payload as Record<string, unknown> | null;
+          return payload?.mutation === "transient_upstream_recovery_fallback";
+        }) ?? null,
+      );
+    expect(wakeup?.reason).toBe("issue_assigned");
+    expect((wakeup?.payload as Record<string, unknown> | null)?.issueId).toBe(issueId);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) => comment.body.includes("recovery fallback agent"))).toBe(true);
+  });
+
+  it("hands the issue off immediately when the upstream retry window is too far away", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-04-21T09:00:00.000Z");
+    const retryNotBefore = new Date(
+      now.getTime() + TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_DEFERRAL_THRESHOLD_MS + 60 * 60 * 1000,
+    );
+    const { fallbackAgentId } = await seedRecoveryFallbackFixture({
+      companyId,
+      agentId,
+      runId,
+      issueId,
+      now,
+      retryNotBefore: retryNotBefore.toISOString(),
+    });
+
+    const result = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(result).toMatchObject({
+      outcome: "failed_over_to_recovery_fallback",
+      fallbackAgentId,
+      issueId,
+    });
+
+    const issue = await db
+      .select({ assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.assigneeAgentId).toBe(fallbackAgentId);
+
+    const scheduledRetries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+        ),
+      );
+    expect(scheduledRetries).toHaveLength(0);
+  });
+
+  it("keeps the deferred retry when the upstream retry window is within the failover threshold", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-04-21T09:00:00.000Z");
+    const retryNotBefore = new Date(now.getTime() + 5 * 60 * 1000);
+    const { fallbackAgentId } = await seedRecoveryFallbackFixture({
+      companyId,
+      agentId,
+      runId,
+      issueId,
+      now,
+      retryNotBefore: retryNotBefore.toISOString(),
+    });
+
+    const result = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(result.outcome).toBe("scheduled");
+
+    const issue = await db
+      .select({ assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.assigneeAgentId).toBe(agentId);
+
+    const fallbackWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, fallbackAgentId));
+    expect(fallbackWakeups).toHaveLength(0);
   });
 });
