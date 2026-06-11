@@ -6431,6 +6431,89 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  // Shared core for "run a scheduled retry now": stamp the retry-now request on
+  // the run (and its wakeup request), promote it through the standard gate
+  // evaluation, and dispatch the agent's queue immediately when promoted so the
+  // run starts without waiting for the next scheduler tick (VANA-751 Fix A+B).
+  async function requestScheduledRetryRunNow(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    now?: Date;
+    requestedByActorType?: "user" | "agent" | "system" | null;
+    requestedByActorId?: string | null;
+    issueId?: string | null;
+  }) {
+    const now = input.now ?? new Date();
+    const contextSnapshot = {
+      ...parseObject(input.run.contextSnapshot),
+      scheduledRetryAt: now.toISOString(),
+      retryNowRequestedAt: now.toISOString(),
+      retryNowRequestedByActorType: input.requestedByActorType ?? null,
+      retryNowRequestedByActorId: input.requestedByActorId ?? null,
+    };
+
+    const updated = await db.transaction(async (tx) => {
+      const row = await tx
+        .update(heartbeatRuns)
+        .set({
+          scheduledRetryAt: now,
+          contextSnapshot,
+          updatedAt: now,
+        })
+        .where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.status, "scheduled_retry")))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+      if (!row) return null;
+
+      if (row.wakeupRequestId) {
+        const wakeupPayload = {
+          ...(parseObject(
+            await tx
+              .select({ payload: agentWakeupRequests.payload })
+              .from(agentWakeupRequests)
+              .where(eq(agentWakeupRequests.id, row.wakeupRequestId))
+              .then((rows) => rows[0]?.payload ?? null),
+          )),
+          scheduledRetryAt: now.toISOString(),
+          retryNowRequestedAt: now.toISOString(),
+        };
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            payload: wakeupPayload,
+            updatedAt: now,
+          })
+          .where(eq(agentWakeupRequests.id, row.wakeupRequestId));
+      }
+
+      return row;
+    });
+
+    if (!updated) return { updated: null, promotion: null } as const;
+
+    await appendRunEvent(updated, await nextRunEventSeq(updated.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "info",
+      message: "Scheduled retry was requested to run now",
+      payload: {
+        issueId: input.issueId ?? readNonEmptyString(parseObject(updated.contextSnapshot).issueId) ?? null,
+        scheduledRetryAttempt: updated.scheduledRetryAttempt,
+        scheduledRetryAt: updated.scheduledRetryAt ? new Date(updated.scheduledRetryAt).toISOString() : null,
+        scheduledRetryReason: updated.scheduledRetryReason,
+        requestedByActorType: input.requestedByActorType ?? null,
+        requestedByActorId: input.requestedByActorId ?? null,
+      },
+    });
+
+    const promotion = await promoteScheduledRetryRun(updated, now);
+    if (promotion.outcome === "promoted") {
+      // Fix B (VANA-751): start the promoted run immediately instead of leaving
+      // it queued until the next scheduler tick (~30s).
+      await startNextQueuedRunForAgent(promotion.run.agentId);
+    }
+    return { updated, promotion } as const;
+  }
+
   async function retryScheduledRetryNow(input: {
     issueId: string;
     actor?: { actorType?: "user" | "agent" | "system"; actorId?: string | null };
@@ -6461,52 +6544,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
     }
 
-    const contextSnapshot = {
-      ...parseObject(scheduled.run.contextSnapshot),
-      scheduledRetryAt: now.toISOString(),
-      retryNowRequestedAt: now.toISOString(),
-      retryNowRequestedByActorType: input.actor?.actorType ?? null,
-      retryNowRequestedByActorId: input.actor?.actorId ?? null,
-    };
-
-    const updated = await db.transaction(async (tx) => {
-      const row = await tx
-        .update(heartbeatRuns)
-        .set({
-          scheduledRetryAt: now,
-          contextSnapshot,
-          updatedAt: now,
-        })
-        .where(and(eq(heartbeatRuns.id, scheduled.run.id), eq(heartbeatRuns.status, "scheduled_retry")))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-      if (!row) return null;
-
-      if (row.wakeupRequestId) {
-        const wakeupPayload = {
-          ...(parseObject(
-            await tx
-              .select({ payload: agentWakeupRequests.payload })
-              .from(agentWakeupRequests)
-              .where(eq(agentWakeupRequests.id, row.wakeupRequestId))
-              .then((rows) => rows[0]?.payload ?? null),
-          )),
-          scheduledRetryAt: now.toISOString(),
-          retryNowRequestedAt: now.toISOString(),
-        };
-        await tx
-          .update(agentWakeupRequests)
-          .set({
-            payload: wakeupPayload,
-            updatedAt: now,
-          })
-          .where(eq(agentWakeupRequests.id, row.wakeupRequestId));
-      }
-
-      return row;
+    const { updated, promotion } = await requestScheduledRetryRunNow({
+      run: scheduled.run,
+      now,
+      requestedByActorType: input.actor?.actorType ?? null,
+      requestedByActorId: input.actor?.actorId ?? null,
+      issueId: issue.id,
     });
 
-    if (!updated) {
+    if (!updated || !promotion) {
       const alreadyPromoted = await getIssueRetryRun(issue.companyId, issue.id, ["queued", "running"]);
       if (alreadyPromoted) {
         return {
@@ -6521,23 +6567,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         scheduledRetry: null,
       };
     }
-
-    await appendRunEvent(updated, await nextRunEventSeq(updated.id), {
-      eventType: "lifecycle",
-      stream: "system",
-      level: "info",
-      message: "Scheduled retry was requested to run now",
-      payload: {
-        issueId: issue.id,
-        scheduledRetryAttempt: updated.scheduledRetryAttempt,
-        scheduledRetryAt: updated.scheduledRetryAt ? new Date(updated.scheduledRetryAt).toISOString() : null,
-        scheduledRetryReason: updated.scheduledRetryReason,
-        requestedByActorType: input.actor?.actorType ?? null,
-        requestedByActorId: input.actor?.actorId ?? null,
-      },
-    });
-
-    const promotion = await promoteScheduledRetryRun(updated, now);
     const promotedRow = await getIssueRetryRun(issue.companyId, issue.id, ["queued", "running", "cancelled"]);
     const scheduledRetry = promotedRow
       ? summarizeIssueScheduledRetryRun(promotedRow)
@@ -10264,7 +10293,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               finishedAt: new Date(),
             });
 
-            return { kind: "coalesced" as const, run: mergedRun };
+            return {
+              kind: "coalesced" as const,
+              run: mergedRun,
+              // Fix A (VANA-751): a user-initiated wake that coalesced into a
+              // scheduled retry should run now instead of waiting out the
+              // backoff. Promotion happens after the transaction commits so the
+              // issue row lock is released first; system/timer wakes keep the
+              // automatic-retry backoff untouched.
+              promoteScheduledRetryNow:
+                mergedRun.status === "scheduled_retry" && opts.requestedByActorType === "user",
+            };
           }
 
           const deferredPayload = {
@@ -10380,6 +10419,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
       if (outcome.kind === "coalesced") {
+        if (outcome.promoteScheduledRetryNow) {
+          const { updated, promotion } = await requestScheduledRetryRunNow({
+            run: outcome.run,
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null,
+            issueId,
+          });
+          // requestScheduledRetryRunNow already dispatched the queue on promote;
+          // return the promoted run so callers land on the live run.
+          if (promotion?.outcome === "promoted") return promotion.run;
+          await startNextQueuedRunForAgent(agent.id);
+          return promotion?.run ?? updated ?? outcome.run;
+        }
         await startNextQueuedRunForAgent(agent.id);
         return outcome.run;
       }
@@ -10456,6 +10508,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         runId: mergedRun.id,
         finishedAt: new Date(),
       });
+
+      if (mergedRun.status === "scheduled_retry" && opts.requestedByActorType === "user") {
+        // Fix A (VANA-751): user-initiated wakes promote the coalesced
+        // scheduled retry immediately and dispatch it; system/timer wakes keep
+        // the automatic-retry backoff untouched.
+        const { updated, promotion } = await requestScheduledRetryRunNow({
+          run: mergedRun,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          issueId: issueId ?? null,
+        });
+        return promotion?.run ?? updated ?? mergedRun;
+      }
+
       return mergedRun;
     }
 
