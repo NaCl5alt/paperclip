@@ -733,7 +733,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     retryReason?: "assignment_recovery" | "issue_continuation_needed" | null;
     cause?: string;
     kind?: string;
+    ownerAgentId?: string;
   }) {
+    const expectedOwnerAgentId = input.ownerAgentId ?? input.agentId;
     const action = await waitForValue(async () =>
       db.select().from(issueRecoveryActions).where(
         and(
@@ -751,7 +753,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       kind: input.kind ?? "stranded_assigned_issue",
       status: "active",
       ownerType: "agent",
-      ownerAgentId: input.agentId,
+      ownerAgentId: expectedOwnerAgentId,
       previousOwnerAgentId: input.agentId,
       returnOwnerAgentId: input.agentId,
       cause: input.cause ?? "stranded_assigned_issue",
@@ -782,7 +784,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const wakeups = await db
         .select()
         .from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.agentId, input.agentId));
+        .where(eq(agentWakeupRequests.agentId, expectedOwnerAgentId));
       return wakeups.find((wakeup) => {
         const payload = wakeup.payload as Record<string, unknown> | null;
         return payload?.issueId === input.issueId &&
@@ -2756,6 +2758,229 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("retried continuation");
     expect(comments[0]?.body).toContain("3× attempts");
     expect(comments[0]?.body).toContain("Latest cause: `adapter_failed`");
+  });
+
+  async function seedRecoveryFallbackAgent(input: {
+    companyId: string;
+    sourceAgentId: string;
+    fallbackAgentId?: string;
+    fallbackStatus?: "idle" | "paused";
+  }) {
+    const fallbackAgentId = input.fallbackAgentId ?? randomUUID();
+    if (fallbackAgentId !== input.sourceAgentId) {
+      await db.insert(agents).values({
+        id: fallbackAgentId,
+        companyId: input.companyId,
+        name: "RecoveryFallback",
+        role: "engineer",
+        status: input.fallbackStatus ?? "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
+    await db
+      .update(agents)
+      .set({ adapterConfig: { recoveryFallbackAgentId: fallbackAgentId } })
+      .where(eq(agents.id, input.sourceAgentId));
+    return fallbackAgentId;
+  }
+
+  async function backfillFailedContinuationRetries(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    errorCode: string;
+    error: string;
+  }) {
+    const olderTimestamps = [
+      new Date("2026-03-18T23:50:00.000Z"),
+      new Date("2026-03-18T23:55:00.000Z"),
+    ];
+    for (const finishedAt of olderTimestamps) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: input.companyId,
+        agentId: input.agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "failed",
+        contextSnapshot: {
+          issueId: input.issueId,
+          taskId: input.issueId,
+          wakeReason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+          source: "issue.continuation_recovery",
+        },
+        errorCode: input.errorCode,
+        error: input.error,
+        startedAt: finishedAt,
+        finishedAt,
+        createdAt: finishedAt,
+        updatedAt: finishedAt,
+      });
+    }
+  }
+
+  it("fails over stranded recovery ownership to the configured fallback agent on exhausted transient-upstream retries", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "claude_transient_upstream",
+      runError: "anthropic upstream rejected the session",
+    });
+    await backfillFailedContinuationRetries({
+      companyId,
+      agentId,
+      issueId,
+      errorCode: "claude_transient_upstream",
+      error: "anthropic upstream rejected the session",
+    });
+    const fallbackAgentId = await seedRecoveryFallbackAgent({ companyId, sourceAgentId: agentId });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(1);
+
+    await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "in_progress",
+      retryReason: "issue_continuation_needed",
+      ownerAgentId: fallbackAgentId,
+    });
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Recovery owner: [RecoveryFallback]");
+  });
+
+  it("keeps legacy owner selection for transient-upstream exhaustion when no fallback agent is configured", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "claude_transient_upstream",
+      runError: "anthropic upstream rejected the session",
+    });
+    await backfillFailedContinuationRetries({
+      companyId,
+      agentId,
+      issueId,
+      errorCode: "claude_transient_upstream",
+      error: "anthropic upstream rejected the session",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+
+    await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "in_progress",
+      retryReason: "issue_continuation_needed",
+    });
+  });
+
+  it("ignores a non-invokable recovery fallback agent and falls back to legacy owner selection", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "codex_transient_upstream",
+      runError: "openai upstream rejected the session",
+    });
+    await backfillFailedContinuationRetries({
+      companyId,
+      agentId,
+      issueId,
+      errorCode: "codex_transient_upstream",
+      error: "openai upstream rejected the session",
+    });
+    await seedRecoveryFallbackAgent({ companyId, sourceAgentId: agentId, fallbackStatus: "paused" });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+
+    await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "in_progress",
+      retryReason: "issue_continuation_needed",
+    });
+  });
+
+  it("ignores a self-referencing recovery fallback agent", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "claude_transient_upstream",
+      runError: "anthropic upstream rejected the session",
+    });
+    await backfillFailedContinuationRetries({
+      companyId,
+      agentId,
+      issueId,
+      errorCode: "claude_transient_upstream",
+      error: "anthropic upstream rejected the session",
+    });
+    await seedRecoveryFallbackAgent({ companyId, sourceAgentId: agentId, fallbackAgentId: agentId });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+
+    await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "in_progress",
+      retryReason: "issue_continuation_needed",
+    });
+  });
+
+  it("does not use the recovery fallback agent for non-transient-upstream failures", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "adapter_failed",
+      runError: "ssh: connection reset",
+    });
+    await backfillFailedContinuationRetries({
+      companyId,
+      agentId,
+      issueId,
+      errorCode: "adapter_failed",
+      error: "ssh: connection reset",
+    });
+    await seedRecoveryFallbackAgent({ companyId, sourceAgentId: agentId });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+
+    await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "in_progress",
+      retryReason: "issue_continuation_needed",
+    });
   });
 
   it("does not count mixed-cause continuation failures toward the transient cap", async () => {
