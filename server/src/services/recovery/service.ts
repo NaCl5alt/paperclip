@@ -170,6 +170,11 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "timeout",
 ]);
 
+const TRANSIENT_UPSTREAM_FAILOVER_ERROR_CODES = new Set<string>([
+  "codex_transient_upstream",
+  "claude_transient_upstream",
+]);
+
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "agent_not_invokable",
   "agent_not_found",
@@ -1843,10 +1848,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ].join("\n");
   }
 
-  async function resolveStrandedIssueRecoveryOwnerAgentId(issue: typeof issues.$inferSelect) {
+  async function resolveStrandedIssueRecoveryOwnerAgentId(
+    issue: typeof issues.$inferSelect,
+    latestRun: LatestIssueRun = null,
+  ) {
     const candidateIds: string[] = [];
     if (issue.assigneeAgentId) {
       const assignee = await getAgent(issue.assigneeAgentId);
+      const latestRunErrorCode = readNonEmptyString(latestRun?.errorCode);
+      if (assignee && latestRunErrorCode && TRANSIENT_UPSTREAM_FAILOVER_ERROR_CODES.has(latestRunErrorCode)) {
+        const fallbackAgentId = readNonEmptyString(parseObject(assignee.adapterConfig).recoveryFallbackAgentId);
+        if (fallbackAgentId && fallbackAgentId !== assignee.id) candidateIds.push(fallbackAgentId);
+      }
       if (assignee?.reportsTo) candidateIds.push(assignee.reportsTo);
     }
     if (issue.createdByAgentId) {
@@ -1963,7 +1976,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const existing = await findOpenStrandedIssueRecoveryIssue(input.issue.companyId, input.issue.id);
     if (existing) return existing;
 
-    const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
+    const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue, input.latestRun);
     if (!ownerAgentId) return null;
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
@@ -2091,7 +2104,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
     const recoveryCause = input.recoveryCause ?? "stranded_assigned_issue";
-    const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
+    const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue, input.latestRun);
     const now = new Date();
     const action = await recoveryActionsSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
