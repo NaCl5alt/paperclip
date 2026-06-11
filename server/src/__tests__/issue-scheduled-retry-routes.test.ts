@@ -5,6 +5,7 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentRuntimeState,
   agents,
   agentWakeupRequests,
   companies,
@@ -52,6 +53,7 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -230,31 +232,25 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     const first = await request(app).post(`/api/issues/${issueId}/scheduled-retry/retry-now`).send({});
 
     expect(first.status, JSON.stringify(first.body)).toBe(200);
-    expect(first.body).toMatchObject({
-      outcome: "promoted",
-      scheduledRetry: {
-        runId: retryRunId,
-        status: "queued",
-      },
-    });
+    expect(first.body).toMatchObject({ outcome: "promoted" });
+    expect(first.body.scheduledRetry.runId).toBe(retryRunId);
+    // Fix B dispatches immediately: run may be "queued" or "running" depending on timing.
+    expect(["queued", "running"]).toContain(first.body.scheduledRetry.status);
 
     const second = await request(app).post(`/api/issues/${issueId}/scheduled-retry/retry-now`).send({});
 
     expect(second.status, JSON.stringify(second.body)).toBe(200);
-    expect(second.body).toMatchObject({
-      outcome: "already_promoted",
-      scheduledRetry: {
-        runId: retryRunId,
-        status: "queued",
-      },
-    });
+    expect(second.body).toMatchObject({ outcome: "already_promoted" });
+    expect(second.body.scheduledRetry.runId).toBe(retryRunId);
+    expect(["queued", "running"]).toContain(second.body.scheduledRetry.status);
 
     const retryRuns = await db
       .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.retryOfRunId, first.body.scheduledRetry.retryOfRunId), eq(heartbeatRuns.companyId, companyId)));
     expect(retryRuns).toHaveLength(1);
-    expect(retryRuns[0]).toMatchObject({ id: retryRunId, status: "queued" });
+    expect(retryRuns[0].id).toBe(retryRunId);
+    expect(["queued", "running"]).toContain(retryRuns[0].status);
   });
 
   it("returns a clear no-op response when there is no scheduled retry", async () => {
