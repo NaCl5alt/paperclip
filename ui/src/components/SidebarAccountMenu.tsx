@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Bell,
+  BellOff,
   BookOpen,
   LogOut,
   type LucideIcon,
@@ -16,6 +18,7 @@ import { authApi } from "@/api/auth";
 import { queryKeys } from "@/lib/queryKeys";
 import { useSidebar } from "../context/SidebarContext";
 import { useTheme } from "../context/ThemeContext";
+import { useNotificationPreferences } from "../context/NotificationPreferencesContext";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { cn } from "../lib/utils";
@@ -112,6 +115,7 @@ export function SidebarAccountMenu({
   const queryClient = useQueryClient();
   const { isMobile, setSidebarOpen } = useSidebar();
   const { theme, toggleTheme } = useTheme();
+  const { doneNotificationsEnabled, permission, toggleDoneNotifications } = useNotificationPreferences();
   const open = controlledOpen ?? internalOpen;
   const setOpen = onOpenChange ?? setInternalOpen;
   const { data: session } = useQuery({
@@ -222,6 +226,26 @@ export function SidebarAccountMenu({
                 onClick={() => {
                   toggleTheme();
                   setOpen(false);
+                }}
+              />
+              <MenuAction
+                label={
+                  doneNotificationsEnabled
+                    ? "Turn off task done notifications"
+                    : "Turn on task done notifications"
+                }
+                description={
+                  permission === "unsupported"
+                    ? "This browser does not support notifications."
+                    : permission === "denied"
+                      ? "Notifications are blocked in your browser settings."
+                      : doneNotificationsEnabled
+                        ? "Notifying when one of your tasks is completed."
+                        : "Get a browser notification when one of your tasks is completed."
+                }
+                icon={doneNotificationsEnabled ? Bell : BellOff}
+                onClick={() => {
+                  void toggleDoneNotifications();
                 }}
               />
               {deploymentMode === "authenticated" ? (

@@ -12,7 +12,9 @@ import { useToastActions } from "./ToastContext";
 import { upsertIssueCommentInPages } from "../lib/optimistic-issue-comments";
 import { clearIssueExecutionRun, removeLiveRunById } from "../lib/optimistic-issue-runs";
 import { queryKeys } from "../lib/queryKeys";
-import { toCompanyRelativePath } from "../lib/company-routes";
+import { applyCompanyPrefix, extractCompanyPrefixFromPath, toCompanyRelativePath } from "../lib/company-routes";
+import { showIssueDoneNotification } from "../lib/done-notifications";
+import { useNotificationPreferences } from "./NotificationPreferencesContext";
 import { useLocation } from "../lib/router";
 import { buildSameOriginWebSocketUrl } from "../lib/websocket-url";
 
@@ -527,6 +529,88 @@ function buildActivityToast(
   };
 }
 
+function resolveCachedIssue(
+  queryClient: QueryClient,
+  companyId: string,
+  issueId: string,
+  details: Record<string, unknown> | null,
+): Issue | null {
+  const issueRefs = resolveIssueQueryRefs(queryClient, companyId, issueId, details);
+  const detailIssue = issueRefs
+    .map((ref) => queryClient.getQueryData<Issue>(queryKeys.issues.detail(ref)))
+    .find((issue): issue is Issue => !!issue);
+  if (detailIssue) return detailIssue;
+  return (
+    queryClient
+      .getQueryData<Issue[]>(queryKeys.issues.list(companyId))
+      ?.find((issue) => issueRefs.some((ref) => issue.id === ref || issue.identifier === ref)) ?? null
+  );
+}
+
+async function notifyIssueDoneIfOwn(
+  queryClient: QueryClient,
+  companyId: string,
+  issueId: string,
+  details: Record<string, unknown> | null,
+  currentUserId: string,
+  deps: DoneNotificationDeps,
+) {
+  let issue = resolveCachedIssue(queryClient, companyId, issueId, details);
+  if (!issue) {
+    try {
+      issue = await issuesApi.get(issueId);
+    } catch {
+      return;
+    }
+  }
+  if (issue.assigneeUserId !== currentUserId && issue.createdByUserId !== currentUserId) return;
+
+  const ref = issue.identifier ?? `Issue ${shortId(issue.id)}`;
+  const companyPrefix = extractCompanyPrefixFromPath(deps.getPathname());
+  deps.showNotification({
+    issueId: issue.id,
+    title: `${ref} is done`,
+    body: issue.title ? truncate(issue.title, 96) : undefined,
+    href: applyCompanyPrefix(`/issues/${issue.identifier ?? issue.id}`, companyPrefix),
+  });
+}
+
+interface DoneNotificationDeps {
+  isActive: () => boolean;
+  isForegrounded: () => boolean;
+  getPathname: () => string;
+  showNotification: typeof showIssueDoneNotification;
+}
+
+function maybeNotifyIssueDone(
+  queryClient: QueryClient,
+  companyId: string,
+  payload: Record<string, unknown>,
+  currentActor: { userId: string | null; agentId: string | null },
+  deps: DoneNotificationDeps,
+) {
+  if (!deps.isActive()) return;
+  const currentUserId = currentActor.userId;
+  if (!currentUserId) return;
+
+  const entityType = readString(payload.entityType);
+  const action = readString(payload.action);
+  const entityId = readString(payload.entityId);
+  const details = readRecord(payload.details);
+  if (entityType !== "issue" || action !== "issue.updated" || !entityId) return;
+  if (readString(details?.status) !== "done") return;
+
+  const actorType = readString(payload.actorType);
+  const actorId = readString(payload.actorId);
+  // The board user completing their own issue does not need to be told about it.
+  if (actorType === "user" && actorId === currentUserId) return;
+  // While the board tab is focused the in-app toast already covers the update;
+  // OS notifications are for the backgrounded-tab case.
+  if (deps.isForegrounded()) return;
+
+  void notifyIssueDoneIfOwn(queryClient, companyId, entityId, details, currentUserId, deps);
+}
+
 function buildJoinRequestToast(
   payload: Record<string, unknown>,
 ): ToastInput | null {
@@ -812,6 +896,7 @@ function handleLiveEvent(
   pushToast: (toast: ToastInput) => string | null,
   gate: ToastGate,
   currentActor: { userId: string | null; agentId: string | null },
+  doneNotifications: DoneNotificationDeps,
 ) {
   if (event.companyId !== expectedCompanyId) return;
 
@@ -871,6 +956,7 @@ function handleLiveEvent(
     ) {
       gatedPushToast(gate, pushToast, `activity:${action ?? "unknown"}`, toast);
     }
+    maybeNotifyIssueDone(queryClient, expectedCompanyId, payload, currentActor, doneNotifications);
   }
 }
 
@@ -916,6 +1002,7 @@ function closeSocketQuietly(target: LiveUpdatesSocketLike | null, reason: string
 export const __liveUpdatesTestUtils = {
   buildAgentStatusToast,
   buildRunStatusToast,
+  maybeNotifyIssueDone,
   closeSocketQuietly,
   hydrateVisibleIssueComment,
   invalidateActivityQueries,
@@ -932,6 +1019,8 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
   const { selectedCompanyId, selectedCompany } = useCompany();
   const queryClient = useQueryClient();
   const { pushToast } = useToastActions();
+  const { doneNotificationsActive } = useNotificationPreferences();
+  const doneNotificationsActiveRef = useRef(doneNotificationsActive);
   const location = useLocation();
   const gateRef = useRef<ToastGate>({ cooldownHits: new Map(), suppressUntil: 0 });
   const pathnameRef = useRef(location.pathname);
@@ -952,6 +1041,10 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     pathnameRef.current = location.pathname;
   }, [location.pathname]);
+
+  useEffect(() => {
+    doneNotificationsActiveRef.current = doneNotificationsActive;
+  }, [doneNotificationsActive]);
 
   useEffect(() => {
     currentActorRef.current = {
@@ -1013,6 +1106,11 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
           handleLiveEvent(queryClient, liveCompanyId, pathnameRef.current, parsed, pushToast, gateRef.current, {
             userId: currentActorRef.current.userId,
             agentId: currentActorRef.current.agentId,
+          }, {
+            isActive: () => doneNotificationsActiveRef.current,
+            isForegrounded: isPageForegrounded,
+            getPathname: () => window.location.pathname,
+            showNotification: showIssueDoneNotification,
           });
         } catch {
           // Ignore non-JSON payloads.
