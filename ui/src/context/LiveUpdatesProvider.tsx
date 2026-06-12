@@ -601,9 +601,10 @@ function maybeNotifyIssueDone(
   const entityId = readString(payload.entityId);
   const details = readRecord(payload.details);
   if (entityType !== "issue" || action !== "issue.updated" || !entityId) return;
-  // The backend only includes changed fields in details, so a present "done"
-  // status means a transition; the renotify window and Notification tag bound
-  // the blast radius if that assumption ever changes.
+  // The backend echoes the fields supplied in the update request, so a present
+  // "done" status usually means a transition but is not guaranteed to (a no-op
+  // PATCH re-sending status:"done" emits it too); the renotify window and
+  // Notification tag bound the blast radius for such repeats.
   if (readString(details?.status) !== "done") return;
 
   const actorType = readString(payload.actorType);
