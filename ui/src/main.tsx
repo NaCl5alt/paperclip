@@ -14,6 +14,7 @@ import { DialogProvider } from "./context/DialogContext";
 import { EditorAutocompleteProvider } from "./context/EditorAutocompleteContext";
 import { ToastProvider } from "./context/ToastContext";
 import { ThemeProvider } from "./context/ThemeContext";
+import { NotificationPreferencesProvider } from "./context/NotificationPreferencesContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { initPluginBridge } from "./plugins/bridge-init";
 import { PluginLauncherProvider } from "./plugins/launchers";
@@ -50,7 +51,8 @@ createRoot(document.getElementById("root")!).render(
           <CompanyProvider>
             <EditorAutocompleteProvider>
               <ToastProvider>
-                <LiveUpdatesProvider>
+                <NotificationPreferencesProvider>
+                  <LiveUpdatesProvider>
                   <TooltipProvider>
                     <CompanyAwareBreadcrumbProvider>
                       <SidebarProvider>
@@ -64,7 +66,8 @@ createRoot(document.getElementById("root")!).render(
                       </SidebarProvider>
                     </CompanyAwareBreadcrumbProvider>
                   </TooltipProvider>
-                </LiveUpdatesProvider>
+                  </LiveUpdatesProvider>
+                </NotificationPreferencesProvider>
               </ToastProvider>
             </EditorAutocompleteProvider>
           </CompanyProvider>
