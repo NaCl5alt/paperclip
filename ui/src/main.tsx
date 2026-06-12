@@ -53,19 +53,19 @@ createRoot(document.getElementById("root")!).render(
               <ToastProvider>
                 <NotificationPreferencesProvider>
                   <LiveUpdatesProvider>
-                  <TooltipProvider>
-                    <CompanyAwareBreadcrumbProvider>
-                      <SidebarProvider>
-                        <PanelProvider>
-                          <PluginLauncherProvider>
-                            <DialogProvider>
-                              <App />
-                            </DialogProvider>
-                          </PluginLauncherProvider>
-                        </PanelProvider>
-                      </SidebarProvider>
-                    </CompanyAwareBreadcrumbProvider>
-                  </TooltipProvider>
+                    <TooltipProvider>
+                      <CompanyAwareBreadcrumbProvider>
+                        <SidebarProvider>
+                          <PanelProvider>
+                            <PluginLauncherProvider>
+                              <DialogProvider>
+                                <App />
+                              </DialogProvider>
+                            </PluginLauncherProvider>
+                          </PanelProvider>
+                        </SidebarProvider>
+                      </CompanyAwareBreadcrumbProvider>
+                    </TooltipProvider>
                   </LiveUpdatesProvider>
                 </NotificationPreferencesProvider>
               </ToastProvider>

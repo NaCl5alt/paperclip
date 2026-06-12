@@ -41,6 +41,15 @@ vi.mock("../context/ThemeContext", () => ({
   }),
 }));
 
+vi.mock("../context/NotificationPreferencesContext", () => ({
+  useNotificationPreferences: () => ({
+    doneNotificationsEnabled: false,
+    doneNotificationsActive: false,
+    permission: "default",
+    toggleDoneNotifications: vi.fn(),
+  }),
+}));
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
