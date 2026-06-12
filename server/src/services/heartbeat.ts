@@ -248,7 +248,7 @@ const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 // When a transient-upstream failure carries a retryNotBefore (e.g. a session-limit
 // reset) further away than this threshold, hand the issue off to the assignee's
 // configured recovery fallback agent instead of waiting for the deferred retry.
-export const TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_DEFERRAL_THRESHOLD_MS = 30 * 60 * 1000;
+export const TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_DEFERRAL_THRESHOLD_MS = 5 * 60 * 1000;
 const TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_WAKE_SOURCE = "heartbeat.transient_upstream_recovery_fallback";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
 const WORKSPACE_VALIDATION_FAILURE_CODE = "workspace_validation_failed";
