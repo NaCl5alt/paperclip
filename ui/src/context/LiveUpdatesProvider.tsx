@@ -564,6 +564,9 @@ async function notifyIssueDoneIfOwn(
     }
   }
   if (issue.assigneeUserId !== currentUserId && issue.createdByUserId !== currentUserId) return;
+  // The cache-miss fetch above can be slow; re-check the gates so a toggle flip
+  // or a foregrounded tab during the await does not still produce a notification.
+  if (!deps.isActive() || deps.isForegrounded()) return;
 
   const ref = issue.identifier ?? `Issue ${shortId(issue.id)}`;
   const companyPrefix = extractCompanyPrefixFromPath(deps.getPathname());
@@ -598,6 +601,9 @@ function maybeNotifyIssueDone(
   const entityId = readString(payload.entityId);
   const details = readRecord(payload.details);
   if (entityType !== "issue" || action !== "issue.updated" || !entityId) return;
+  // The backend only includes changed fields in details, so a present "done"
+  // status means a transition; the renotify window and Notification tag bound
+  // the blast radius if that assumption ever changes.
   if (readString(details?.status) !== "done") return;
 
   const actorType = readString(payload.actorType);
@@ -956,7 +962,11 @@ function handleLiveEvent(
     ) {
       gatedPushToast(gate, pushToast, `activity:${action ?? "unknown"}`, toast);
     }
-    maybeNotifyIssueDone(queryClient, expectedCompanyId, payload, currentActor, doneNotifications);
+    // Reuse the toast reconnect-suppression window so replayed events after a
+    // WebSocket reconnect do not produce OS notifications either.
+    if (Date.now() >= gate.suppressUntil) {
+      maybeNotifyIssueDone(queryClient, expectedCompanyId, payload, currentActor, doneNotifications);
+    }
   }
 }
 

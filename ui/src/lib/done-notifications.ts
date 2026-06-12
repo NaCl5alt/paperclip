@@ -53,6 +53,12 @@ export function showIssueDoneNotification(input: DoneNotificationInput, now = Da
   const last = lastNotifiedAt.get(input.issueId);
   if (last !== undefined && now - last < RENOTIFY_SUPPRESS_MS) return false;
 
+  // Entries outside the suppress window are dead weight; sweep them so the
+  // map stays bounded in long-lived tabs.
+  for (const [issueId, notifiedAt] of lastNotifiedAt) {
+    if (now - notifiedAt >= RENOTIFY_SUPPRESS_MS) lastNotifiedAt.delete(issueId);
+  }
+
   let notification: Notification;
   try {
     notification = new Notification(input.title, {
