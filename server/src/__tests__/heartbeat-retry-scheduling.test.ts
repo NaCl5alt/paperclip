@@ -1507,7 +1507,9 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     const runId = randomUUID();
     const issueId = randomUUID();
     const now = new Date("2026-04-21T09:00:00.000Z");
-    const retryNotBefore = new Date(now.getTime() + 5 * 60 * 1000);
+    const retryNotBefore = new Date(
+      now.getTime() + TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_DEFERRAL_THRESHOLD_MS - 60 * 1000,
+    );
     const { fallbackAgentId } = await seedRecoveryFallbackFixture({
       companyId,
       agentId,
