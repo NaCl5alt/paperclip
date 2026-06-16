@@ -123,7 +123,7 @@ function dayKeyExpr(dateSql: ReturnType<typeof sql>) {
   return sql<string>`to_char(date_trunc('day', ${dateSql}), 'YYYY-MM-DD')`;
 }
 
-function sumNumber(column: typeof costEvents.costCents | typeof costEvents.inputTokens | typeof costEvents.cachedInputTokens | typeof costEvents.outputTokens) {
+function sumNumber(column: typeof costEvents.costCents | typeof costEvents.inputTokens | typeof costEvents.cachedInputTokens | typeof costEvents.cacheCreationInputTokens | typeof costEvents.outputTokens) {
   return sql<number>`coalesce(sum(${column}), 0)::double precision`;
 }
 
@@ -180,6 +180,7 @@ async function loadWindowStats(
       costCents: sumNumber(costEvents.costCents),
       inputTokens: sumNumber(costEvents.inputTokens),
       cachedInputTokens: sumNumber(costEvents.cachedInputTokens),
+      cacheCreationInputTokens: sumNumber(costEvents.cacheCreationInputTokens),
       outputTokens: sumNumber(costEvents.outputTokens),
       costEventCount: sql<number>`count(${costEvents.id})::int`,
     })
@@ -199,6 +200,7 @@ async function loadWindowStats(
     costCents: Number(costStats?.costCents ?? 0),
     inputTokens: Number(costStats?.inputTokens ?? 0),
     cachedInputTokens: Number(costStats?.cachedInputTokens ?? 0),
+    cacheCreationInputTokens: Number(costStats?.cacheCreationInputTokens ?? 0),
     outputTokens: Number(costStats?.outputTokens ?? 0),
     costEventCount: Number(costStats?.costEventCount ?? 0),
   };
@@ -216,6 +218,7 @@ async function loadDailyStats(db: Db, companyId: string, userId: string): Promis
       costCents: 0,
       inputTokens: 0,
       cachedInputTokens: 0,
+      cacheCreationInputTokens: 0,
       outputTokens: 0,
     });
   }
@@ -272,6 +275,7 @@ async function loadDailyStats(db: Db, companyId: string, userId: string): Promis
       costCents: sumNumber(costEvents.costCents),
       inputTokens: sumNumber(costEvents.inputTokens),
       cachedInputTokens: sumNumber(costEvents.cachedInputTokens),
+      cacheCreationInputTokens: sumNumber(costEvents.cacheCreationInputTokens),
       outputTokens: sumNumber(costEvents.outputTokens),
     })
     .from(costEvents)
@@ -291,6 +295,7 @@ async function loadDailyStats(db: Db, companyId: string, userId: string): Promis
     point.costCents = Number(row.costCents);
     point.inputTokens = Number(row.inputTokens);
     point.cachedInputTokens = Number(row.cachedInputTokens);
+    point.cacheCreationInputTokens = Number(row.cacheCreationInputTokens);
     point.outputTokens = Number(row.outputTokens);
   }
 
@@ -365,6 +370,7 @@ export function userProfileRoutes(db: Db) {
           costCents: sumNumber(costEvents.costCents),
           inputTokens: sumNumber(costEvents.inputTokens),
           cachedInputTokens: sumNumber(costEvents.cachedInputTokens),
+          cacheCreationInputTokens: sumNumber(costEvents.cacheCreationInputTokens),
           outputTokens: sumNumber(costEvents.outputTokens),
         })
         .from(costEvents)
@@ -382,6 +388,7 @@ export function userProfileRoutes(db: Db) {
           costCents: sumNumber(costEvents.costCents),
           inputTokens: sumNumber(costEvents.inputTokens),
           cachedInputTokens: sumNumber(costEvents.cachedInputTokens),
+          cacheCreationInputTokens: sumNumber(costEvents.cacheCreationInputTokens),
           outputTokens: sumNumber(costEvents.outputTokens),
         })
         .from(costEvents)
@@ -418,6 +425,7 @@ export function userProfileRoutes(db: Db) {
         costCents: Number(entry.costCents),
         inputTokens: Number(entry.inputTokens),
         cachedInputTokens: Number(entry.cachedInputTokens),
+        cacheCreationInputTokens: Number(entry.cacheCreationInputTokens),
         outputTokens: Number(entry.outputTokens),
       })),
       topProviders: topProviders.map((entry) => ({
@@ -425,6 +433,7 @@ export function userProfileRoutes(db: Db) {
         costCents: Number(entry.costCents),
         inputTokens: Number(entry.inputTokens),
         cachedInputTokens: Number(entry.cachedInputTokens),
+        cacheCreationInputTokens: Number(entry.cacheCreationInputTokens),
         outputTokens: Number(entry.outputTokens),
       })),
     };

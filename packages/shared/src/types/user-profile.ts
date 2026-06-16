@@ -23,6 +23,7 @@ export interface UserProfileWindowStats {
   costCents: number;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheCreationInputTokens: number;
   outputTokens: number;
   costEventCount: number;
 }
@@ -34,6 +35,7 @@ export interface UserProfileDailyPoint {
   costCents: number;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheCreationInputTokens: number;
   outputTokens: number;
 }
 
@@ -64,6 +66,7 @@ export interface UserProfileAgentUsage {
   costCents: number;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheCreationInputTokens: number;
   outputTokens: number;
 }
 
@@ -74,6 +77,7 @@ export interface UserProfileProviderUsage {
   costCents: number;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheCreationInputTokens: number;
   outputTokens: number;
 }
 

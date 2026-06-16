@@ -806,6 +806,7 @@ export function buildHostServices(
         costCents: 0,
         inputTokens: 0,
         cachedInputTokens: 0,
+        cacheCreationInputTokens: 0,
         outputTokens: 0,
         billingCode: billingCode ?? null,
       };
@@ -816,6 +817,7 @@ export function buildHostServices(
         costCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::double precision`,
         inputTokens: sql<number>`coalesce(sum(${costEvents.inputTokens}), 0)::double precision`,
         cachedInputTokens: sql<number>`coalesce(sum(${costEvents.cachedInputTokens}), 0)::double precision`,
+        cacheCreationInputTokens: sql<number>`coalesce(sum(${costEvents.cacheCreationInputTokens}), 0)::double precision`,
         outputTokens: sql<number>`coalesce(sum(${costEvents.outputTokens}), 0)::double precision`,
       })
       .from(costEvents)
@@ -825,6 +827,7 @@ export function buildHostServices(
       costCents: Number(row?.costCents ?? 0),
       inputTokens: Number(row?.inputTokens ?? 0),
       cachedInputTokens: Number(row?.cachedInputTokens ?? 0),
+      cacheCreationInputTokens: Number(row?.cacheCreationInputTokens ?? 0),
       outputTokens: Number(row?.outputTokens ?? 0),
       billingCode: billingCode ?? null,
     };

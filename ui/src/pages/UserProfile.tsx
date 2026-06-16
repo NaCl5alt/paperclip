@@ -31,8 +31,8 @@ function initials(name: string | null | undefined) {
   return value.slice(0, 2).toUpperCase();
 }
 
-function totalTokens(stats: Pick<UserProfileWindowStats, "inputTokens" | "cachedInputTokens" | "outputTokens">) {
-  return stats.inputTokens + stats.cachedInputTokens + stats.outputTokens;
+function totalTokens(stats: Pick<UserProfileWindowStats, "inputTokens" | "cachedInputTokens" | "cacheCreationInputTokens" | "outputTokens">) {
+  return stats.inputTokens + stats.cachedInputTokens + stats.cacheCreationInputTokens + stats.outputTokens;
 }
 
 function completionRate(stats: UserProfileWindowStats) {
@@ -154,6 +154,7 @@ interface UsageRow {
   costCents: number;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheCreationInputTokens: number;
   outputTokens: number;
 }
 
@@ -223,6 +224,7 @@ export function UserProfile() {
         costCents: row.costCents,
         inputTokens: row.inputTokens,
         cachedInputTokens: row.cachedInputTokens,
+        cacheCreationInputTokens: row.cacheCreationInputTokens,
         outputTokens: row.outputTokens,
       })),
     [data?.topAgents],
@@ -237,6 +239,7 @@ export function UserProfile() {
         costCents: row.costCents,
         inputTokens: row.inputTokens,
         cachedInputTokens: row.cachedInputTokens,
+        cacheCreationInputTokens: row.cacheCreationInputTokens,
         outputTokens: row.outputTokens,
       })),
     [data?.topProviders],

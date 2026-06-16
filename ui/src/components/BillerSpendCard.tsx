@@ -29,7 +29,7 @@ export function BillerSpendCard({
         outputTokens: 0,
       };
       current.costCents += entry.costCents;
-      current.inputTokens += entry.inputTokens + entry.cachedInputTokens;
+      current.inputTokens += entry.inputTokens + entry.cachedInputTokens + entry.cacheCreationInputTokens;
       current.outputTokens += entry.outputTokens;
       map.set(entry.provider, current);
     }
@@ -65,6 +65,12 @@ export function BillerSpendCard({
               <span className="font-mono">{formatTokens(row.inputTokens + row.cachedInputTokens)}</span> in
               {" · "}
               <span className="font-mono">{formatTokens(row.outputTokens)}</span> out
+              {row.cacheCreationInputTokens > 0 ? (
+                <>
+                  {" · "}
+                  <span className="font-mono">{formatTokens(row.cacheCreationInputTokens)}</span> cache write
+                </>
+              ) : null}
               {" · "}
               {row.providerCount} provider{row.providerCount === 1 ? "" : "s"}
               {" · "}

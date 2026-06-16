@@ -285,6 +285,11 @@ function runMetrics(run: HeartbeatRun) {
     "cached_input_tokens",
     "cache_read_input_tokens",
   );
+  const cacheCreation = usageNumber(
+    usage,
+    "cacheCreationInputTokens",
+    "cache_creation_input_tokens",
+  );
   const cost =
     visibleRunCostUsd(usage, result);
   const provider = asNonEmptyString(usage?.provider) ?? null;
@@ -293,6 +298,7 @@ function runMetrics(run: HeartbeatRun) {
     input,
     output,
     cached,
+    cacheCreation,
     cost,
     totalTokens: input + output,
     provider,
@@ -1373,7 +1379,7 @@ function CostsSection({
   const runsWithCost = runs
     .filter((r) => {
       const metrics = runMetrics(r);
-      return metrics.cost > 0 || metrics.input > 0 || metrics.output > 0 || metrics.cached > 0;
+      return metrics.cost > 0 || metrics.input > 0 || metrics.output > 0 || metrics.cached > 0 || metrics.cacheCreation > 0;
     })
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
@@ -3254,7 +3260,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
     ? Math.round((new Date(run.finishedAt).getTime() - new Date(run.startedAt).getTime()) / 1000)
     : null;
   const displayDurationSec = durationSec ?? (isRunning ? elapsedSec : null);
-  const hasMetrics = metrics.input > 0 || metrics.output > 0 || metrics.cached > 0 || metrics.cost > 0;
+  const hasMetrics = metrics.input > 0 || metrics.output > 0 || metrics.cached > 0 || metrics.cacheCreation > 0 || metrics.cost > 0;
   const hasSession = !!(run.sessionIdBefore || run.sessionIdAfter);
   const sessionChanged = run.sessionIdBefore && run.sessionIdAfter && run.sessionIdBefore !== run.sessionIdAfter;
   const sessionId = run.sessionIdAfter || run.sessionIdBefore;
@@ -3455,6 +3461,12 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 <div className="text-xs text-muted-foreground">Cached</div>
                 <div className="text-sm font-medium font-mono">{formatTokens(metrics.cached)}</div>
               </div>
+              {metrics.cacheCreation > 0 ? (
+                <div>
+                  <div className="text-xs text-muted-foreground">Cache write</div>
+                  <div className="text-sm font-medium font-mono">{formatTokens(metrics.cacheCreation)}</div>
+                </div>
+              ) : null}
               <div>
                 <div className="text-xs text-muted-foreground">Cost</div>
                 <div className="text-sm font-medium font-mono">{metrics.cost > 0 ? `$${metrics.cost.toFixed(4)}` : "-"}</div>

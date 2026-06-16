@@ -1161,6 +1161,7 @@ async function buildAgentContext(
         model: costEvents.model,
         inputTokens: costEvents.inputTokens,
         cachedInputTokens: costEvents.cachedInputTokens,
+        cacheCreationInputTokens: costEvents.cacheCreationInputTokens,
         outputTokens: costEvents.outputTokens,
         costCents: costEvents.costCents,
       })
@@ -1194,6 +1195,7 @@ async function buildAgentContext(
           model: asString(usage.model),
           inputTokens: asNumber(usage.inputTokens) ?? asNumber(usage.rawInputTokens),
           cachedInputTokens: asNumber(usage.cachedInputTokens) ?? asNumber(usage.rawCachedInputTokens),
+          cacheCreationInputTokens: asNumber(usage.cacheCreationInputTokens) ?? asNumber(usage.rawCacheCreationInputTokens),
           outputTokens: asNumber(usage.outputTokens) ?? asNumber(usage.rawOutputTokens),
           costUsd: asNumber(usage.costUsd),
           usageSource: asString(usage.usageSource),
@@ -1213,6 +1215,7 @@ async function buildAgentContext(
         models: uniqueNonEmpty(runCosts.map((row) => row.model)),
         inputTokens: runCosts.reduce((sum, row) => sum + row.inputTokens, 0),
         cachedInputTokens: runCosts.reduce((sum, row) => sum + row.cachedInputTokens, 0),
+        cacheCreationInputTokens: runCosts.reduce((sum, row) => sum + row.cacheCreationInputTokens, 0),
         outputTokens: runCosts.reduce((sum, row) => sum + row.outputTokens, 0),
         costCents: runCosts.reduce((sum, row) => sum + row.costCents, 0),
       }

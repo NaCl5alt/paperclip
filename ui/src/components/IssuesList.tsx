@@ -507,7 +507,7 @@ function SubIssueProgressSummaryStrip({
   });
 
   const totalTokens = costSummary
-    ? costSummary.inputTokens + costSummary.cachedInputTokens + costSummary.outputTokens
+    ? costSummary.inputTokens + costSummary.cachedInputTokens + costSummary.cacheCreationInputTokens + costSummary.outputTokens
     : 0;
   const showCostSummary = !!costSummary && (costSummary.runCount > 0 || totalTokens > 0);
 

@@ -1072,6 +1072,7 @@ function IssueDetailActivityTab({
     let input = 0;
     let output = 0;
     let cached = 0;
+    let cacheCreation = 0;
     let cost = 0;
     let runtimeMs = 0;
     let runCount = 0;
@@ -1090,12 +1091,18 @@ function IssueDetailActivityTab({
         "cached_input_tokens",
         "cache_read_input_tokens",
       );
+      const runCacheCreation = usageNumber(
+        usage,
+        "cacheCreationInputTokens",
+        "cache_creation_input_tokens",
+      );
       const runCost = visibleRunCostUsd(usage, result);
       if (runCost > 0) hasCost = true;
-      if (runInput + runOutput + runCached > 0) hasTokens = true;
+      if (runInput + runOutput + runCached + runCacheCreation > 0) hasTokens = true;
       input += runInput;
       output += runOutput;
       cached += runCached;
+      cacheCreation += runCacheCreation;
       cost += runCost;
 
       if (run.startedAt) {
@@ -1112,6 +1119,7 @@ function IssueDetailActivityTab({
       input,
       output,
       cached,
+      cacheCreation,
       cost,
       totalTokens: input + output,
       hasCost,
@@ -1128,6 +1136,7 @@ function IssueDetailActivityTab({
     && (issueTreeCostSummary.costCents > 0
       || issueTreeCostTokens > 0
       || issueTreeCostSummary.cachedInputTokens > 0
+      || issueTreeCostSummary.cacheCreationInputTokens > 0
       || issueTreeCostSummary.runtimeMs > 0
       || issueTreeCostSummary.issueCount > 1);
   const shouldShowCostSummary =
@@ -1156,9 +1165,7 @@ function IssueDetailActivityTab({
                 {issueCostSummary.hasTokens ? (
                   <span>
                     Tokens {formatTokens(issueCostSummary.totalTokens)}
-                    {issueCostSummary.cached > 0
-                      ? ` (in ${formatTokens(issueCostSummary.input)}, out ${formatTokens(issueCostSummary.output)}, cached ${formatTokens(issueCostSummary.cached)})`
-                      : ` (in ${formatTokens(issueCostSummary.input)}, out ${formatTokens(issueCostSummary.output)})`}
+                    {` (in ${formatTokens(issueCostSummary.input)}, out ${formatTokens(issueCostSummary.output)}${issueCostSummary.cached > 0 ? `, cached ${formatTokens(issueCostSummary.cached)}` : ""}${issueCostSummary.cacheCreation > 0 ? `, cache write ${formatTokens(issueCostSummary.cacheCreation)}` : ""})`}
                   </span>
                 ) : null}
                 {issueCostSummary.hasRuntime ? (
@@ -1183,9 +1190,7 @@ function IssueDetailActivityTab({
                   </span>
                   <span>
                     Tokens {formatTokens(issueTreeCostTokens)}
-                    {issueTreeCostSummary.cachedInputTokens > 0
-                      ? ` (in ${formatTokens(issueTreeCostSummary.inputTokens)}, out ${formatTokens(issueTreeCostSummary.outputTokens)}, cached ${formatTokens(issueTreeCostSummary.cachedInputTokens)})`
-                      : ` (in ${formatTokens(issueTreeCostSummary.inputTokens)}, out ${formatTokens(issueTreeCostSummary.outputTokens)})`}
+                    {` (in ${formatTokens(issueTreeCostSummary.inputTokens)}, out ${formatTokens(issueTreeCostSummary.outputTokens)}${issueTreeCostSummary.cachedInputTokens > 0 ? `, cached ${formatTokens(issueTreeCostSummary.cachedInputTokens)}` : ""}${issueTreeCostSummary.cacheCreationInputTokens > 0 ? `, cache write ${formatTokens(issueTreeCostSummary.cacheCreationInputTokens)}` : ""})`}
                   </span>
                   {issueTreeCostSummary.runCount > 0 ? (
                     <span>
