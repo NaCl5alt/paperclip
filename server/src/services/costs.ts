@@ -71,6 +71,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           biller: data.biller ?? data.provider,
           billingType: data.billingType ?? "unknown",
           cachedInputTokens: data.cachedInputTokens ?? 0,
+          cacheCreationInputTokens: data.cacheCreationInputTokens ?? 0,
         })
         .returning()
         .then((rows) => rows[0]);

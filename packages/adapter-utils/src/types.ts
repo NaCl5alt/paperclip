@@ -30,7 +30,10 @@ export interface AdapterRuntime {
 export interface UsageSummary {
   inputTokens: number;
   outputTokens: number;
+  /** Tokens served from the prompt cache (cache read). */
   cachedInputTokens?: number;
+  /** Tokens written to the prompt cache (cache creation/write). Largest metered cost item; must be retained for cost visibility. */
+  cacheCreationInputTokens?: number;
 }
 
 export type AdapterBillingType =

@@ -14,6 +14,7 @@ export const createCostEventSchema = z.object({
   model: z.string().min(1),
   inputTokens: z.number().int().nonnegative().optional().default(0),
   cachedInputTokens: z.number().int().nonnegative().optional().default(0),
+  cacheCreationInputTokens: z.number().int().nonnegative().optional().default(0),
   outputTokens: z.number().int().nonnegative().optional().default(0),
   costCents: z.number().int().nonnegative(),
   occurredAt: z.string().datetime(),

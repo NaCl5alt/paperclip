@@ -15,6 +15,7 @@ export interface CostEvent {
   model: string;
   inputTokens: number;
   cachedInputTokens: number;
+  cacheCreationInputTokens: number;
   outputTokens: number;
   costCents: number;
   occurredAt: Date;

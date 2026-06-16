@@ -213,6 +213,53 @@ describe("parseClaudeStreamJson incompleteToolCall (VANA-644 fixture)", () => {
   });
 });
 
+describe("parseClaudeStreamJson usage cache tokens (VANA-1034)", () => {
+  it("retains cache_creation and cache_read tokens in the usage summary", () => {
+    const stdout = streamLines([
+      { type: "system", subtype: "init", session_id: "sess-cache", model: "claude-opus-4-8" },
+      {
+        type: "result",
+        subtype: "success",
+        session_id: "sess-cache",
+        is_error: false,
+        result: "done",
+        total_cost_usd: 1.23,
+        usage: {
+          input_tokens: 100,
+          output_tokens: 50,
+          cache_read_input_tokens: 4000,
+          cache_creation_input_tokens: 9000,
+        },
+      },
+    ]);
+    const parsed = parseClaudeStreamJson(stdout);
+    expect(parsed.usage).toEqual({
+      inputTokens: 100,
+      cachedInputTokens: 4000,
+      cacheCreationInputTokens: 9000,
+      outputTokens: 50,
+    });
+  });
+
+  it("defaults cache token counts to 0 when the result omits them", () => {
+    const stdout = streamLines([
+      { type: "system", subtype: "init", session_id: "sess-nocache", model: "claude-opus-4-8" },
+      {
+        type: "result",
+        subtype: "success",
+        session_id: "sess-nocache",
+        is_error: false,
+        result: "done",
+        total_cost_usd: 0.1,
+        usage: { input_tokens: 10, output_tokens: 5 },
+      },
+    ]);
+    const parsed = parseClaudeStreamJson(stdout);
+    expect(parsed.usage?.cacheCreationInputTokens).toBe(0);
+    expect(parsed.usage?.cachedInputTokens).toBe(0);
+  });
+});
+
 describe("extractClaudeRetryNotBefore", () => {
   it("parses the 'resets 4pm' hint in its explicit timezone", () => {
     const now = new Date("2026-04-22T15:15:00.000Z");
