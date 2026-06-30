@@ -199,6 +199,25 @@ export function parseGeminiJsonl(stdout: string) {
   };
 }
 
+/**
+ * Parse output from the Antigravity CLI (`agy`). Unlike the stock gemini CLI,
+ * agy print mode emits the assistant response as plain text on stdout (no
+ * stream-json), and exposes no session/usage/cost metadata. We therefore treat
+ * the whole stdout as the summary and return the same shape as
+ * {@link parseGeminiJsonl} with the structured fields empty.
+ */
+export function parseAgyOutput(stdout: string): ReturnType<typeof parseGeminiJsonl> {
+  return {
+    sessionId: null,
+    summary: stdout.trim(),
+    usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 },
+    costUsd: null,
+    errorMessage: null,
+    resultEvent: null,
+    question: null,
+  };
+}
+
 export function isGeminiUnknownSessionError(stdout: string, stderr: string): boolean {
   const haystack = `${stdout}\n${stderr}`
     .split(/\r?\n/)

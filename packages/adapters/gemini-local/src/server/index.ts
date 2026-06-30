@@ -3,11 +3,13 @@ export { listGeminiSkills, syncGeminiSkills } from "./skills.js";
 export { testEnvironment } from "./test.js";
 export {
   parseGeminiJsonl,
+  parseAgyOutput,
   isGeminiUnknownSessionError,
   describeGeminiFailure,
   detectGeminiAuthRequired,
   isGeminiTurnLimitResult,
 } from "./parse.js";
+export { isAgyCommand, buildGeminiInvocationArgs, AGY_SESSION_SENTINEL } from "./args.js";
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
 
 function readNonEmptyString(value: unknown): string | null {

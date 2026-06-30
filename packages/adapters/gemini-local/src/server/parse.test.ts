@@ -1,5 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { parseGeminiJsonl } from "./parse.js";
+import { parseAgyOutput, parseGeminiJsonl } from "./parse.js";
+
+describe("parseAgyOutput", () => {
+  it("treats plain stdout as the summary and leaves metadata empty", () => {
+    const parsed = parseAgyOutput("  READY\n");
+    expect(parsed.summary).toBe("READY");
+    expect(parsed.sessionId).toBeNull();
+    expect(parsed.errorMessage).toBeNull();
+    expect(parsed.resultEvent).toBeNull();
+    expect(parsed.usage).toEqual({ inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 });
+  });
+
+  it("preserves multi-line plain text responses", () => {
+    const parsed = parseAgyOutput("line one\nline two");
+    expect(parsed.summary).toBe("line one\nline two");
+  });
+});
 
 describe("parseGeminiJsonl", () => {
   it("collects assistant text from message events with string content", () => {

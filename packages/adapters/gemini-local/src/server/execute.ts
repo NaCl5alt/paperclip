@@ -53,8 +53,10 @@ import {
   detectGeminiAuthRequired,
   isGeminiTurnLimitResult,
   isGeminiUnknownSessionError,
+  parseAgyOutput,
   parseGeminiJsonl,
 } from "./parse.js";
+import { AGY_SESSION_SENTINEL, buildGeminiInvocationArgs, isAgyCommand } from "./args.js";
 import { firstNonEmptyLine } from "./utils.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -184,6 +186,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const command = asString(config.command, "gemini");
+  const isAgy = isAgyCommand(command);
+  // agy stores conversations per-HOME under ~/.gemini/antigravity-cli, and its
+  // print-mode resume (`--continue`) targets the most-recent conversation in
+  // that store with no per-agent scoping. Sharing a HOME across agents would
+  // therefore let one agent resume another's conversation, so agy resume is
+  // opt-in (default off = fresh, stateless, isolated run each heartbeat).
+  const agyResume = isAgy && asBoolean(config.agyResume, false);
   const model = asString(config.model, DEFAULT_GEMINI_LOCAL_MODEL).trim();
   const sandbox = asBoolean(config.sandbox, false);
 
@@ -445,8 +454,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   }
   const commandNotes = (() => {
-    const notes: string[] = ["Prompt is passed to Gemini via --prompt for non-interactive execution."];
-    notes.push("Added --approval-mode yolo for unattended execution.");
+    const notes: string[] = [];
+    if (isAgy) {
+      notes.push("Detected agy/antigravity command: using Antigravity CLI flag dialect.");
+      notes.push(
+        "Prompt passed via --prompt; unattended via --dangerously-skip-permissions (no --output-format/--approval-mode/--sandbox=none).",
+      );
+      notes.push(
+        agyResume
+          ? "Resume enabled (config.agyResume): uses --continue (most recent conversation); requires a per-agent HOME to avoid cross-agent context bleed."
+          : "Resume disabled by default (config.agyResume=false): each heartbeat runs fresh/stateless; agy print mode exposes no conversation id to round-trip.",
+      );
+    } else {
+      notes.push("Prompt is passed to Gemini via --prompt for non-interactive execution.");
+      notes.push("Added --approval-mode yolo for unattended execution.");
+    }
     if (executionTargetIsRemote) {
       notes.push("Set GEMINI_CLI_TRUST_WORKSPACE=true for remote headless execution.");
     }
@@ -503,20 +525,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     heartbeatPromptChars: renderedPrompt.length,
   };
 
-  const buildArgs = (resumeSessionId: string | null) => {
-    const args = ["--output-format", "stream-json"];
-    if (resumeSessionId) args.push("--resume", resumeSessionId);
-    if (model && model !== DEFAULT_GEMINI_LOCAL_MODEL) args.push("--model", model);
-    args.push("--approval-mode", "yolo");
-    if (sandbox) {
-      args.push("--sandbox");
-    } else {
-      args.push("--sandbox=none");
-    }
-    if (extraArgs.length > 0) args.push(...extraArgs);
-    args.push("--prompt", prompt);
-    return args;
-  };
+  const buildArgs = (resumeSessionId: string | null) =>
+    buildGeminiInvocationArgs({
+      isAgy,
+      resumeSessionId,
+      model,
+      defaultModel: DEFAULT_GEMINI_LOCAL_MODEL,
+      sandbox,
+      extraArgs,
+      prompt,
+    });
 
   const runAttempt = async (resumeSessionId: string | null) => {
     const args = buildArgs(resumeSessionId);
@@ -546,7 +564,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
     return {
       proc,
-      parsed: parseGeminiJsonl(proc.stdout),
+      parsed: isAgy ? parseAgyOutput(proc.stdout) : parseGeminiJsonl(proc.stdout),
     };
   };
 
@@ -586,12 +604,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const structuredFailure = attempt.parsed.resultEvent
       ? describeGeminiFailure(attempt.parsed.resultEvent)
       : null;
+    // agy exits 0 even on some failures (e.g. it silently ignores an invalid
+    // --model) and emits plain text, so exit code alone is not a reliable
+    // success signal. Treat an exit-0 run with no output as a failure so a
+    // broken run cannot look successful or poison the resume sentinel.
+    const agyEmptyOutput = isAgy && (attempt.proc.exitCode ?? 0) === 0 && attempt.parsed.summary.length === 0;
     const fallbackErrorMessage =
       parsedError ||
       structuredFailure ||
       stderrLine ||
-      `Gemini exited with code ${attempt.proc.exitCode ?? -1}`;
-    const failed = (attempt.proc.exitCode ?? 0) !== 0;
+      (agyEmptyOutput
+        ? "agy produced no output"
+        : `Gemini exited with code ${attempt.proc.exitCode ?? -1}`);
+    const failed = (attempt.proc.exitCode ?? 0) !== 0 || agyEmptyOutput;
     const clearSessionForTurnLimit = isGeminiTurnLimitResult(
       attempt.parsed.resultEvent,
       attempt.proc.exitCode,
@@ -599,8 +624,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     // On retry, don't fall back to old session ID — the old session was stale
     const canFallbackToRuntimeSession = !isRetry;
-    const resolvedSessionId = attempt.parsed.sessionId
-      ?? (canFallbackToRuntimeSession ? (runtimeSessionId ?? runtime.sessionId ?? null) : null);
+    const resolvedSessionId = isAgy
+      // agy exposes no conversation id; when resume is opted in, persist a
+      // sentinel after a successful run so the next heartbeat passes --continue
+      // (resume most recent conversation). Never persisted when resume is off.
+      ? (!failed && agyResume ? AGY_SESSION_SENTINEL : null)
+      : (attempt.parsed.sessionId
+        ?? (canFallbackToRuntimeSession ? (runtimeSessionId ?? runtime.sessionId ?? null) : null));
     const resolvedSessionParams = resolvedSessionId
       ? ({
         sessionId: resolvedSessionId,
@@ -655,7 +685,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionId &&
       !initial.proc.timedOut &&
       (initial.proc.exitCode ?? 0) !== 0 &&
-      isGeminiUnknownSessionError(initial.proc.stdout, initial.proc.stderr)
+      // agy can't report unknown-session structurally; any failed --continue retries fresh.
+      (isAgy || isGeminiUnknownSessionError(initial.proc.stdout, initial.proc.stderr))
     ) {
       await onLog(
         "stdout",
