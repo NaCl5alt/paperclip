@@ -52,12 +52,31 @@ describe("buildGeminiInvocationArgs (agy dialect)", () => {
     const args = buildGeminiInvocationArgs({ ...base, isAgy: true, resumeSessionId: null });
     expect(args).toEqual([
       "--dangerously-skip-permissions",
+      "--print-timeout",
+      "30m",
       "--prompt",
       "hello world",
     ]);
     expect(args).not.toContain("--output-format");
     expect(args).not.toContain("--approval-mode");
     expect(args).not.toContain("--sandbox=none");
+  });
+
+  it("uses timeoutSec to format --print-timeout", () => {
+    const args = buildGeminiInvocationArgs({ ...base, isAgy: true, resumeSessionId: null, timeoutSec: 120 });
+    expect(args).toContain("--print-timeout");
+    expect(args[args.indexOf("--print-timeout") + 1]).toBe("120s");
+  });
+
+  it("does not override --print-timeout if specified in extraArgs", () => {
+    const args = buildGeminiInvocationArgs({
+      ...base,
+      isAgy: true,
+      resumeSessionId: null,
+      extraArgs: ["--print-timeout", "60m"],
+    });
+    expect(args.filter(x => x === "--print-timeout").length).toBe(1);
+    expect(args[args.indexOf("--print-timeout") + 1]).toBe("60m");
   });
 
   it("uses --continue (not --resume) when resuming", () => {

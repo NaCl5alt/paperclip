@@ -534,6 +534,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sandbox,
       extraArgs,
       prompt,
+      timeoutSec,
     });
 
   const runAttempt = async (resumeSessionId: string | null) => {

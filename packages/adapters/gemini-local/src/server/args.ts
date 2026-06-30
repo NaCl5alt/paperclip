@@ -28,6 +28,8 @@ export interface GeminiInvocationArgOptions {
   extraArgs: string[];
   /** Fully-rendered prompt text. */
   prompt: string;
+  /** Optional process execution timeout in seconds. */
+  timeoutSec?: number;
 }
 
 /**
@@ -44,7 +46,7 @@ export interface GeminiInvocationArgOptions {
  *     id to round-trip, so we resume the most recent conversation)
  */
 export function buildGeminiInvocationArgs(opts: GeminiInvocationArgOptions): string[] {
-  const { isAgy, resumeSessionId, model, defaultModel, sandbox, extraArgs, prompt } = opts;
+  const { isAgy, resumeSessionId, model, defaultModel, sandbox, extraArgs, prompt, timeoutSec } = opts;
 
   if (isAgy) {
     const args: string[] = [];
@@ -52,6 +54,10 @@ export function buildGeminiInvocationArgs(opts: GeminiInvocationArgOptions): str
     if (model && model !== defaultModel) args.push("--model", model);
     args.push("--dangerously-skip-permissions");
     if (sandbox) args.push("--sandbox");
+    if (!extraArgs.includes("--print-timeout")) {
+      const timeoutVal = timeoutSec && timeoutSec > 0 ? `${timeoutSec}s` : "30m";
+      args.push("--print-timeout", timeoutVal);
+    }
     if (extraArgs.length > 0) args.push(...extraArgs);
     args.push("--prompt", prompt);
     return args;
