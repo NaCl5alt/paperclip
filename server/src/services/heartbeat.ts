@@ -5996,7 +5996,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         currentAssigneeAgentId: issue.assigneeAgentId,
       });
     }
-    if (issue.status !== "in_progress" && issue.status !== "todo") {
+    // VANA-1892: comment-driven wakes (the primary use case for this handoff)
+    // routinely fire on issues parked in `blocked` or `in_review`, and the old
+    // `in_progress`/`todo`-only allowlist silently dropped every such handoff
+    // (top failure mode: blocked×16 / in_review×13). Every non-terminal status
+    // (incl. `backlog`) is intentionally eligible; only genuinely terminal
+    // statuses are ineligible — matching the
+    // `notInArray(issues.status, ["done", "cancelled"])` convention used across
+    // the recovery paths. The `issue_reassigned` guard above still protects
+    // against handing an issue that has since moved to another assignee.
+    if (issue.status === "done" || issue.status === "cancelled") {
       return skipWithEvent("issue_not_live", { issueId, issueStatus: issue.status });
     }
 

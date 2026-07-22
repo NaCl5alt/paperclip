@@ -7,6 +7,7 @@ import {
   agentWakeupRequests,
   budgetPolicies,
   companies,
+  companySkills,
   createDb,
   environmentLeases,
   heartbeatRunEvents,
@@ -57,6 +58,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(budgetPolicies);
+    await db.delete(companySkills);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -1351,6 +1353,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     retryNotBefore?: string | null;
     scheduledRetryAttempt?: number;
     accountQuotaExhausted?: boolean;
+    issueStatus?: "todo" | "in_progress" | "in_review" | "blocked" | "backlog" | "done" | "cancelled";
   }) {
     await seedRetryFixture({
       runId: input.runId,
@@ -1378,7 +1381,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       id: input.issueId,
       companyId: input.companyId,
       title: "Transient upstream failover source",
-      status: "in_progress",
+      status: input.issueStatus ?? "in_progress",
       priority: "medium",
       assigneeAgentId: input.agentId,
       issueNumber: 1,
@@ -1462,6 +1465,90 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(comments.some((comment) => comment.body.includes("recovery fallback agent"))).toBe(true);
   });
 
+  // VANA-1892: comment-driven wakes fire on issues parked in `blocked`/`in_review`,
+  // which the old `in_progress`/`todo`-only allowlist silently dropped. `backlog`
+  // was likewise excluded before and is now eligible, so it is covered here too.
+  it.each(["blocked", "in_review", "backlog"] as const)(
+    "hands the issue off to the recovery fallback agent when the source issue is %s",
+    async (issueStatus) => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const issueId = randomUUID();
+      const now = new Date("2026-04-21T09:00:00.000Z");
+      const { fallbackAgentId } = await seedRecoveryFallbackFixture({
+        companyId,
+        agentId,
+        runId,
+        issueId,
+        now,
+        issueStatus,
+        scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+      });
+
+      const exhausted = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(exhausted.outcome).toBe("retry_exhausted");
+      if (exhausted.outcome !== "retry_exhausted") return;
+      expect(exhausted.recoveryFallback).toEqual({
+        outcome: "failed_over",
+        fallbackAgentId,
+        issueId,
+      });
+
+      const issue = await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(issue?.assigneeAgentId).toBe(fallbackAgentId);
+    },
+  );
+
+  // Terminal issues stay ineligible: handing a done/cancelled issue to a
+  // fallback agent would resurrect finished work.
+  it.each(["done", "cancelled"] as const)(
+    "skips the recovery fallback handoff when the source issue is %s",
+    async (issueStatus) => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const issueId = randomUUID();
+      const now = new Date("2026-04-21T09:00:00.000Z");
+      await seedRecoveryFallbackFixture({
+        companyId,
+        agentId,
+        runId,
+        issueId,
+        now,
+        issueStatus,
+        scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+      });
+
+      const exhausted = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(exhausted.outcome).toBe("retry_exhausted");
+      if (exhausted.outcome !== "retry_exhausted") return;
+      expect(exhausted.recoveryFallback).toEqual({
+        outcome: "skipped",
+        reason: "issue_not_live",
+      });
+
+      const issue = await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(issue?.assigneeAgentId).toBe(agentId);
+    },
+  );
+
   it("hands the issue off immediately when the upstream retry window is too far away", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -1509,6 +1596,62 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       );
     expect(scheduledRetries).toHaveLength(0);
   });
+
+  // VANA-1892 incident reproduction: the failed run hit a session limit whose
+  // reset window was far in the future, so the deferred-window failover branch
+  // (`retry_not_before_deferred`) fired — but the source issue was parked in
+  // `blocked` (human-comment-driven wake). The old status guard dropped it here.
+  it.each(["blocked", "in_review"] as const)(
+    "hands off via the deferred-window branch when the source issue is %s",
+    async (issueStatus) => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const issueId = randomUUID();
+      const now = new Date("2026-04-21T09:00:00.000Z");
+      const retryNotBefore = new Date(
+        now.getTime() + TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_DEFERRAL_THRESHOLD_MS + 60 * 60 * 1000,
+      );
+      const { fallbackAgentId } = await seedRecoveryFallbackFixture({
+        companyId,
+        agentId,
+        runId,
+        issueId,
+        now,
+        issueStatus,
+        retryNotBefore: retryNotBefore.toISOString(),
+      });
+
+      const result = await heartbeat.scheduleBoundedRetry(runId, {
+        now,
+        random: () => 0.5,
+      });
+
+      expect(result).toMatchObject({
+        outcome: "failed_over_to_recovery_fallback",
+        fallbackAgentId,
+        issueId,
+      });
+
+      const issue = await db
+        .select({ assigneeAgentId: issues.assigneeAgentId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(issue?.assigneeAgentId).toBe(fallbackAgentId);
+
+      const scheduledRetries = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+          ),
+        );
+      expect(scheduledRetries).toHaveLength(0);
+    },
+  );
 
   it("keeps the deferred retry when the upstream retry window is within the failover threshold", async () => {
     const companyId = randomUUID();
