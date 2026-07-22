@@ -16,12 +16,8 @@ const instructionsFileHint =
   "Absolute path to a markdown file (e.g. AGENTS.md) that defines this agent's behavior. Injected into the system prompt at runtime.";
 
 const recoveryFallbackHint =
-  "Optional. When a run of this agent fails on a transient upstream (usage / rate-limit) condition, recovery is handed to the selected codex agent instead of the default manager/creator/executive owner. Candidates are codex agents in the same company. Leave unset to keep the default recovery behavior.";
+  "Optional. When a run of this agent fails on a transient upstream (usage / rate-limit) condition, recovery is handed to the selected agent instead of the default manager/creator/executive owner. Candidates are active agents in the same company. Leave unset to keep the default recovery behavior.";
 
-// Mirrors the failover target in server/src/services/recovery/adapter-failover.ts
-// (FAILOVER_FALLBACK_ADAPTER_TYPE). Recovery failover routes to codex agents, so
-// the picker only offers — and validates against — this adapter type.
-const FAILOVER_FALLBACK_ADAPTER_TYPE = "codex_local";
 
 export function ClaudeLocalConfigFields({
   mode,
@@ -91,7 +87,6 @@ export function ClaudeLocalAdvancedFields({
   const agentList = agents ?? [];
   const candidates = agentList.filter(
     (a) =>
-      a.adapterType === FAILOVER_FALLBACK_ADAPTER_TYPE &&
       a.id !== selfAgentId &&
       a.status !== "terminated",
   );
@@ -108,7 +103,7 @@ export function ClaudeLocalAdvancedFields({
       : mark("adapterConfig", "recoveryFallbackAgentId", next || undefined);
 
   // Surface stored values the backend recovery guard would not honor. New
-  // selections are always valid because the dropdown only offers codex,
+  // selections are always valid because the dropdown only offers
   // non-self, non-terminated candidates — these checks only fire on a
   // previously-saved value that has since become invalid.
   const selectedAgent = agentList.find((a) => a.id === recoveryFallbackValue);
@@ -116,13 +111,10 @@ export function ClaudeLocalAdvancedFields({
   if (recoveryFallbackValue) {
     if (recoveryFallbackValue === selfAgentId) {
       recoveryFallbackWarning =
-        "An agent cannot be its own recovery fallback. Pick a different codex agent.";
+        "An agent cannot be its own recovery fallback. Pick a different agent.";
     } else if (!selectedAgent) {
       recoveryFallbackWarning =
         "The configured fallback agent no longer exists; recovery will fall back to the default owner.";
-    } else if (selectedAgent.adapterType !== FAILOVER_FALLBACK_ADAPTER_TYPE) {
-      recoveryFallbackWarning =
-        "Recovery fallback must be a codex agent; this selection will be ignored by recovery.";
     } else if (selectedAgent.status === "terminated") {
       recoveryFallbackWarning =
         "The configured fallback agent is terminated and will be ignored by recovery.";
@@ -211,7 +203,7 @@ export function ClaudeLocalAdvancedFields({
           <p className="mt-1 text-xs text-amber-400">{recoveryFallbackWarning}</p>
         ) : candidates.length === 0 ? (
           <p className="mt-1 text-xs text-muted-foreground">
-            No codex agents are available in this company yet.
+            No other agents are available in this company yet.
           </p>
         ) : recoveryFallbackValue && selectedAgent ? (
           <p className="mt-1 text-xs text-muted-foreground">

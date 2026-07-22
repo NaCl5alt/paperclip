@@ -116,6 +116,13 @@ describe("execution workspace config helpers", () => {
       source: "project_primary",
     });
   });
+
+  it("getById, getCloseReadiness, and update return null immediately for invalid UUIDs", async () => {
+    const svc = executionWorkspaceService(null as any);
+    expect(await svc.getById("invalid-uuid")).toBeNull();
+    expect(await svc.getCloseReadiness("invalid-uuid")).toBeNull();
+    expect(await svc.update("invalid-uuid", {})).toBeNull();
+  });
 });
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();

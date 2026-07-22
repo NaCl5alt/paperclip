@@ -70,14 +70,14 @@ describe("ClaudeLocalAdvancedFields recovery fallback agent", () => {
     );
   }
 
-  it("lists only same-company codex candidates, excluding self, non-codex and terminated", () => {
+  it("lists same-company candidates, excluding self and terminated", () => {
     render(editProps());
     const labels = optionLabels();
     expect(labels).toContain("Unset (default recovery owner)");
     expect(labels).toContain("Codex One");
     expect(labels).toContain("Codex Two");
+    expect(labels).toContain("Claude X");
     expect(labels).not.toContain("Self Agent");
-    expect(labels).not.toContain("Claude X");
     expect(labels).not.toContain("Dead Codex");
   });
 
@@ -106,10 +106,5 @@ describe("ClaudeLocalAdvancedFields recovery fallback agent", () => {
   it("warns when a stored fallback points at the agent itself", () => {
     render(editProps({ config: { recoveryFallbackAgentId: "self-claude" } }));
     expect(container.textContent).toContain("cannot be its own recovery fallback");
-  });
-
-  it("warns when a stored fallback is non-codex", () => {
-    render(editProps({ config: { recoveryFallbackAgentId: "claude-x" } }));
-    expect(container.textContent).toContain("must be a codex agent");
   });
 });

@@ -15,6 +15,7 @@ import type {
   WorkspaceRuntimeDesiredState,
   WorkspaceRuntimeService,
 } from "@paperclipai/shared";
+import { isUuidLike } from "@paperclipai/shared";
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import {
   listCurrentRuntimeServicesForExecutionWorkspaces,
@@ -473,6 +474,7 @@ export function executionWorkspaceService(db: Db) {
     },
 
     getById: async (id: string) => {
+      if (!isUuidLike(id)) return null;
       const row = await db
         .select()
         .from(executionWorkspaces)
@@ -487,6 +489,7 @@ export function executionWorkspaceService(db: Db) {
     },
 
     getCloseReadiness: async (id: string): Promise<ExecutionWorkspaceCloseReadiness | null> => {
+      if (!isUuidLike(id)) return null;
       const workspace = await db
         .select()
         .from(executionWorkspaces)
@@ -747,6 +750,7 @@ export function executionWorkspaceService(db: Db) {
     },
 
     update: async (id: string, patch: Partial<typeof executionWorkspaces.$inferInsert>) => {
+      if (!isUuidLike(id)) return null;
       const row = await db
         .update(executionWorkspaces)
         .set({ ...patch, updatedAt: new Date() })

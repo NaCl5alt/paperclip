@@ -91,4 +91,12 @@ describe.sequential("execution workspace routes", () => {
     expect(mockExecutionWorkspaceService.list).not.toHaveBeenCalled();
   });
 
+  it("returns 404 when looking up an execution workspace by an invalid UUID", async () => {
+    mockExecutionWorkspaceService.getById.mockResolvedValue(null);
+    const res = await request(createApp())
+      .get("/api/execution-workspaces/invalid-uuid");
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ error: "Execution workspace not found" });
+    expect(mockExecutionWorkspaceService.getById).toHaveBeenCalledWith("invalid-uuid");
+  });
 });
