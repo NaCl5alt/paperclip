@@ -11,4 +11,5 @@ export interface Goal {
   ownerAgentId: string | null;
   createdAt: Date;
   updatedAt: Date;
+  lastReviewedAt?: Date | null;
 }
