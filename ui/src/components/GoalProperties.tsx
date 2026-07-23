@@ -8,6 +8,7 @@ import { goalsApi } from "../api/goals";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
 import { StatusBadge } from "./StatusBadge";
+import { GoalLastReviewedControl } from "./GoalLastReviewed";
 import { formatDate, cn, agentUrl } from "../lib/utils";
 import { Separator } from "@/components/ui/separator";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -157,6 +158,16 @@ export function GoalProperties({ goal, onUpdate }: GoalPropertiesProps) {
         </PropertyRow>
         <PropertyRow label="Updated">
           <span className="text-sm">{formatDate(goal.updatedAt)}</span>
+        </PropertyRow>
+        <PropertyRow label="Last Reviewed">
+          <GoalLastReviewedControl
+            lastReviewedAt={goal.lastReviewedAt}
+            onMarkReviewed={
+              onUpdate
+                ? () => onUpdate({ lastReviewedAt: new Date().toISOString() })
+                : undefined
+            }
+          />
         </PropertyRow>
       </div>
     </div>
