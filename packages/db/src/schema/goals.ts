@@ -22,6 +22,7 @@ export const goals = pgTable(
     ownerAgentId: uuid("owner_agent_id").references(() => agents.id),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    lastReviewedAt: timestamp("last_reviewed_at", { withTimezone: true }),
   },
   (table) => ({
     companyIdx: index("goals_company_idx").on(table.companyId),

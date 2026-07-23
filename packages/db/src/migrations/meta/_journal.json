@@ -703,6 +703,13 @@
       "breakpoints": true
     },
     {
+      "idx": 100,
+      "version": "7",
+      "when": 1780534400000,
+      "tag": "0100_goal_last_reviewed_at",
+      "breakpoints": true
+    },
+    {
       "idx": 101,
       "version": "7",
       "when": 1780534500000,
