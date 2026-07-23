@@ -12,6 +12,8 @@ export const createGoalSchema = z.object({
 
 export type CreateGoal = z.infer<typeof createGoalSchema>;
 
-export const updateGoalSchema = createGoalSchema.partial();
+export const updateGoalSchema = createGoalSchema.partial().extend({
+  lastReviewedAt: z.string().datetime().optional().nullable(),
+});
 
 export type UpdateGoal = z.infer<typeof updateGoalSchema>;
