@@ -317,15 +317,36 @@ export function useLiveRunTranscripts({
         if (!runById.has(runId)) return;
 
         if (event.type === "heartbeat.run.log") {
-          const chunk = readString(payload["chunk"]);
-          if (!chunk) return;
-          const ts = readString(payload["ts"]) ?? event.createdAt;
           const stream =
             readString(payload["stream"]) === "stderr"
               ? "stderr"
               : readString(payload["stream"]) === "system"
                 ? "system"
                 : "stdout";
+          // Server coalesces high-frequency chunks into one event but keeps per-chunk segments so the
+          // dedupe key stays identical to the persisted per-line log read by the fallback poll (no double display).
+          const segments = Array.isArray(payload["segments"]) ? payload["segments"] : null;
+          if (segments) {
+            const parsed: Array<RunLogChunk & { dedupeKey: string }> = [];
+            for (const raw of segments) {
+              if (!raw || typeof raw !== "object") continue;
+              const segment = raw as Record<string, unknown>;
+              const segChunk = readString(segment["chunk"]);
+              if (!segChunk) continue;
+              const segTs = readString(segment["ts"]) ?? event.createdAt;
+              parsed.push({
+                ts: segTs,
+                stream,
+                chunk: segChunk,
+                dedupeKey: `log:${runId}:${segTs}:${stream}:${segChunk}`,
+              });
+            }
+            appendChunks(runId, parsed);
+            return;
+          }
+          const chunk = readString(payload["chunk"]);
+          if (!chunk) return;
+          const ts = readString(payload["ts"]) ?? event.createdAt;
           appendChunks(runId, [{
             ts,
             stream,

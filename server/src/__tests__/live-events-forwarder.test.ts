@@ -18,7 +18,7 @@ function logEvent(
     payload: {
       runId,
       agentId: "ag_1",
-      ts: nextId * 1000,
+      ts: new Date(nextId * 1000).toISOString(),
       stream: opts.stream ?? "stdout",
       chunk,
       truncated: opts.truncated ?? false,
@@ -71,6 +71,43 @@ describe("createLiveEventForwarder", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]?.payload.chunk).toBe("abc");
     expect(sent[0]?.payload.stream).toBe("stdout");
+  });
+
+  it("carries per-chunk segments so the client can reproduce per-line dedupe keys", () => {
+    const sent: LiveEvent[] = [];
+    const forwarder = createLiveEventForwarder((data) => sent.push(JSON.parse(data)));
+
+    const e1 = logEvent("run_1", "a");
+    const e2 = logEvent("run_1", "b");
+    forwarder.handle(e1);
+    forwarder.handle(e2);
+
+    vi.advanceTimersByTime(150);
+
+    expect(sent).toHaveLength(1);
+    const segments = sent[0]?.payload.segments as Array<{ ts: unknown; chunk: unknown }>;
+    expect(segments).toHaveLength(2);
+    expect(segments.map((s) => s.chunk)).toEqual(["a", "b"]);
+    // segment ts must equal each source event's payload.ts (identical to the persisted per-line ts)
+    expect(segments[0]?.ts).toBe(e1.payload.ts);
+    expect(segments[1]?.ts).toBe(e2.payload.ts);
+    // joined chunk stays consistent with the segment chunks
+    expect(sent[0]?.payload.chunk).toBe("ab");
+  });
+
+  it("drops the segment of the oldest chunk when it is dropped for the byte budget", () => {
+    const sent: LiveEvent[] = [];
+    const forwarder = createLiveEventForwarder((data) => sent.push(JSON.parse(data)));
+
+    const big = "x".repeat(40 * 1024); // 40KiB each; budget is 64KiB
+    forwarder.handle(logEvent("run_1", `${big}A`));
+    forwarder.handle(logEvent("run_1", `${big}B`));
+
+    vi.advanceTimersByTime(150);
+
+    const segments = sent[0]?.payload.segments as Array<{ chunk: string }>;
+    expect(segments).toHaveLength(1);
+    expect(segments[0]?.chunk.endsWith("B")).toBe(true);
   });
 
   it("keeps distinct streams as separate coalesced messages", () => {

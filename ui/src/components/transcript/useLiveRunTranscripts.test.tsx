@@ -343,4 +343,86 @@ describe("useLiveRunTranscripts", () => {
     });
     container.remove();
   });
+
+  it("does not double-display when a coalesced live event overlaps the fallback poll's per-line read", async () => {
+    const t1 = "2026-04-20T00:00:00.001Z";
+    const t2 = "2026-04-20T00:00:00.002Z";
+    // Fallback poll reads the persisted log as per-line NDJSON (one line per source chunk).
+    const persisted =
+      `${JSON.stringify({ ts: t1, stream: "stdout", chunk: "alpha\n" })}\n` +
+      `${JSON.stringify({ ts: t2, stream: "stdout", chunk: "beta\n" })}\n`;
+    logMock.mockReset();
+    logMock.mockResolvedValueOnce({
+      runId: "run-1",
+      store: "memory",
+      logRef: "log-1",
+      content: persisted,
+      nextOffset: persisted.length,
+    });
+    logMock.mockResolvedValue({ runId: "run-1", store: "memory", logRef: "log-1", content: "", nextOffset: persisted.length });
+
+    function Harness() {
+      useLiveRunTranscripts({
+        companyId: "company-1",
+        runs: [{ id: "run-1", status: "running", adapterType: "codex_local" }],
+      });
+      return null;
+    }
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(<Harness />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // After the poll, the two persisted lines are shown exactly once.
+    const afterPollChunks = buildTranscriptMock.mock.calls.at(-1)?.[0];
+    expect(afterPollChunks).toEqual([
+      { ts: t1, stream: "stdout", chunk: "alpha\n" },
+      { ts: t2, stream: "stdout", chunk: "beta\n" },
+    ]);
+    const callsAfterPoll = buildTranscriptMock.mock.calls.length;
+
+    // The live websocket delivers the SAME two chunks coalesced into one event, carrying per-chunk segments.
+    await act(async () => {
+      FakeWebSocket.instances[0]!.onmessage?.(
+        new MessageEvent("message", {
+          data: JSON.stringify({
+            companyId: "company-1",
+            type: "heartbeat.run.log",
+            createdAt: t2,
+            payload: {
+              runId: "run-1",
+              ts: t2,
+              stream: "stdout",
+              chunk: "alpha\nbeta\n",
+              segments: [
+                { ts: t1, chunk: "alpha\n" },
+                { ts: t2, chunk: "beta\n" },
+              ],
+            },
+          }),
+        }),
+      );
+      await Promise.resolve();
+    });
+
+    // Dedup collapses the overlap: no new chunks, no transcript rebuild, still exactly two lines.
+    expect(buildTranscriptMock.mock.calls.length).toBe(callsAfterPoll);
+    const finalChunks = buildTranscriptMock.mock.calls.at(-1)?.[0] as unknown[];
+    expect(finalChunks).toHaveLength(2);
+    expect(finalChunks).toEqual([
+      { ts: t1, stream: "stdout", chunk: "alpha\n" },
+      { ts: t2, stream: "stdout", chunk: "beta\n" },
+    ]);
+
+    act(() => {
+      root.unmount();
+    });
+    container.remove();
+  });
 });

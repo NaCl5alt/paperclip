@@ -13,11 +13,18 @@ import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 // Coalesce high-frequency run-log chunks into at most one send per window so the client renderer isn't drowned by per-chunk JSON.parse.
 const RUN_LOG_FLUSH_INTERVAL_MS = 150;
 // Cap concatenated live bytes per run+stream per flush; oldest whole chunks are dropped since the full log is persisted in the DB.
+// A single source chunk is already capped at MAX_LIVE_LOG_CHUNK_BYTES (8KiB) upstream, so this budget always holds several chunks.
 const MAX_RUN_LOG_FLUSH_BYTES = 64 * 1024;
+
+// One coalesced source chunk, kept per-segment so the client can reproduce the exact per-line dedupe key of the persisted log.
+interface RunLogSegment {
+  ts: string;
+  chunk: string;
+}
 
 interface RunLogBuffer {
   event: LiveEvent;
-  chunks: string[];
+  segments: RunLogSegment[];
   bytes: number;
   truncated: boolean;
 }
@@ -32,7 +39,13 @@ export function createLiveEventForwarder(send: (data: string) => void) {
     for (const buffer of logBuffers.values()) {
       const merged: LiveEvent = {
         ...buffer.event,
-        payload: { ...buffer.event.payload, chunk: buffer.chunks.join(""), truncated: buffer.truncated },
+        payload: {
+          ...buffer.event.payload,
+          // Joined chunk for single-line consumers (AgentDetail / plugin host); per-chunk segments for dedupe-aware consumers.
+          chunk: buffer.segments.map((segment) => segment.chunk).join(""),
+          truncated: buffer.truncated,
+          segments: buffer.segments,
+        },
       };
       send(JSON.stringify(merged));
     }
@@ -44,22 +57,23 @@ export function createLiveEventForwarder(send: (data: string) => void) {
     const runId = typeof payload.runId === "string" ? payload.runId : "";
     const stream = typeof payload.stream === "string" ? payload.stream : "stdout";
     const chunk = typeof payload.chunk === "string" ? payload.chunk : "";
+    const ts = typeof payload.ts === "string" ? payload.ts : event.createdAt;
     const key = `${runId} ${stream}`;
 
     let buffer = logBuffers.get(key);
     if (!buffer) {
-      buffer = { event, chunks: [], bytes: 0, truncated: false };
+      buffer = { event, segments: [], bytes: 0, truncated: false };
       logBuffers.set(key, buffer);
     }
     buffer.event = event; // keep newest event as the flush template (latest ts/id)
-    buffer.chunks.push(chunk);
+    buffer.segments.push({ ts, chunk });
     buffer.bytes += Buffer.byteLength(chunk, "utf8");
     if (payload.truncated === true) buffer.truncated = true;
 
     // Drop oldest whole chunks (never split mid-char) until within budget; always keep the newest.
-    while (buffer.bytes > MAX_RUN_LOG_FLUSH_BYTES && buffer.chunks.length > 1) {
-      const dropped = buffer.chunks.shift() as string;
-      buffer.bytes -= Buffer.byteLength(dropped, "utf8");
+    while (buffer.bytes > MAX_RUN_LOG_FLUSH_BYTES && buffer.segments.length > 1) {
+      const dropped = buffer.segments.shift() as RunLogSegment;
+      buffer.bytes -= Buffer.byteLength(dropped.chunk, "utf8");
       buffer.truncated = true;
     }
 
