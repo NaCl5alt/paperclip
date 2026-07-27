@@ -5,10 +5,84 @@ import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipai/db";
-import type { DeploymentMode } from "@paperclipai/shared";
+import type { DeploymentMode, LiveEvent } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+
+// Coalesce high-frequency run-log chunks into at most one send per window so the client renderer isn't drowned by per-chunk JSON.parse.
+const RUN_LOG_FLUSH_INTERVAL_MS = 150;
+// Cap concatenated live bytes per run+stream per flush; oldest whole chunks are dropped since the full log is persisted in the DB.
+const MAX_RUN_LOG_FLUSH_BYTES = 64 * 1024;
+
+interface RunLogBuffer {
+  event: LiveEvent;
+  chunks: string[];
+  bytes: number;
+  truncated: boolean;
+}
+
+// Forwards live events to one socket: run.log chunks are coalesced per (runId, stream); every other event type is sent immediately.
+export function createLiveEventForwarder(send: (data: string) => void) {
+  const logBuffers = new Map<string, RunLogBuffer>();
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const flush = () => {
+    flushTimer = null;
+    for (const buffer of logBuffers.values()) {
+      const merged: LiveEvent = {
+        ...buffer.event,
+        payload: { ...buffer.event.payload, chunk: buffer.chunks.join(""), truncated: buffer.truncated },
+      };
+      send(JSON.stringify(merged));
+    }
+    logBuffers.clear();
+  };
+
+  const enqueueLog = (event: LiveEvent) => {
+    const payload = event.payload ?? {};
+    const runId = typeof payload.runId === "string" ? payload.runId : "";
+    const stream = typeof payload.stream === "string" ? payload.stream : "stdout";
+    const chunk = typeof payload.chunk === "string" ? payload.chunk : "";
+    const key = `${runId} ${stream}`;
+
+    let buffer = logBuffers.get(key);
+    if (!buffer) {
+      buffer = { event, chunks: [], bytes: 0, truncated: false };
+      logBuffers.set(key, buffer);
+    }
+    buffer.event = event; // keep newest event as the flush template (latest ts/id)
+    buffer.chunks.push(chunk);
+    buffer.bytes += Buffer.byteLength(chunk, "utf8");
+    if (payload.truncated === true) buffer.truncated = true;
+
+    // Drop oldest whole chunks (never split mid-char) until within budget; always keep the newest.
+    while (buffer.bytes > MAX_RUN_LOG_FLUSH_BYTES && buffer.chunks.length > 1) {
+      const dropped = buffer.chunks.shift() as string;
+      buffer.bytes -= Buffer.byteLength(dropped, "utf8");
+      buffer.truncated = true;
+    }
+
+    if (flushTimer === null) flushTimer = setTimeout(flush, RUN_LOG_FLUSH_INTERVAL_MS);
+  };
+
+  return {
+    handle(event: LiveEvent) {
+      if (event.type === "heartbeat.run.log") {
+        enqueueLog(event);
+        return;
+      }
+      send(JSON.stringify(event));
+    },
+    dispose() {
+      if (flushTimer !== null) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      logBuffers.clear();
+    },
+  };
+}
 
 interface WsSocket {
   readyState: number;
@@ -205,12 +279,18 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
-    const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
+    const forwarder = createLiveEventForwarder((data) => {
       if (socket.readyState !== WebSocket.OPEN) return;
-      socket.send(JSON.stringify(event));
+      socket.send(data);
+    });
+    const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
+      forwarder.handle(event);
     });
 
-    cleanupByClient.set(socket, unsubscribe);
+    cleanupByClient.set(socket, () => {
+      unsubscribe();
+      forwarder.dispose();
+    });
     aliveByClient.set(socket, true);
 
     socket.on("pong", () => {
