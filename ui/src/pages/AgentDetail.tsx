@@ -3887,10 +3887,29 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
         if (!payload || eventRunId !== run.id) return;
 
         if (event.type === "heartbeat.run.log") {
-          const chunk = typeof payload.chunk === "string" ? payload.chunk : "";
-          if (!chunk) return;
           const streamRaw = asNonEmptyString(payload.stream);
           const stream = streamRaw === "stderr" || streamRaw === "system" ? streamRaw : "stdout";
+          // Coalesced live events carry the bytes as per-chunk `segments` only; a flat `chunk` means an
+          // uncoalesced sender, so keep that path as the fallback.
+          const segments = Array.isArray(payload.segments) ? payload.segments : null;
+          if (segments) {
+            const parsed: Array<{ ts: string; stream: typeof stream; chunk: string }> = [];
+            for (const rawSegment of segments) {
+              const segment = asRecord(rawSegment);
+              if (!segment) continue;
+              const segmentChunk = typeof segment.chunk === "string" ? segment.chunk : "";
+              if (!segmentChunk) continue;
+              parsed.push({
+                ts: asNonEmptyString(segment.ts) ?? event.createdAt,
+                stream,
+                chunk: segmentChunk,
+              });
+            }
+            if (parsed.length > 0) setLogLines((prev) => [...prev, ...parsed]);
+            return;
+          }
+          const chunk = typeof payload.chunk === "string" ? payload.chunk : "";
+          if (!chunk) return;
           const ts = asNonEmptyString((payload as Record<string, unknown>).ts) ?? event.createdAt;
           setLogLines((prev) => [...prev, { ts, stream, chunk }]);
           return;

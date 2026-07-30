@@ -39,7 +39,8 @@ export const MAX_RUN_LOG_FLUSH_BYTES = readPositiveIntEnv(
   MIN_RUN_LOG_FLUSH_MAX_BYTES,
 );
 
-// One coalesced source chunk, kept per-segment so the client can reproduce the exact per-line dedupe key of the persisted log.
+// One coalesced source chunk. Segments are the wire form of the log bytes (no joined duplicate is sent),
+// and keeping them per-chunk lets the client reproduce the exact per-line dedupe key of the persisted log.
 interface RunLogSegment {
   ts: string;
   chunk: string;
@@ -60,12 +61,17 @@ export function createLiveEventForwarder(send: (data: string) => void) {
   const flush = () => {
     flushTimer = null;
     for (const buffer of logBuffers.values()) {
+      // `segments` is the only carrier of the log bytes. The template event's own `chunk` is dropped
+      // rather than replaced by a joined copy: emitting both put every byte on the wire twice, which
+      // measured as ~2.02x the source byte rate and was the real reason the byte budget had to drop
+      // live chunks to stay affordable.
+      // `?? {}` matches enqueueLog's own tolerance for a nullish payload: object spread accepts null,
+      // but destructuring it throws, and this runs inside a timer where that would be an unhandled crash.
+      const { chunk: _joined, ...payloadWithoutChunk } = buffer.event.payload ?? {};
       const merged: LiveEvent = {
         ...buffer.event,
         payload: {
-          ...buffer.event.payload,
-          // Joined chunk for single-line consumers (AgentDetail / plugin host); per-chunk segments for dedupe-aware consumers.
-          chunk: buffer.segments.map((segment) => segment.chunk).join(""),
+          ...payloadWithoutChunk,
           truncated: buffer.truncated,
           segments: buffer.segments,
         },

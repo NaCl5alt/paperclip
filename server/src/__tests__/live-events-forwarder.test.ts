@@ -34,6 +34,12 @@ function logEvent(
   };
 }
 
+// Segments are the wire form of the coalesced log bytes, so assertions read the content from there.
+function segmentChunks(event: LiveEvent | undefined): string[] {
+  const segments = event?.payload.segments as Array<{ chunk: string }> | undefined;
+  return (segments ?? []).map((segment) => segment.chunk);
+}
+
 function statusEvent(runId: string): LiveEvent {
   nextId += 1;
   return {
@@ -64,7 +70,7 @@ describe("createLiveEventForwarder", () => {
     expect(sent[0]?.type).toBe("heartbeat.run.status");
   });
 
-  it("coalesces consecutive run.log chunks of the same run+stream into one concatenated message", () => {
+  it("coalesces consecutive run.log chunks of the same run+stream into one message", () => {
     const sent: LiveEvent[] = [];
     const forwarder = createLiveEventForwarder((data) => sent.push(JSON.parse(data)));
 
@@ -77,8 +83,25 @@ describe("createLiveEventForwarder", () => {
     vi.advanceTimersByTime(FLUSH);
 
     expect(sent).toHaveLength(1);
-    expect(sent[0]?.payload.chunk).toBe("abc");
+    expect(segmentChunks(sent[0])).toEqual(["a", "b", "c"]);
     expect(sent[0]?.payload.stream).toBe("stdout");
+  });
+
+  // Regression guard: carrying both a joined `chunk` and per-chunk `segments` doubled every log byte
+  // on the wire, which is what forced the byte budget to throw away live chunks.
+  it("sends the log bytes once, as segments only, with no joined chunk field", () => {
+    const sent: LiveEvent[] = [];
+    const forwarder = createLiveEventForwarder((data) => sent.push(JSON.parse(data)));
+
+    forwarder.handle(logEvent("run_1", "a"));
+    forwarder.handle(logEvent("run_1", "b"));
+    vi.advanceTimersByTime(FLUSH);
+
+    expect(sent).toHaveLength(1);
+    expect(Object.hasOwn(sent[0]?.payload ?? {}, "chunk")).toBe(false);
+    // Non-chunk template fields still ride along so consumers can route the message.
+    expect(sent[0]?.payload.runId).toBe("run_1");
+    expect(sent[0]?.payload.agentId).toBe("ag_1");
   });
 
   it("carries per-chunk segments so the client can reproduce per-line dedupe keys", () => {
@@ -99,8 +122,6 @@ describe("createLiveEventForwarder", () => {
     // segment ts must equal each source event's payload.ts (identical to the persisted per-line ts)
     expect(segments[0]?.ts).toBe(e1.payload.ts);
     expect(segments[1]?.ts).toBe(e2.payload.ts);
-    // joined chunk stays consistent with the segment chunks
-    expect(sent[0]?.payload.chunk).toBe("ab");
   });
 
   it("drops the segment of the oldest chunk when it is dropped for the byte budget", () => {
@@ -131,10 +152,10 @@ describe("createLiveEventForwarder", () => {
     vi.advanceTimersByTime(FLUSH);
 
     const byStream = Object.fromEntries(
-      sent.map((e) => [e.payload.stream, e.payload.chunk]),
+      sent.map((e) => [e.payload.stream, segmentChunks(e)]),
     );
-    expect(byStream.stdout).toBe("out1out2");
-    expect(byStream.stderr).toBe("err1");
+    expect(byStream.stdout).toEqual(["out1", "out2"]);
+    expect(byStream.stderr).toEqual(["err1"]);
   });
 
   it("drops oldest whole chunks past the byte budget and marks truncated", () => {
@@ -150,10 +171,11 @@ describe("createLiveEventForwarder", () => {
     vi.advanceTimersByTime(FLUSH);
 
     expect(sent).toHaveLength(1);
-    const chunk = String(sent[0]?.payload.chunk);
+    const chunks = segmentChunks(sent[0]);
     // oldest chunk dropped, newest retained
-    expect(chunk.startsWith("B")).toBe(true);
-    expect(chunk.includes("A")).toBe(false);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]?.startsWith("B")).toBe(true);
+    expect(chunks.some((chunk) => chunk.includes("A"))).toBe(false);
     expect(sent[0]?.payload.truncated).toBe(true);
   });
 

@@ -387,7 +387,8 @@ describe("useLiveRunTranscripts", () => {
     ]);
     const callsAfterPoll = buildTranscriptMock.mock.calls.length;
 
-    // The live websocket delivers the SAME two chunks coalesced into one event, carrying per-chunk segments.
+    // The live websocket redelivers the SAME two chunks coalesced into one event. The wire form carries
+    // the bytes only in per-chunk `segments` (no joined `chunk`), so dedupe must work off segments alone.
     await act(async () => {
       FakeWebSocket.instances[0]!.onmessage?.(
         new MessageEvent("message", {
@@ -399,7 +400,6 @@ describe("useLiveRunTranscripts", () => {
               runId: "run-1",
               ts: t2,
               stream: "stdout",
-              chunk: "alpha\nbeta\n",
               segments: [
                 { ts: t1, chunk: "alpha\n" },
                 { ts: t2, chunk: "beta\n" },
@@ -413,11 +413,39 @@ describe("useLiveRunTranscripts", () => {
 
     // Dedup collapses the overlap: no new chunks, no transcript rebuild, still exactly two lines.
     expect(buildTranscriptMock.mock.calls.length).toBe(callsAfterPoll);
+    const dedupedChunks = buildTranscriptMock.mock.calls.at(-1)?.[0] as unknown[];
+    expect(dedupedChunks).toHaveLength(2);
+    expect(dedupedChunks).toEqual([
+      { ts: t1, stream: "stdout", chunk: "alpha\n" },
+      { ts: t2, stream: "stdout", chunk: "beta\n" },
+    ]);
+
+    // A segments-only event whose chunks are new must still append, so the segments path is really live.
+    const t3 = "2026-04-20T00:00:02.000Z";
+    await act(async () => {
+      FakeWebSocket.instances[0]!.onmessage?.(
+        new MessageEvent("message", {
+          data: JSON.stringify({
+            companyId: "company-1",
+            type: "heartbeat.run.log",
+            createdAt: t3,
+            payload: {
+              runId: "run-1",
+              ts: t3,
+              stream: "stdout",
+              segments: [{ ts: t3, chunk: "gamma\n" }],
+            },
+          }),
+        }),
+      );
+      await Promise.resolve();
+    });
+
     const finalChunks = buildTranscriptMock.mock.calls.at(-1)?.[0] as unknown[];
-    expect(finalChunks).toHaveLength(2);
     expect(finalChunks).toEqual([
       { ts: t1, stream: "stdout", chunk: "alpha\n" },
       { ts: t2, stream: "stdout", chunk: "beta\n" },
+      { ts: t3, stream: "stdout", chunk: "gamma\n" },
     ]);
 
     act(() => {
