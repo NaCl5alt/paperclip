@@ -13,8 +13,10 @@ import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 // Coalesce high-frequency run-log chunks into at most one send per window so the client renderer isn't drowned by per-chunk JSON.parse.
 // Tradeoff: a live log line is delayed up to the flush window, and under heavy load the newest bytes over the budget are the only
 // ones streamed live (older segments are dropped); the full log is always in the DB and the client's fallback poll backfills them.
+// The budget is deliberately generous because a flush now costs its log bytes once (~1.6% framing overhead). It was briefly tightened
+// to 16KiB when a flush duplicated every byte, which bought its byte savings by dropping ~70% of live chunks -- an unnecessary trade.
 const DEFAULT_RUN_LOG_FLUSH_INTERVAL_MS = 400;
-const DEFAULT_RUN_LOG_FLUSH_MAX_BYTES = 16 * 1024;
+const DEFAULT_RUN_LOG_FLUSH_MAX_BYTES = 64 * 1024;
 // Floors so a stray env value can't defeat the coalescing (too-small window) or blow up a single message (too-large budget is fine, too-small starves it).
 const MIN_RUN_LOG_FLUSH_INTERVAL_MS = 50;
 const MIN_RUN_LOG_FLUSH_MAX_BYTES = 4 * 1024;
