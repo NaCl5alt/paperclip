@@ -11,10 +11,33 @@ import { logger } from "../middleware/logger.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 
 // Coalesce high-frequency run-log chunks into at most one send per window so the client renderer isn't drowned by per-chunk JSON.parse.
-const RUN_LOG_FLUSH_INTERVAL_MS = 150;
-// Cap concatenated live bytes per run+stream per flush; oldest whole chunks are dropped since the full log is persisted in the DB.
-// A single source chunk is already capped at MAX_LIVE_LOG_CHUNK_BYTES (8KiB) upstream, so this budget always holds several chunks.
-const MAX_RUN_LOG_FLUSH_BYTES = 64 * 1024;
+// Tradeoff: a live log line is delayed up to the flush window, and under heavy load the newest bytes over the budget are the only
+// ones streamed live (older segments are dropped); the full log is always in the DB and the client's fallback poll backfills them.
+const DEFAULT_RUN_LOG_FLUSH_INTERVAL_MS = 400;
+const DEFAULT_RUN_LOG_FLUSH_MAX_BYTES = 16 * 1024;
+// Floors so a stray env value can't defeat the coalescing (too-small window) or blow up a single message (too-large budget is fine, too-small starves it).
+const MIN_RUN_LOG_FLUSH_INTERVAL_MS = 50;
+const MIN_RUN_LOG_FLUSH_MAX_BYTES = 4 * 1024;
+
+// Reads a positive-integer env override; falls back to `fallback` on missing / NaN / non-integer / below-`min` values.
+export function readPositiveIntEnv(name: string, fallback: number, min: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < min) return fallback;
+  return parsed;
+}
+
+export const RUN_LOG_FLUSH_INTERVAL_MS = readPositiveIntEnv(
+  "PAPERCLIP_RUN_LOG_FLUSH_INTERVAL_MS",
+  DEFAULT_RUN_LOG_FLUSH_INTERVAL_MS,
+  MIN_RUN_LOG_FLUSH_INTERVAL_MS,
+);
+export const MAX_RUN_LOG_FLUSH_BYTES = readPositiveIntEnv(
+  "PAPERCLIP_RUN_LOG_FLUSH_MAX_BYTES",
+  DEFAULT_RUN_LOG_FLUSH_MAX_BYTES,
+  MIN_RUN_LOG_FLUSH_MAX_BYTES,
+);
 
 // One coalesced source chunk, kept per-segment so the client can reproduce the exact per-line dedupe key of the persisted log.
 interface RunLogSegment {

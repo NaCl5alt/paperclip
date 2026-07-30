@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LiveEvent } from "@paperclipai/shared";
-import { createLiveEventForwarder } from "../realtime/live-events-ws.js";
+import {
+  MAX_RUN_LOG_FLUSH_BYTES,
+  RUN_LOG_FLUSH_INTERVAL_MS,
+  createLiveEventForwarder,
+  readPositiveIntEnv,
+} from "../realtime/live-events-ws.js";
+
+// Advance past one flush window, whatever the configured/default interval is.
+const FLUSH = RUN_LOG_FLUSH_INTERVAL_MS;
 
 let nextId = 0;
 
@@ -66,7 +74,7 @@ describe("createLiveEventForwarder", () => {
 
     expect(sent).toHaveLength(0); // buffered, not yet flushed
 
-    vi.advanceTimersByTime(150);
+    vi.advanceTimersByTime(FLUSH);
 
     expect(sent).toHaveLength(1);
     expect(sent[0]?.payload.chunk).toBe("abc");
@@ -82,7 +90,7 @@ describe("createLiveEventForwarder", () => {
     forwarder.handle(e1);
     forwarder.handle(e2);
 
-    vi.advanceTimersByTime(150);
+    vi.advanceTimersByTime(FLUSH);
 
     expect(sent).toHaveLength(1);
     const segments = sent[0]?.payload.segments as Array<{ ts: unknown; chunk: unknown }>;
@@ -99,15 +107,17 @@ describe("createLiveEventForwarder", () => {
     const sent: LiveEvent[] = [];
     const forwarder = createLiveEventForwarder((data) => sent.push(JSON.parse(data)));
 
-    const big = "x".repeat(40 * 1024); // 40KiB each; budget is 64KiB
-    forwarder.handle(logEvent("run_1", `${big}A`));
-    forwarder.handle(logEvent("run_1", `${big}B`));
+    // Each chunk alone fills the budget, so two chunks force the oldest segment to be dropped.
+    const chunkA = `A${"x".repeat(MAX_RUN_LOG_FLUSH_BYTES)}`;
+    const chunkB = `B${"x".repeat(MAX_RUN_LOG_FLUSH_BYTES)}`;
+    forwarder.handle(logEvent("run_1", chunkA));
+    forwarder.handle(logEvent("run_1", chunkB));
 
-    vi.advanceTimersByTime(150);
+    vi.advanceTimersByTime(FLUSH);
 
     const segments = sent[0]?.payload.segments as Array<{ chunk: string }>;
     expect(segments).toHaveLength(1);
-    expect(segments[0]?.chunk.endsWith("B")).toBe(true);
+    expect(segments[0]?.chunk.startsWith("B")).toBe(true);
   });
 
   it("keeps distinct streams as separate coalesced messages", () => {
@@ -118,7 +128,7 @@ describe("createLiveEventForwarder", () => {
     forwarder.handle(logEvent("run_1", "err1", { stream: "stderr" }));
     forwarder.handle(logEvent("run_1", "out2", { stream: "stdout" }));
 
-    vi.advanceTimersByTime(150);
+    vi.advanceTimersByTime(FLUSH);
 
     const byStream = Object.fromEntries(
       sent.map((e) => [e.payload.stream, e.payload.chunk]),
@@ -131,16 +141,18 @@ describe("createLiveEventForwarder", () => {
     const sent: LiveEvent[] = [];
     const forwarder = createLiveEventForwarder((data) => sent.push(JSON.parse(data)));
 
-    const big = "x".repeat(40 * 1024); // 40KiB each; budget is 64KiB
-    forwarder.handle(logEvent("run_1", `${big}A`));
-    forwarder.handle(logEvent("run_1", `${big}B`));
+    // Each chunk alone fills the budget, so two chunks force the oldest to be dropped.
+    const chunkA = `A${"x".repeat(MAX_RUN_LOG_FLUSH_BYTES)}`;
+    const chunkB = `B${"x".repeat(MAX_RUN_LOG_FLUSH_BYTES)}`;
+    forwarder.handle(logEvent("run_1", chunkA));
+    forwarder.handle(logEvent("run_1", chunkB));
 
-    vi.advanceTimersByTime(150);
+    vi.advanceTimersByTime(FLUSH);
 
     expect(sent).toHaveLength(1);
     const chunk = String(sent[0]?.payload.chunk);
     // oldest chunk dropped, newest retained
-    expect(chunk.endsWith("B")).toBe(true);
+    expect(chunk.startsWith("B")).toBe(true);
     expect(chunk.includes("A")).toBe(false);
     expect(sent[0]?.payload.truncated).toBe(true);
   });
@@ -150,7 +162,7 @@ describe("createLiveEventForwarder", () => {
     const forwarder = createLiveEventForwarder((data) => sent.push(JSON.parse(data)));
 
     forwarder.handle(logEvent("run_1", "small", { truncated: true }));
-    vi.advanceTimersByTime(150);
+    vi.advanceTimersByTime(FLUSH);
 
     expect(sent[0]?.payload.truncated).toBe(true);
   });
@@ -161,8 +173,36 @@ describe("createLiveEventForwarder", () => {
 
     forwarder.handle(logEvent("run_1", "a"));
     forwarder.dispose();
-    vi.advanceTimersByTime(1000);
+    vi.advanceTimersByTime(FLUSH + 1000);
 
     expect(sent).toHaveLength(0);
+  });
+});
+
+describe("readPositiveIntEnv", () => {
+  const NAME = "PAPERCLIP_TEST_RUN_LOG_ENV";
+  afterEach(() => {
+    delete process.env[NAME];
+  });
+
+  it("returns the fallback when the env var is unset or blank", () => {
+    delete process.env[NAME];
+    expect(readPositiveIntEnv(NAME, 400, 50)).toBe(400);
+    process.env[NAME] = "   ";
+    expect(readPositiveIntEnv(NAME, 400, 50)).toBe(400);
+  });
+
+  it("returns the parsed value when it is a valid integer at or above the minimum", () => {
+    process.env[NAME] = "800";
+    expect(readPositiveIntEnv(NAME, 400, 50)).toBe(800);
+    process.env[NAME] = "50";
+    expect(readPositiveIntEnv(NAME, 400, 50)).toBe(50);
+  });
+
+  it("falls back on NaN, non-integer, negative, or below-minimum values", () => {
+    for (const bad of ["abc", "400.5", "-5", "10", "0", "1e-3"]) {
+      process.env[NAME] = bad;
+      expect(readPositiveIntEnv(NAME, 400, 50)).toBe(400);
+    }
   });
 });
