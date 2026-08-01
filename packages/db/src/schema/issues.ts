@@ -35,6 +35,11 @@ export const issues = pgTable(
     priority: text("priority").notNull().default("medium"),
     assigneeAgentId: uuid("assignee_agent_id").references(() => agents.id),
     assigneeUserId: text("assignee_user_id"),
+    // Records the assignee that owned the issue immediately before an automatic
+    // recovery failover overwrote `assigneeAgentId` with a fallback agent, so
+    // recovery can hand the issue back to its original owner if the fallback
+    // makes no progress. Null when the issue has not been failed over.
+    previousAssigneeAgentId: uuid("previous_assignee_agent_id").references(() => agents.id),
     checkoutRunId: uuid("checkout_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     executionRunId: uuid("execution_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     executionAgentNameKey: text("execution_agent_name_key"),

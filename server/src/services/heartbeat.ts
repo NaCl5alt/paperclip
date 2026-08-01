@@ -6018,7 +6018,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (budgetBlock) return skipWithEvent("fallback_agent_budget_blocked", { issueId });
 
     try {
-      await issuesSvc.update(issueId, { assigneeAgentId: fallbackAgent.id });
+      await issuesSvc.update(issueId, {
+        assigneeAgentId: fallbackAgent.id,
+        // Preserve the pre-failover assignee in a structured field so recovery
+        // can hand the issue back if the fallback makes no progress. Keep the
+        // earliest original across repeated failovers rather than overwriting.
+        previousAssigneeAgentId: issue.previousAssigneeAgentId ?? agent.id,
+      });
     } catch (err) {
       return skipWithEvent("issue_reassignment_failed", {
         issueId,
