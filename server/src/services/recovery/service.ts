@@ -599,6 +599,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return Boolean(run || deferredWake);
   }
 
+  // True when a recent system comment on the issue already contains the given
+  // marker, so terminal recovery-action helpers don't post duplicate notices or
+  // repeat a reassignment when two overlapping reconcile ticks race the same
+  // action (the sweep runs on a lockless setInterval).
+  async function hasSystemCommentMarker(issueId: string, marker: string) {
+    const rows = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")))
+      .orderBy(desc(issueComments.createdAt))
+      .limit(50);
+    return rows.some((row) => (row.body ?? "").includes(marker));
+  }
+
   async function hasQueuedIssueWake(companyId: string, issueId: string) {
     return db
       .select({ id: agentWakeupRequests.id })
@@ -2568,6 +2582,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     latestRun: LatestIssueRun;
     reason: string;
   }) {
+    // Idempotency guard for overlapping ticks: if this action was already
+    // board-escalated, don't re-null the policy or post a second notice.
+    const marker = `re-nudge board escalation for recovery action \`${input.action.id}\``;
+    if (await hasSystemCommentMarker(input.issue.id, marker)) return;
+
     await recoveryActionsSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
@@ -2592,6 +2611,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       [
         "Paperclip exhausted automatic re-nudges for this stranded recovery action and could not find an invokable owner to hand it back to.",
         "",
+        `- Event: ${marker}`,
         `- Source issue: ${issueUiLink({ identifier: input.issue.identifier, id: input.issue.id }, prefix)}`,
         `- Recovery action: \`${input.action.id}\``,
         `- Reason: \`${input.reason}\``,
@@ -2629,6 +2649,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     issue: typeof issues.$inferSelect;
     returnOwner: typeof agents.$inferSelect;
   }) {
+    // Idempotency guard for overlapping ticks: don't reassign or comment twice
+    // if this action was already handed back.
+    const marker = `returned to original owner for recovery action \`${input.action.id}\``;
+    if (await hasSystemCommentMarker(input.issue.id, marker)) return;
+
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
     const nextStatus = blockerIds.length > 0 ? "blocked" : "todo";
     const updated = await issuesSvc.update(input.issue.id, {
@@ -2657,6 +2682,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       [
         "The recovery fallback made no progress, so Paperclip handed this issue back to its original owner.",
         "",
+        `- Event: ${marker}`,
         `- New assignee: ${agentUiLink(input.returnOwner, prefix)}`,
         `- Recovery action: \`${input.action.id}\` (resolved)`,
         `- Status: \`${nextStatus}\``,

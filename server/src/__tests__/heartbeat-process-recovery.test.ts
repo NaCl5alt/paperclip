@@ -2866,6 +2866,90 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.status).toBe("blocked");
   });
 
+  it("returns a stranded issue to its original owner once re-nudges are exhausted", async () => {
+    const originalOwnerId = randomUUID();
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "adapter_failed",
+      runError: "ssh: connection reset",
+    });
+    // A distinct, invokable original owner recorded from a prior failover.
+    await db.insert(agents).values({
+      id: originalOwnerId,
+      companyId,
+      name: "OriginalOwner",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(issues).set({ previousAssigneeAgentId: originalOwnerId }).where(eq(issues.id, issueId));
+    for (const finishedAt of [
+      new Date("2026-03-18T23:50:00.000Z"),
+      new Date("2026-03-18T23:55:00.000Z"),
+    ]) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "failed",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+          source: "issue.continuation_recovery",
+        },
+        errorCode: "adapter_failed",
+        error: "ssh: connection reset",
+        startedAt: finishedAt,
+        finishedAt,
+        createdAt: finishedAt,
+        updatedAt: finishedAt,
+      });
+    }
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.escalated).toBe(1);
+
+    const action = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.sourceIssueId, issueId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    expect(action?.returnOwnerAgentId).toBe(originalOwnerId);
+
+    // Simulate exhausted re-nudges: cap attemptCount, kill the live run, mark stale.
+    await db.update(heartbeatRuns)
+      .set({ status: "failed", errorCode: "adapter_failed", error: "agy produced no output", finishedAt: new Date(Date.now() - 90 * 60 * 1000) })
+      .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"])));
+    await db.update(issueRecoveryActions)
+      .set({ attemptCount: 3, lastAttemptAt: new Date(Date.now() - 2 * 60 * 60 * 1000) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.recoveryActionReturnedToOwner).toBe(1);
+
+    const resolved = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)).then((rows) => rows[0] ?? null);
+    expect(resolved?.status).toBe("resolved");
+    expect(resolved?.outcome).toBe("restored");
+
+    const returnedIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(returnedIssue?.assigneeAgentId).toBe(originalOwnerId);
+    expect(returnedIssue?.previousAssigneeAgentId).toBeNull();
+    expect(["todo", "blocked"]).toContain(returnedIssue?.status);
+  });
+
   async function seedRecoveryFallbackAgent(input: {
     companyId: string;
     sourceAgentId: string;
