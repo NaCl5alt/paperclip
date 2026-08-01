@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseAgyOutput, parseGeminiJsonl } from "./parse.js";
+import { detectGeminiAuthRequired, parseAgyOutput, parseGeminiJsonl } from "./parse.js";
 
 describe("parseAgyOutput", () => {
   it("treats plain stdout as the summary and leaves metadata empty", () => {
@@ -145,5 +145,43 @@ describe("parseGeminiJsonl", () => {
 
     const result = parseGeminiJsonl(stdout);
     expect(result.errorMessage).toBe("boom");
+  });
+});
+
+describe("detectGeminiAuthRequired", () => {
+  it("flags the agy `authentication failed or timed out` failure as an auth error", () => {
+    const result = detectGeminiAuthRequired({
+      parsed: null,
+      stdout: "",
+      stderr: "Error: authentication failed or timed out",
+    });
+    expect(result.requiresAuth).toBe(true);
+  });
+
+  it("flags `failed to authenticate` phrasing as an auth error", () => {
+    const result = detectGeminiAuthRequired({
+      parsed: null,
+      stdout: "failed to authenticate with the upstream provider",
+      stderr: "",
+    });
+    expect(result.requiresAuth).toBe(true);
+  });
+
+  it("still flags the pre-existing `not authenticated` phrasing", () => {
+    const result = detectGeminiAuthRequired({
+      parsed: null,
+      stdout: "",
+      stderr: "not authenticated: run `gemini auth login` first",
+    });
+    expect(result.requiresAuth).toBe(true);
+  });
+
+  it("does not flag a generic non-auth failure", () => {
+    const result = detectGeminiAuthRequired({
+      parsed: null,
+      stdout: "agy produced no output",
+      stderr: "connection reset by peer",
+    });
+    expect(result.requiresAuth).toBe(false);
   });
 });
