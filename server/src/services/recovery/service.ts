@@ -6,6 +6,7 @@ import {
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
+  type IssueRecoveryAction,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -22,6 +23,7 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  routines,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -175,6 +177,15 @@ const TRANSIENT_UPSTREAM_FAILOVER_ERROR_CODES = new Set<string>([
   "claude_transient_upstream",
 ]);
 
+// Adapter-level failures where the run died inside the execution system itself
+// (not a per-issue application error). Routing the recovery notification to an
+// owner on the SAME adapter would make the notification run die the same way,
+// which is exactly how a stranded issue lost its only rescue path.
+const ADAPTER_FAILURE_ERROR_CODES = new Set<string>([
+  "adapter_failed",
+  "gemini_auth_required",
+]);
+
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "agent_not_invokable",
   "agent_not_found",
@@ -187,6 +198,20 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
 const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
+
+// Source-scoped stranded recovery actions previously enqueued a single owner
+// wake and never retried it, so a wake run that died (e.g. the owner shared the
+// same broken adapter) left the issue pending indefinitely. These bound a
+// re-nudge loop: re-fire the owner wake when it has gone stale, up to a cap,
+// then fall back to the original assignee / board escalation.
+const STRANDED_RECOVERY_RENUDGE_MAX_ATTEMPTS = Math.max(
+  1,
+  Math.floor(asNumber(process.env.PAPERCLIP_STRANDED_RECOVERY_RENUDGE_MAX_ATTEMPTS, 3)),
+);
+const STRANDED_RECOVERY_RENUDGE_STALE_MS = Math.max(
+  60_000,
+  Math.floor(asNumber(process.env.PAPERCLIP_STRANDED_RECOVERY_RENUDGE_STALE_MS, 60 * 60 * 1000)),
+);
 
 type ContinuationRetryClassification = {
   kind: "transient_infra" | "non_retryable" | "default";
@@ -1876,7 +1901,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     candidateIds.push(...roleCandidates.map((agent) => agent.id));
     if (issue.assigneeAgentId) candidateIds.push(issue.assigneeAgentId);
 
+    // When the stranded run died from an adapter-level failure, prefer a
+    // recovery owner on a different adapter so the rescue notification does not
+    // die on the same broken execution system. Only fall back to a same-adapter
+    // owner when no healthy-adapter candidate is invokable.
+    const failingAdapterType = await resolveFailingAdapterType(latestRun);
+
     const seen = new Set<string>();
+    let sameAdapterFallbackAgentId: string | null = null;
     for (const agentId of candidateIds) {
       if (seen.has(agentId)) continue;
       seen.add(agentId);
@@ -1886,10 +1918,55 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         issueId: issue.id,
         projectId: issue.projectId,
       });
-      if ((await isAgentInvokable(candidate)) && !budgetBlock) return candidate.id;
+      if (!(await isAgentInvokable(candidate)) || budgetBlock) continue;
+      if (failingAdapterType && candidate.adapterType === failingAdapterType) {
+        if (!sameAdapterFallbackAgentId) sameAdapterFallbackAgentId = candidate.id;
+        continue;
+      }
+      return candidate.id;
     }
 
-    return null;
+    return sameAdapterFallbackAgentId;
+  }
+
+  // Resolve the adapter type of the run that just stranded the issue, but only
+  // when it failed with an adapter-level error code (so callers can avoid
+  // re-routing recovery to the same broken adapter).
+  async function resolveFailingAdapterType(latestRun: LatestIssueRun): Promise<string | null> {
+    const errorCode = readNonEmptyString(latestRun?.errorCode);
+    if (!errorCode || !ADAPTER_FAILURE_ERROR_CODES.has(errorCode)) return null;
+    const runAgentId = readNonEmptyString(latestRun?.agentId);
+    if (!runAgentId) return null;
+    const runAgent = await getAgent(runAgentId);
+    return readNonEmptyString(runAgent?.adapterType) ?? null;
+  }
+
+  // Resolve the assignee that owned the issue before any automatic failover, so
+  // recovery can hand it back to its real owner. Prefer the structured
+  // `previousAssigneeAgentId` captured at failover; fall back to the routine
+  // owner for routine-execution issues (a cheap, reliable late fallback even
+  // when the structured field was never populated); otherwise the current
+  // assignee.
+  async function resolveOriginalAssigneeAgentId(
+    issue: typeof issues.$inferSelect,
+  ): Promise<string | null> {
+    const previousAssignee = readNonEmptyString(issue.previousAssigneeAgentId);
+    if (previousAssignee) return previousAssignee;
+
+    if (issue.originKind === "routine_execution") {
+      const routineId = readNonEmptyString(issue.originId);
+      if (routineId) {
+        const routine = await db
+          .select({ assigneeAgentId: routines.assigneeAgentId })
+          .from(routines)
+          .where(and(eq(routines.id, routineId), eq(routines.companyId, issue.companyId)))
+          .then((rows) => rows[0] ?? null);
+        const routineAssignee = readNonEmptyString(routine?.assigneeAgentId);
+        if (routineAssignee) return routineAssignee;
+      }
+    }
+
+    return readNonEmptyString(issue.assigneeAgentId) ?? null;
   }
 
   function buildStrandedIssueRecoveryDescription(input: {
@@ -2105,7 +2182,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     const recoveryCause = input.recoveryCause ?? "stranded_assigned_issue";
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue, input.latestRun);
+    const originalAssigneeAgentId = await resolveOriginalAssigneeAgentId(input.issue);
     const now = new Date();
+    // Owner-wake recovery actions get a bounded re-nudge policy so a lost/failed
+    // wake is retried instead of stranding the issue forever. Manual-repair and
+    // board-escalation actions are terminal and do not re-nudge.
+    const shouldRenudge = Boolean(ownerAgentId) && recoveryCause !== "workspace_validation_failed";
     const action = await recoveryActionsSvc.upsertSourceScoped({
       companyId: input.issue.companyId,
       sourceIssueId: input.issue.id,
@@ -2113,7 +2195,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       ownerType: ownerAgentId ? "agent" : "board",
       ownerAgentId,
       previousOwnerAgentId: input.issue.assigneeAgentId,
-      returnOwnerAgentId: input.issue.assigneeAgentId,
+      // Return the issue to its real (pre-failover) owner, not the fallback that
+      // currently holds it. Falls back to the current assignee when no original
+      // owner can be resolved.
+      returnOwnerAgentId: originalAssigneeAgentId ?? input.issue.assigneeAgentId,
       cause: recoveryCause,
       fingerprint: strandedRecoveryActionFingerprint({
         issue: input.issue,
@@ -2147,8 +2232,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           type: "board_escalation",
           reason: "no_invokable_recovery_owner",
         },
-      monitorPolicy: null,
-      maxAttempts: null,
+      monitorPolicy: shouldRenudge
+        ? {
+          type: "renudge",
+          reason: "source_scoped_recovery_action",
+          staleAfterMs: STRANDED_RECOVERY_RENUDGE_STALE_MS,
+          maxAttempts: STRANDED_RECOVERY_RENUDGE_MAX_ATTEMPTS,
+        }
+        : null,
+      maxAttempts: shouldRenudge ? STRANDED_RECOVERY_RENUDGE_MAX_ATTEMPTS : null,
       lastAttemptAt: now,
     });
 
@@ -2467,6 +2559,260 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  // Stop re-nudging and surface a still-stranded issue to the board once the
+  // bounded owner-wake retries are exhausted with no invokable owner to return
+  // to. The source issue is already `blocked`, so this posts a one-time notice.
+  async function escalateStrandedRecoveryActionToBoard(input: {
+    action: IssueRecoveryAction;
+    issue: typeof issues.$inferSelect;
+    latestRun: LatestIssueRun;
+    reason: string;
+  }) {
+    await recoveryActionsSvc.upsertSourceScoped({
+      companyId: input.issue.companyId,
+      sourceIssueId: input.issue.id,
+      kind: input.action.kind,
+      ownerType: "board",
+      ownerAgentId: null,
+      cause: input.action.cause,
+      fingerprint: input.action.fingerprint,
+      nextAction: input.action.nextAction,
+      wakePolicy: { type: "board_escalation", reason: input.reason },
+      // Drop the re-nudge policy so this action leaves the sweep and the notice
+      // is posted only once.
+      monitorPolicy: null,
+      maxAttempts: null,
+      lastAttemptAt: new Date(),
+    });
+
+    const prefix = await getCompanyIssuePrefix(input.issue.companyId);
+    const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
+    await issuesSvc.addComment(
+      input.issue.id,
+      [
+        "Paperclip exhausted automatic re-nudges for this stranded recovery action and could not find an invokable owner to hand it back to.",
+        "",
+        `- Source issue: ${issueUiLink({ identifier: input.issue.identifier, id: input.issue.id }, prefix)}`,
+        `- Recovery action: \`${input.action.id}\``,
+        `- Reason: \`${input.reason}\``,
+        `- Re-nudge attempts: \`${input.action.attemptCount}\``,
+        failureSummary ? `- Failure: ${failureSummary.trim()}` : "- Failure: none recorded",
+        "",
+        "Next action: a board operator should assign an invokable owner, fix the runtime/adapter state, or record an intentional manual resolution.",
+      ].join("\n"),
+      {},
+    );
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.recovery_action_board_escalated",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        recoveryActionId: input.action.id,
+        reason: input.reason,
+        attemptCount: input.action.attemptCount,
+      },
+    });
+  }
+
+  // Hand a stranded issue back to its original (pre-failover) owner once the
+  // fallback owner has exhausted its re-nudges, then resolve the recovery
+  // action. This is the return path that `returnOwnerAgentId` never had.
+  async function returnStrandedIssueToOriginalOwner(input: {
+    action: IssueRecoveryAction;
+    issue: typeof issues.$inferSelect;
+    returnOwner: typeof agents.$inferSelect;
+  }) {
+    const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
+    const nextStatus = blockerIds.length > 0 ? "blocked" : "todo";
+    const updated = await issuesSvc.update(input.issue.id, {
+      status: nextStatus,
+      assigneeAgentId: input.returnOwner.id,
+      previousAssigneeAgentId: null,
+      blockedByIssueIds: blockerIds,
+    });
+
+    await recoveryActionsSvc.resolveActiveForIssue({
+      companyId: input.issue.companyId,
+      sourceIssueId: input.issue.id,
+      actionId: input.action.id,
+      status: "resolved",
+      outcome: "restored",
+      resolutionNote: `Returned to original owner ${input.returnOwner.id} after recovery re-nudges were exhausted.`,
+    });
+
+    if (updated && nextStatus === "todo") {
+      await enqueueInitialAssignedTodoDispatch(updated, input.returnOwner.id);
+    }
+
+    const prefix = await getCompanyIssuePrefix(input.issue.companyId);
+    await issuesSvc.addComment(
+      input.issue.id,
+      [
+        "The recovery fallback made no progress, so Paperclip handed this issue back to its original owner.",
+        "",
+        `- New assignee: ${agentUiLink(input.returnOwner, prefix)}`,
+        `- Recovery action: \`${input.action.id}\` (resolved)`,
+        `- Status: \`${nextStatus}\``,
+      ].join("\n"),
+      {},
+    );
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.recovery_action_returned_to_owner",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        recoveryActionId: input.action.id,
+        returnOwnerAgentId: input.returnOwner.id,
+        status: nextStatus,
+      },
+    });
+  }
+
+  // Periodic sweep over active owner-wake recovery actions: re-fire a lost or
+  // failed owner wake when it goes stale, up to a bounded cap, then return the
+  // issue to its original owner or escalate to the board. Closes the gap where a
+  // single failed recovery wake left an issue pending indefinitely.
+  async function renudgeStrandedRecoveryActions(result: {
+    recoveryActionRenudged: number;
+    recoveryActionReturnedToOwner: number;
+    recoveryActionBoardEscalated: number;
+    skipped: number;
+    issueIds: string[];
+  }) {
+    const actions = await recoveryActionsSvc.listActiveRenudgeCandidates();
+    const nowMs = Date.now();
+
+    for (const action of actions) {
+      const policy = parseObject(action.monitorPolicy);
+      const staleAfterMs = Math.max(
+        60_000,
+        Math.floor(asNumber(policy.staleAfterMs, STRANDED_RECOVERY_RENUDGE_STALE_MS)),
+      );
+      const maxAttempts = Math.max(
+        1,
+        Math.floor(asNumber(policy.maxAttempts, STRANDED_RECOVERY_RENUDGE_MAX_ATTEMPTS)),
+      );
+
+      const lastAttemptMs = action.lastAttemptAt ? new Date(action.lastAttemptAt).getTime() : 0;
+      if (lastAttemptMs && nowMs - lastAttemptMs < staleAfterMs) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.id, action.sourceIssueId), eq(issues.companyId, action.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (!issue) {
+        await recoveryActionsSvc.resolveActiveForIssue({
+          companyId: action.companyId,
+          sourceIssueId: action.sourceIssueId,
+          actionId: action.id,
+          status: "cancelled",
+          outcome: "cancelled",
+          resolutionNote: "Source issue no longer exists.",
+        });
+        continue;
+      }
+
+      // Stop when a human took the issue or it reached a terminal disposition.
+      if (issue.assigneeUserId || issue.status === "done" || issue.status === "cancelled") {
+        await recoveryActionsSvc.resolveActiveForIssue({
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          actionId: action.id,
+          status: "resolved",
+          outcome: "false_positive",
+          resolutionNote: "Source issue no longer needs automatic recovery.",
+        });
+        continue;
+      }
+
+      // Owner is actively working the issue, or recovery is paused — leave it.
+      if (await hasActiveExecutionPath(issue.companyId, issue.id)) {
+        result.skipped += 1;
+        continue;
+      }
+      if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+
+      if (action.attemptCount < maxAttempts) {
+        // Re-fire the owner wake, re-selecting an owner that avoids the adapter
+        // that just failed.
+        const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(issue, latestRun);
+        if (!ownerAgentId) {
+          await escalateStrandedRecoveryActionToBoard({ action, issue, latestRun, reason: "no_invokable_recovery_owner" });
+          result.recoveryActionBoardEscalated += 1;
+          result.issueIds.push(issue.id);
+          continue;
+        }
+        const refreshed = await recoveryActionsSvc.upsertSourceScoped({
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          kind: action.kind,
+          ownerType: "agent",
+          ownerAgentId,
+          // previousOwner/returnOwner omitted → preserved by the upsert.
+          cause: action.cause,
+          fingerprint: action.fingerprint,
+          nextAction: action.nextAction,
+          wakePolicy: { type: "wake_owner", reason: "source_scoped_recovery_action_renudge", ownerAgentId },
+          monitorPolicy: { type: "renudge", reason: "source_scoped_recovery_action", staleAfterMs, maxAttempts },
+          maxAttempts,
+          lastAttemptAt: new Date(),
+        });
+        await enqueueSourceScopedStrandedRecoveryWake({
+          action: refreshed,
+          issue,
+          latestRun,
+          recoveryCause: action.cause as StrandedRecoveryCause,
+        });
+        result.recoveryActionRenudged += 1;
+        result.issueIds.push(issue.id);
+        continue;
+      }
+
+      // Re-nudges exhausted: hand back to the original owner when possible.
+      const returnOwnerAgentId = readNonEmptyString(action.returnOwnerAgentId);
+      const returnOwner = returnOwnerAgentId ? await getAgent(returnOwnerAgentId) : null;
+      const returnOwnerUsable =
+        Boolean(returnOwner) &&
+        returnOwner!.companyId === issue.companyId &&
+        returnOwner!.id !== action.ownerAgentId &&
+        (await isAgentInvokable(returnOwner!)) &&
+        !(await isInvocationBudgetBlocked(issue, returnOwner!.id));
+      if (returnOwner && returnOwnerUsable) {
+        await returnStrandedIssueToOriginalOwner({ action, issue, returnOwner });
+        result.recoveryActionReturnedToOwner += 1;
+        result.issueIds.push(issue.id);
+        continue;
+      }
+
+      await escalateStrandedRecoveryActionToBoard({ action, issue, latestRun, reason: "renudge_attempts_exhausted" });
+      result.recoveryActionBoardEscalated += 1;
+      result.issueIds.push(issue.id);
+    }
+  }
+
   async function reconcileStrandedAssignedIssues() {
     const candidates = await db
       .select()
@@ -2488,6 +2834,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       orphanBlockersAssigned: 0,
       successfulRunHandoffEscalated: 0,
       escalated: 0,
+      recoveryActionRenudged: 0,
+      recoveryActionReturnedToOwner: 0,
+      recoveryActionBoardEscalated: 0,
       skipped: 0,
       issueIds: [] as string[],
     };
@@ -2764,6 +3113,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
     result.skipped += orphanBlockerRecovery.skipped;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
+
+    await renudgeStrandedRecoveryActions(result);
 
     return result;
   }

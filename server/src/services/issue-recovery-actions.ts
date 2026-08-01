@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueRecoveryActions } from "@paperclipai/db";
 import type {
@@ -157,6 +157,24 @@ export function issueRecoveryActionService(db: Db) {
     return result;
   }
 
+  // Active recovery actions carrying a `renudge` monitor policy — the ones a
+  // periodic sweep must revisit to re-fire a lost/failed owner wake instead of
+  // stranding the issue forever. Oldest last-attempt first so the most overdue
+  // actions are re-nudged first.
+  async function listActiveRenudgeCandidates(): Promise<IssueRecoveryAction[]> {
+    const rows = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.status, "active"),
+          sql`${issueRecoveryActions.monitorPolicy} ->> 'type' = 'renudge'`,
+        ),
+      )
+      .orderBy(asc(issueRecoveryActions.lastAttemptAt));
+    return rows.map(toReadModel);
+  }
+
   async function retryUpsertSourceScoped(
     input: UpsertIssueRecoveryActionInput,
     retryCount: number,
@@ -289,6 +307,7 @@ export function issueRecoveryActionService(db: Db) {
   return {
     getActiveForIssue,
     listActiveForIssues,
+    listActiveRenudgeCandidates,
     resolveActiveForIssue,
     upsertSourceScoped,
   };

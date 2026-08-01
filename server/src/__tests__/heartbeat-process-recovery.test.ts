@@ -758,7 +758,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       returnOwnerAgentId: input.agentId,
       cause: input.cause ?? "stranded_assigned_issue",
       attemptCount: 1,
-      maxAttempts: null,
+      maxAttempts: 3,
+      monitorPolicy: { type: "renudge" },
     });
     expect(action.evidence).toMatchObject({
       sourceIssueId: input.issueId,
@@ -2758,6 +2759,111 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("retried continuation");
     expect(comments[0]?.body).toContain("3× attempts");
     expect(comments[0]?.body).toContain("Latest cause: `adapter_failed`");
+  });
+
+  it("re-nudges a stale owner-wake recovery action instead of leaving it pending forever", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "adapter_failed",
+      runError: "ssh: connection reset",
+    });
+    // Backfill retries so the first sweep reaches the cap and escalates into a
+    // source-scoped recovery action.
+    for (const finishedAt of [
+      new Date("2026-03-18T23:50:00.000Z"),
+      new Date("2026-03-18T23:55:00.000Z"),
+    ]) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "failed",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+          source: "issue.continuation_recovery",
+        },
+        errorCode: "adapter_failed",
+        error: "ssh: connection reset",
+        startedAt: finishedAt,
+        finishedAt,
+        createdAt: finishedAt,
+        updatedAt: finishedAt,
+      });
+    }
+    const heartbeat = heartbeatService(db);
+
+    // First sweep creates the recovery action and enqueues the initial owner wake.
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.escalated).toBe(1);
+
+    const action = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.sourceIssueId, issueId),
+      ))
+      .then((rows) => rows[0] ?? null);
+    expect(action?.attemptCount).toBe(1);
+    expect((action?.monitorPolicy as Record<string, unknown> | null)?.type).toBe("renudge");
+
+    const wakesBefore = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.reason, "source_scoped_recovery_action"),
+      ));
+
+    // Simulate the incident: the recovery owner's wake run died on its broken
+    // adapter (the real one failed in ~8s), leaving no live execution path, and
+    // mark the action stale so the next sweep must re-fire the wake.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "failed",
+        errorCode: "adapter_failed",
+        error: "agy produced no output",
+        finishedAt: new Date(Date.now() - 90 * 60 * 1000),
+      })
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+      ));
+    await db
+      .update(issueRecoveryActions)
+      .set({ lastAttemptAt: new Date(Date.now() - 2 * 60 * 60 * 1000) })
+      .where(eq(issueRecoveryActions.id, action!.id));
+
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.recoveryActionRenudged).toBe(1);
+
+    const renudged = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action!.id))
+      .then((rows) => rows[0] ?? null);
+    expect(renudged?.status).toBe("active");
+    expect(renudged?.attemptCount).toBe(2);
+
+    const wakesAfter = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.reason, "source_scoped_recovery_action"),
+      ));
+    expect(wakesAfter.length).toBeGreaterThan(wakesBefore.length);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
   });
 
   async function seedRecoveryFallbackAgent(input: {
