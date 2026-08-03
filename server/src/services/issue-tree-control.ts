@@ -4,6 +4,7 @@ import {
   agentWakeupRequests,
   heartbeatRuns,
   issueComments,
+  issueThreadInteractions,
   issueTreeHoldMembers,
   issueTreeHolds,
   issues,
@@ -893,6 +894,32 @@ export function issueTreeControlService(db: Db) {
         status: issues.status,
         assigneeAgentId: issues.assigneeAgentId,
       });
+
+    // The bulk cancel above bypasses issueService.update, so mirror its
+    // terminal-close expiry (VANA-2574): expire every pending interaction on the
+    // issues that actually transitioned to cancelled here. Scoped to `updated`
+    // (which already excludes already-terminal issues), so it stays idempotent.
+    if (updated.length > 0) {
+      await db
+        .update(issueThreadInteractions)
+        .set({
+          status: "expired",
+          result: {
+            version: 1,
+            outcome: "issue_closed",
+            issueStatus: "cancelled",
+          },
+          resolvedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issueThreadInteractions.companyId, companyId),
+            inArray(issueThreadInteractions.issueId, updated.map((issue) => issue.id)),
+            eq(issueThreadInteractions.status, "pending"),
+          ),
+        );
+    }
 
     return {
       updatedIssueIds: updated.map((issue) => issue.id),

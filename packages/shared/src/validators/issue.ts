@@ -842,6 +842,15 @@ export const requestConfirmationResultSchema = z.object({
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
 });
 
+// Result written to any pending interaction (all kinds) when its issue reaches a
+// terminal status (done / cancelled). Kept separate from the per-kind result
+// schemas so the terminal-close expiry is uniform across kinds (VANA-2574).
+export const issueClosedInteractionResultSchema = z.object({
+  version: z.literal(1),
+  outcome: z.literal("issue_closed"),
+  issueStatus: z.enum(["done", "cancelled"]),
+});
+
 export const requestCheckboxConfirmationResultSchema = requestConfirmationResultSchema.extend({
   selectedOptionIds: z.array(z.string().trim().min(1).max(120))
     .max(REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT)

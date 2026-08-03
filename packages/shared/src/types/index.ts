@@ -317,6 +317,7 @@ export type {
   IssueThreadInteraction,
   IssueThreadInteractionPayload,
   IssueThreadInteractionResult,
+  IssueClosedInteractionResult,
   IssueDocument,
   IssueDocumentSummary,
   DocumentRevision,

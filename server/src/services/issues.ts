@@ -5232,6 +5232,42 @@ export function issueService(db: Db) {
           }
         }
         const [enriched] = await withIssueLabels(tx, [updated]);
+        // When an issue transitions to a terminal status, expire every pending
+        // thread interaction on it — all kinds, not only request_confirmation —
+        // so a closed issue never strands a pending prompt (VANA-2574 / VANA-2571).
+        // Guarded on the status *transition* (existing.status !== next) and on
+        // status = "pending", so re-PATCHing an already-terminal issue and
+        // already-resolved interactions are both no-ops (idempotent). This runs
+        // in the same transaction as the status change; no continuation wake is
+        // queued because the wake helper lives in the routes layer, so closing an
+        // issue silently clears its pending interactions.
+        if (
+          (issueData.status === "done" || issueData.status === "cancelled") &&
+          existing.status !== issueData.status
+        ) {
+          const expiredAt = new Date();
+          await tx
+            .update(issueThreadInteractions)
+            .set({
+              status: "expired",
+              result: {
+                version: 1,
+                outcome: "issue_closed",
+                issueStatus: issueData.status,
+              },
+              resolvedByAgentId: actorAgentId ?? null,
+              resolvedByUserId: actorUserId ?? null,
+              resolvedAt: expiredAt,
+              updatedAt: expiredAt,
+            })
+            .where(
+              and(
+                eq(issueThreadInteractions.companyId, existing.companyId),
+                eq(issueThreadInteractions.issueId, existing.id),
+                eq(issueThreadInteractions.status, "pending"),
+              ),
+            );
+        }
         if (
           (issueData.status === "done" || issueData.status === "cancelled") &&
           existing.status !== issueData.status &&

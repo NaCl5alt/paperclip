@@ -8,6 +8,7 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueThreadInteractions,
   issueTreeHoldMembers,
   issueTreeHolds,
   issues,
@@ -40,6 +41,7 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
   afterEach(async () => {
     await db.delete(issueTreeHoldMembers);
     await db.delete(issueTreeHolds);
+    await db.delete(issueThreadInteractions);
     await db.delete(issueComments);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
@@ -335,6 +337,53 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
       cancel: "released",
       restore: "released",
     });
+  });
+
+  it("expires pending interactions on issues the cancel cascade transitions", async () => {
+    const companyId = randomUUID();
+    const rootIssueId = randomUUID();
+    const todoChildId = randomUUID();
+    const doneChildId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values([
+      { id: rootIssueId, companyId, title: "Root", status: "in_progress", priority: "medium", createdAt: new Date("2026-04-21T10:00:00.000Z") },
+      { id: todoChildId, companyId, parentId: rootIssueId, title: "Todo child", status: "todo", priority: "medium", createdAt: new Date("2026-04-21T10:01:00.000Z") },
+      { id: doneChildId, companyId, parentId: rootIssueId, title: "Done child", status: "done", priority: "medium", createdAt: new Date("2026-04-21T10:02:00.000Z") },
+    ]);
+    // A pending interaction on a child that WILL be cancelled, and one on a child
+    // that is already terminal (so the cascade skips it and must not touch it).
+    const todoInteractionId = randomUUID();
+    const doneInteractionId = randomUUID();
+    await db.insert(issueThreadInteractions).values([
+      { id: todoInteractionId, companyId, issueId: todoChildId, kind: "ask_user_questions", status: "pending", payload: { version: 1, questions: [{ id: "q", prompt: "?", selectionMode: "single", options: [{ id: "a", label: "A" }] }] } },
+      { id: doneInteractionId, companyId, issueId: doneChildId, kind: "request_confirmation", status: "pending", payload: { version: 1, prompt: "?" } },
+    ]);
+
+    const svc = issueTreeControlService(db);
+    const cancel = await svc.createHold(companyId, rootIssueId, {
+      mode: "cancel",
+      reason: "bad plan",
+      actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
+    });
+    await svc.cancelIssueStatusesForHold(companyId, rootIssueId, cancel.hold.id);
+
+    const rows = await db
+      .select({ id: issueThreadInteractions.id, status: issueThreadInteractions.status, result: issueThreadInteractions.result })
+      .from(issueThreadInteractions)
+      .where(inArray(issueThreadInteractions.id, [todoInteractionId, doneInteractionId]));
+    const byId = Object.fromEntries(rows.map((row) => [row.id, row]));
+
+    // The interaction on the cancelled child is expired with issue_closed.
+    expect(byId[todoInteractionId].status).toBe("expired");
+    expect(byId[todoInteractionId].result).toMatchObject({ version: 1, outcome: "issue_closed", issueStatus: "cancelled" });
+    // The already-done child was skipped by the cascade, so its interaction is untouched.
+    expect(byId[doneInteractionId].status).toBe("pending");
   });
 
   it("walks pause-hold ancestry beyond 15 levels for checkout and interaction waives", async () => {

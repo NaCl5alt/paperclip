@@ -20,6 +20,7 @@ import {
   projects,
   workspaceOperations,
 } from "@paperclipai/db";
+import { ISSUE_THREAD_INTERACTION_KINDS } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -1656,6 +1657,212 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       expect(accepted.interaction).toMatchObject({
         id: created.id,
         status: "accepted",
+      });
+    });
+  });
+
+  describe("expires pending interactions when the issue reaches a terminal status", () => {
+    async function createPending(
+      issue: { id: string; companyId: string },
+      kind: (typeof ISSUE_THREAD_INTERACTION_KINDS)[number],
+    ) {
+      const payloadByKind = {
+        suggest_tasks: {
+          version: 1 as const,
+          tasks: [{ clientKey: "root", title: "Follow-up" }],
+        },
+        ask_user_questions: {
+          version: 1 as const,
+          questions: [
+            {
+              id: "scope",
+              prompt: "Pick a scope",
+              selectionMode: "single" as const,
+              options: [{ id: "a", label: "A" }],
+            },
+          ],
+        },
+        request_confirmation: {
+          version: 1 as const,
+          prompt: "Proceed?",
+        },
+        request_checkbox_confirmation: {
+          version: 1 as const,
+          prompt: "Check the boxes",
+          options: [{ id: "opt-1", label: "Option 1" }],
+        },
+      } as const;
+      return interactionsSvc.create(issue, {
+        kind,
+        continuationPolicy: "wake_assignee",
+        payload: payloadByKind[kind],
+      }, { userId: "local-board" });
+    }
+
+    it("expires every pending kind on a done transition and records issue_closed", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Done expires all kinds");
+      const created = await Promise.all(
+        ISSUE_THREAD_INTERACTION_KINDS.map((kind) => createPending({ id: issueId, companyId }, kind)),
+      );
+      expect(created.every((row) => row.status === "pending")).toBe(true);
+
+      await issuesSvc.update(issueId, { status: "done", actorUserId: "local-board" });
+
+      const listed = await interactionsSvc.listForIssue(issueId);
+      expect(listed).toHaveLength(ISSUE_THREAD_INTERACTION_KINDS.length);
+      for (const interaction of listed) {
+        expect(interaction.status).toBe("expired");
+        expect(interaction.result).toMatchObject({
+          version: 1,
+          outcome: "issue_closed",
+          issueStatus: "done",
+        });
+        expect(interaction.resolvedByUserId).toBe("local-board");
+        expect(interaction.resolvedAt).not.toBeNull();
+      }
+    });
+
+    it("expires every pending kind on a cancelled transition", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Cancelled expires all kinds");
+      await Promise.all(
+        ISSUE_THREAD_INTERACTION_KINDS.map((kind) => createPending({ id: issueId, companyId }, kind)),
+      );
+
+      await issuesSvc.update(issueId, { status: "cancelled", actorUserId: "local-board" });
+
+      const listed = await interactionsSvc.listForIssue(issueId);
+      expect(listed).toHaveLength(ISSUE_THREAD_INTERACTION_KINDS.length);
+      for (const interaction of listed) {
+        expect(interaction.status).toBe("expired");
+        expect(interaction.result).toMatchObject({
+          version: 1,
+          outcome: "issue_closed",
+          issueStatus: "cancelled",
+        });
+      }
+    });
+
+    it("does not touch already-expired interactions when the issue is re-PATCHed to done", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Idempotent re-PATCH");
+      await createPending({ id: issueId, companyId }, "request_confirmation");
+
+      await issuesSvc.update(issueId, { status: "done", actorUserId: "local-board" });
+      const afterFirst = await interactionsSvc.listForIssue(issueId);
+      expect(afterFirst).toHaveLength(1);
+      const firstResolvedAt = afterFirst[0].resolvedAt;
+      expect(firstResolvedAt).not.toBeNull();
+
+      // Re-PATCHing an already-terminal issue is a no-op transition, so the
+      // interaction must keep its original resolvedAt (not be re-expired).
+      await issuesSvc.update(issueId, { status: "done", actorUserId: "local-board" });
+      const afterSecond = await interactionsSvc.listForIssue(issueId);
+      expect(afterSecond).toHaveLength(1);
+      expect(afterSecond[0].status).toBe("expired");
+      expect(new Date(afterSecond[0].resolvedAt as Date).getTime()).toBe(
+        new Date(firstResolvedAt as Date).getTime(),
+      );
+    });
+
+    it("does not expire pending interactions on an open-to-open transition", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Open to open");
+      const created = await createPending({ id: issueId, companyId }, "request_confirmation");
+
+      await issuesSvc.update(issueId, { status: "todo", actorUserId: "local-board" });
+
+      const listed = await interactionsSvc.listForIssue(issueId);
+      expect(listed).toHaveLength(1);
+      expect(listed[0]).toMatchObject({ id: created.id, status: "pending" });
+    });
+
+    it("leaves already answered interactions untouched and only expires pending ones", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Preserve answered");
+      const question = await createPending({ id: issueId, companyId }, "ask_user_questions");
+      const answered = await interactionsSvc.answerQuestions({ id: issueId, companyId }, question.id, {
+        answers: [{ questionId: "scope", optionIds: ["a"] }],
+      }, { userId: "local-board" });
+      expect(answered.status).toBe("answered");
+      const pending = await createPending({ id: issueId, companyId }, "request_confirmation");
+
+      await issuesSvc.update(issueId, { status: "done", actorUserId: "local-board" });
+
+      const listed = await interactionsSvc.listForIssue(issueId);
+      const byId = new Map(listed.map((row) => [row.id, row]));
+      expect(byId.get(answered.id)).toMatchObject({
+        status: "answered",
+        result: { version: 1 },
+      });
+      expect(byId.get(answered.id)?.result).not.toMatchObject({ outcome: "issue_closed" });
+      expect(byId.get(pending.id)).toMatchObject({
+        status: "expired",
+        result: { outcome: "issue_closed", issueStatus: "done" },
+      });
+    });
+
+    describe("backfillExpirePendingInteractionsOnTerminalIssues", () => {
+      // The backfill targets interactions already stranded on closed issues, so
+      // seed the issue directly in a terminal status (bypassing the update hook).
+      async function seedTerminalIssue(status: "done" | "cancelled") {
+        const companyId = randomUUID();
+        const goalId = randomUUID();
+        const issueId = randomUUID();
+        await db.insert(companies).values({
+          id: companyId,
+          name: "Paperclip",
+          issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+          requireBoardApprovalForNewAgents: false,
+        });
+        await db.insert(goals).values({ id: goalId, companyId, title: "Backfill", level: "task", status: "active" });
+        await db.insert(issues).values({ id: issueId, companyId, goalId, title: "Closed issue", status, priority: "medium" });
+        return { companyId, goalId, issueId };
+      }
+
+      it("dry-run reports counts across kinds without writing", async () => {
+        const done = await seedTerminalIssue("done");
+        await createPending({ id: done.issueId, companyId: done.companyId }, "request_confirmation");
+        await createPending({ id: done.issueId, companyId: done.companyId }, "ask_user_questions");
+        const cancelled = await seedTerminalIssue("cancelled");
+        await createPending({ id: cancelled.issueId, companyId: cancelled.companyId }, "suggest_tasks");
+
+        const result = await interactionsSvc.backfillExpirePendingInteractionsOnTerminalIssues({ dryRun: true });
+        expect(result).toMatchObject({
+          dryRun: true,
+          total: 3,
+          countByStatus: { done: 2, cancelled: 1 },
+          updated: 0,
+        });
+        // Nothing was written.
+        const stillPending = await interactionsSvc.listForIssue(done.issueId);
+        expect(stillPending.every((row) => row.status === "pending")).toBe(true);
+      });
+
+      it("execute expires stranded pending interactions and is idempotent", async () => {
+        const done = await seedTerminalIssue("done");
+        await createPending({ id: done.issueId, companyId: done.companyId }, "request_confirmation");
+        await createPending({ id: done.issueId, companyId: done.companyId }, "ask_user_questions");
+
+        // An open issue in the same company must be left alone.
+        const openIssueId = randomUUID();
+        const openGoalId = randomUUID();
+        await db.insert(goals).values({ id: openGoalId, companyId: done.companyId, title: "Open", level: "task", status: "active" });
+        await db.insert(issues).values({ id: openIssueId, companyId: done.companyId, goalId: openGoalId, title: "Open", status: "todo", priority: "medium" });
+        const openPending = await createPending({ id: openIssueId, companyId: done.companyId }, "request_confirmation");
+
+        const first = await interactionsSvc.backfillExpirePendingInteractionsOnTerminalIssues({ dryRun: false });
+        expect(first).toMatchObject({ dryRun: false, total: 2, updated: 2 });
+
+        const closed = await interactionsSvc.listForIssue(done.issueId);
+        expect(closed).toHaveLength(2);
+        for (const row of closed) {
+          expect(row.status).toBe("expired");
+          expect(row.result).toMatchObject({ outcome: "issue_closed", issueStatus: "done" });
+        }
+        const openListed = await interactionsSvc.listForIssue(openIssueId);
+        expect(openListed).toHaveLength(1);
+        expect(openListed[0]).toMatchObject({ id: openPending.id, status: "pending" });
+
+        // Second run finds nothing pending on terminal issues.
+        const second = await interactionsSvc.backfillExpirePendingInteractionsOnTerminalIssues({ dryRun: false });
+        expect(second).toMatchObject({ total: 0, updated: 0 });
       });
     });
   });

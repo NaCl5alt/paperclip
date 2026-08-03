@@ -881,11 +881,22 @@ export type IssueThreadInteractionPayload =
   | RequestConfirmationPayload
   | RequestCheckboxConfirmationPayload;
 
+// Written to any pending interaction (all kinds) when its issue transitions to
+// a terminal status (done / cancelled). `issueStatus` records which terminal
+// status closed it so done-driven and cancelled-driven expiries stay separable
+// in post-hoc analysis (VANA-2574 / VANA-2571).
+export interface IssueClosedInteractionResult {
+  version: 1;
+  outcome: "issue_closed";
+  issueStatus: "done" | "cancelled";
+}
+
 export type IssueThreadInteractionResult =
   | SuggestTasksResult
   | AskUserQuestionsResult
   | RequestConfirmationResult
-  | RequestCheckboxConfirmationResult;
+  | RequestCheckboxConfirmationResult
+  | IssueClosedInteractionResult;
 
 export interface IssueAttachment {
   id: string;

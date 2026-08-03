@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { z } from "zod";
 import { and, asc, eq, inArray, isNotNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -30,6 +31,7 @@ import {
   askUserQuestionsResultSchema,
   cancelIssueThreadInteractionSchema,
   createIssueThreadInteractionSchema,
+  issueClosedInteractionResultSchema,
   rejectIssueThreadInteractionSchema,
   requestCheckboxConfirmationPayloadSchema,
   requestCheckboxConfirmationResultSchema,
@@ -133,34 +135,53 @@ function hydrateInteraction(
     continuationPolicy: row.continuationPolicy as IssueThreadInteraction["continuationPolicy"],
   };
 
+  // A terminal-close expiry (VANA-2574) writes the same `issue_closed` result to
+  // every kind, so parse that shape uniformly and fall back to the per-kind
+  // result schema otherwise. The per-kind result *types* deliberately stay
+  // kind-specific (so the ~30 UI/route consumers don't each grow an issue_closed
+  // branch); the parsed issue_closed value is surfaced through the per-kind field
+  // via a contained cast. All result consumers read these fields defensively
+  // (optional chaining), and issue_closed only ever lands on expired rows.
+  const isIssueClosedResult =
+    !!row.result
+    && typeof row.result === "object"
+    && (row.result as { outcome?: unknown }).outcome === "issue_closed";
+  const parseResult = <T extends z.ZodTypeAny>(schema: T): z.infer<T> | null => {
+    if (!row.result) return null;
+    if (isIssueClosedResult) {
+      return issueClosedInteractionResultSchema.parse(row.result) as unknown as z.infer<T>;
+    }
+    return schema.parse(row.result);
+  };
+
   switch (row.kind) {
     case "suggest_tasks":
       return {
         ...base,
         kind: "suggest_tasks",
         payload: suggestTasksPayloadSchema.parse(row.payload),
-        result: row.result ? suggestTasksResultSchema.parse(row.result) : null,
+        result: parseResult(suggestTasksResultSchema),
       } satisfies SuggestTasksInteraction;
     case "ask_user_questions":
       return {
         ...base,
         kind: "ask_user_questions",
         payload: askUserQuestionsPayloadSchema.parse(row.payload),
-        result: row.result ? askUserQuestionsResultSchema.parse(row.result) : null,
+        result: parseResult(askUserQuestionsResultSchema),
       } satisfies AskUserQuestionsInteraction;
     case "request_confirmation":
       return {
         ...base,
         kind: "request_confirmation",
         payload: requestConfirmationPayloadSchema.parse(row.payload),
-        result: row.result ? requestConfirmationResultSchema.parse(row.result) : null,
+        result: parseResult(requestConfirmationResultSchema),
       } satisfies RequestConfirmationInteraction;
     case "request_checkbox_confirmation":
       return {
         ...base,
         kind: "request_checkbox_confirmation",
         payload: requestCheckboxConfirmationPayloadSchema.parse(row.payload),
-        result: row.result ? requestCheckboxConfirmationResultSchema.parse(row.result) : null,
+        result: parseResult(requestCheckboxConfirmationResultSchema),
       } satisfies RequestCheckboxConfirmationInteraction;
     default:
       throw unprocessable(`Unknown interaction kind: ${row.kind}`);
@@ -1417,6 +1438,87 @@ export function issueThreadInteractionService(db: Db) {
         await touchIssue(db, issue.id);
       }
       return expired;
+    },
+
+    // One-shot backfill for the terminal-close expiry rule (VANA-2574): apply the
+    // same rule the issue-update service now enforces going forward to the pending
+    // interactions that were stranded on already-closed issues. Dry-run by
+    // default — pass { dryRun: false } to write. Idempotent (status='pending'
+    // guard), and never queues a continuation wake.
+    backfillExpirePendingInteractionsOnTerminalIssues: async (options?: {
+      companyId?: string | null;
+      dryRun?: boolean;
+    }) => {
+      const dryRun = options?.dryRun ?? true;
+      const terminalStatuses = ["done", "cancelled"] as const;
+      const filters = [
+        eq(issueThreadInteractions.status, "pending"),
+        inArray(issues.status, [...terminalStatuses]),
+      ];
+      if (options?.companyId) {
+        filters.push(eq(issueThreadInteractions.companyId, options.companyId));
+      }
+
+      const rows = await db
+        .select({
+          id: issueThreadInteractions.id,
+          kind: issueThreadInteractions.kind,
+          issueStatus: issues.status,
+        })
+        .from(issueThreadInteractions)
+        .innerJoin(issues, eq(issues.id, issueThreadInteractions.issueId))
+        .where(and(...filters));
+
+      const idsByStatus = new Map<(typeof terminalStatuses)[number], string[]>();
+      const countByStatusKind: Record<string, number> = {};
+      for (const row of rows) {
+        const status = row.issueStatus as (typeof terminalStatuses)[number];
+        if (!idsByStatus.has(status)) idsByStatus.set(status, []);
+        idsByStatus.get(status)!.push(row.id);
+        const key = `${status}/${row.kind}`;
+        countByStatusKind[key] = (countByStatusKind[key] ?? 0) + 1;
+      }
+      const countByStatus: Record<string, number> = {};
+      for (const status of terminalStatuses) {
+        countByStatus[status] = idsByStatus.get(status)?.length ?? 0;
+      }
+
+      let updated = 0;
+      if (!dryRun && rows.length > 0) {
+        const now = new Date();
+        for (const status of terminalStatuses) {
+          const ids = idsByStatus.get(status) ?? [];
+          for (let i = 0; i < ids.length; i += 500) {
+            const chunk = ids.slice(i, i + 500);
+            const updatedRows = await db
+              .update(issueThreadInteractions)
+              .set({
+                status: "expired",
+                result: {
+                  version: 1,
+                  outcome: "issue_closed",
+                  issueStatus: status,
+                },
+                resolvedAt: now,
+                updatedAt: now,
+              })
+              .where(and(
+                inArray(issueThreadInteractions.id, chunk),
+                eq(issueThreadInteractions.status, "pending"),
+              ))
+              .returning({ id: issueThreadInteractions.id });
+            updated += updatedRows.length;
+          }
+        }
+      }
+
+      return {
+        dryRun,
+        total: rows.length,
+        countByStatus,
+        countByStatusKind,
+        updated,
+      };
     },
 
     answerQuestions: async (
