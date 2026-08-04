@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   detectIncompleteToolCall,
   extractClaudeRetryNotBefore,
+  isClaudeAccountQuotaExhausted,
   isClaudeTransientUpstreamError,
   parseClaudeStreamJson,
 } from "./parse.js";
@@ -121,6 +122,52 @@ describe("isClaudeTransientUpstreamError", () => {
         errorMessage: "Invalid request_error: Unknown parameter 'foo'.",
       }),
     ).toBe(false);
+  });
+});
+
+describe("isClaudeAccountQuotaExhausted", () => {
+  // VANA-2662: the real measured wording. In the field this run also carried an
+  // `api_error_status: 429`, which is the *only* reason it was ever classified as
+  // transient — so the fixtures below deliberately omit that field to prove the
+  // text alone is now sufficient.
+  const SPEND_LIMIT_TEXT =
+    "You've hit your org's monthly spend limit · run /usage-credits to ask your admin for a higher limit";
+
+  it("classifies the monthly spend-limit wording as transient without the 429 field", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: { is_error: true, subtype: "error", result: SPEND_LIMIT_TEXT },
+      }),
+    ).toBe(true);
+  });
+
+  it("classifies the reset-less account/org quota wording as account-quota-exhausted", () => {
+    expect(
+      isClaudeAccountQuotaExhausted({
+        parsed: { is_error: true, subtype: "error", result: SPEND_LIMIT_TEXT },
+      }),
+    ).toBe(true);
+    expect(
+      isClaudeAccountQuotaExhausted({ errorMessage: "Your credit balance is too low to run this." }),
+    ).toBe(true);
+    expect(isClaudeAccountQuotaExhausted({ stderr: "insufficient credits" })).toBe(true);
+  });
+
+  it("does not treat the 5-hour / weekly / session reset windows as account-quota exhaustion", () => {
+    expect(isClaudeAccountQuotaExhausted({ errorMessage: "5-hour limit reached." })).toBe(false);
+    expect(
+      isClaudeAccountQuotaExhausted({
+        errorMessage: "Claude usage limit reached — weekly limit reached. Try again in 2 days.",
+      }),
+    ).toBe(false);
+    expect(
+      isClaudeAccountQuotaExhausted({
+        parsed: { is_error: true, result: "You've hit your session limit · resets 1pm (Asia/Tokyo)" },
+      }),
+    ).toBe(false);
+    // ...yet those reset windows must still classify as transient so the
+    // existing retryNotBefore deferral path keeps handling them.
+    expect(isClaudeTransientUpstreamError({ errorMessage: "5-hour limit reached." })).toBe(true);
   });
 });
 

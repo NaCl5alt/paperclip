@@ -39,7 +39,15 @@ export function detectIncompleteToolCall(text: string | null | undefined): boole
 }
 
 const CLAUDE_TRANSIENT_UPSTREAM_RE =
-  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|hit\s+your\s+session\s+limit|session\s+limit\s+reached)/i;
+  /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|hit\s+your\s+session\s+limit|session\s+limit\s+reached|monthly\s+spend\s+limit|spend\s+limit|usage[-\s]?credits|credit\s+balance\s+is\s+too\s+low|insufficient\s+credits)/i;
+// Reset-less account/org-level quota exhaustion (e.g. a monthly spend limit or a
+// depleted credit balance). Unlike the 5-hour / weekly *session* windows, these
+// carry no upstream reset time, so waiting out a bounded-retry ladder never
+// clears them — the heartbeat hands the issue straight to the recovery fallback
+// (VANA-2662). This deliberately excludes the session-window wording so it never
+// steals the existing `retryNotBefore` deferral path.
+const CLAUDE_ACCOUNT_QUOTA_EXHAUSTED_RE =
+  /(?:monthly\s+spend\s+limit|spend\s+limit|usage[-\s]?credits|credit\s+balance\s+is\s+too\s+low|insufficient\s+credits)/i;
 const CLAUDE_EXTRA_USAGE_RESET_RE =
   /(?:out\s+of\s+extra\s+usage|extra\s+usage|usage\s+limit\s+reached|usage\s+cap\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|claude\s+usage\s+limit\s+reached|session\s+limit)[\s\S]{0,80}?\bresets?\s+(?:at\s+)?([^\n()]+?)(?:\s*\(([^)]+)\))?(?:[.!]|\n|$)/i;
 
@@ -424,4 +432,20 @@ export function isClaudeTransientUpstreamError(input: {
   const haystack = buildClaudeTransientHaystack(input);
   if (!haystack) return false;
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
+}
+
+// VANA-2662: a reset-less account/org quota exhaustion (monthly spend limit,
+// depleted credits) is a sub-class of transient-upstream — it is always also an
+// `isClaudeTransientUpstreamError`, but the heartbeat treats it specially by
+// handing the issue off immediately instead of retrying. Callers should gate on
+// `transientUpstream === true` first; this only refines that classification.
+export function isClaudeAccountQuotaExhausted(input: {
+  parsed?: Record<string, unknown> | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  const haystack = buildClaudeTransientHaystack(input);
+  if (!haystack) return false;
+  return CLAUDE_ACCOUNT_QUOTA_EXHAUSTED_RE.test(haystack);
 }

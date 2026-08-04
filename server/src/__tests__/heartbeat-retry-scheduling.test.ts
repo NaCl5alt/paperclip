@@ -1350,6 +1350,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     now: Date;
     retryNotBefore?: string | null;
     scheduledRetryAttempt?: number;
+    accountQuotaExhausted?: boolean;
   }) {
     await seedRetryFixture({
       runId: input.runId,
@@ -1362,6 +1363,14 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       retryNotBefore: input.retryNotBefore ?? null,
       scheduledRetryAttempt: input.scheduledRetryAttempt,
       issueId: input.issueId,
+      ...(input.accountQuotaExhausted
+        ? {
+            resultJson: {
+              errorFamily: "transient_upstream",
+              accountQuotaExhausted: true,
+            },
+          }
+        : {}),
     });
 
     const issuePrefix = `T${input.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
@@ -1538,5 +1547,88 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, fallbackAgentId));
     expect(fallbackWakeups).toHaveLength(0);
+  });
+
+  // VANA-2662: reset-less account/org quota exhaustion hands off immediately at
+  // attempt 1 instead of grinding through the bounded-retry ladder.
+  it("hands the account-quota-exhausted issue off immediately at attempt 1 without retrying", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-04-21T09:00:00.000Z");
+    const { fallbackAgentId } = await seedRecoveryFallbackFixture({
+      companyId,
+      agentId,
+      runId,
+      issueId,
+      now,
+      accountQuotaExhausted: true,
+    });
+
+    const result = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(result).toMatchObject({
+      outcome: "failed_over_to_recovery_fallback",
+      fallbackAgentId,
+      issueId,
+      attempt: 1,
+    });
+
+    const issue = await db
+      .select({ assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.assigneeAgentId).toBe(fallbackAgentId);
+
+    const scheduledRetries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")));
+    expect(scheduledRetries).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) => comment.body.includes("account_quota_exhausted"))).toBe(true);
+  });
+
+  it("falls through to the bounded retry ladder when account quota is exhausted but no fallback is configured", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-04-21T09:00:00.000Z");
+    // No recoveryFallbackAgentId on the agent, so the immediate handoff is
+    // skipped and the run must land on the normal bounded-retry schedule.
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "claude_transient_upstream",
+      errorFamily: "transient_upstream",
+      adapterType: "claude_local",
+      issueId,
+      resultJson: {
+        errorFamily: "transient_upstream",
+        accountQuotaExhausted: true,
+      },
+    });
+
+    const result = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(result.outcome).toBe("scheduled");
+
+    const scheduledRetries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")));
+    expect(scheduledRetries).toHaveLength(1);
   });
 });

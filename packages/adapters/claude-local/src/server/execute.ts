@@ -51,6 +51,7 @@ import {
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
+  isClaudeAccountQuotaExhausted,
   isClaudeMaxTurnsResult,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
@@ -820,6 +821,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             errorMessage: fallbackErrorMessage,
           })
         : null;
+      // VANA-2662: a reset-less account/org quota exhaustion is still a
+      // transient-upstream failure (errorFamily unchanged), but carries an extra
+      // flag so the heartbeat can hand off immediately instead of retrying.
+      const accountQuotaExhausted =
+        transientUpstream &&
+        isClaudeAccountQuotaExhausted({
+          parsed: null,
+          stdout: proc.stdout,
+          stderr: proc.stderr,
+          errorMessage: fallbackErrorMessage,
+        });
       const errorCode = loginMeta.requiresLogin
         ? "claude_auth_required"
         : transientUpstream
@@ -833,11 +845,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorCode,
         errorFamily: transientUpstream ? "transient_upstream" : null,
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
+        ...(accountQuotaExhausted ? { accountQuotaExhausted: true } : {}),
         errorMeta,
         resultJson: {
           stdout: proc.stdout,
           stderr: proc.stderr,
           ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
+          ...(accountQuotaExhausted ? { accountQuotaExhausted: true } : {}),
           ...(transientRetryNotBefore
             ? { retryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
@@ -914,6 +928,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
       : null;
+    // VANA-2662: reset-less account/org quota exhaustion — flag it for immediate
+    // handoff while keeping errorFamily === "transient_upstream" intact.
+    const accountQuotaExhausted =
+      transientUpstream &&
+      isClaudeAccountQuotaExhausted({
+        parsed,
+        stdout: proc.stdout,
+        stderr: proc.stderr,
+        errorMessage,
+      });
     const resolvedErrorCode = loginMeta.requiresLogin
       ? "claude_auth_required"
       : failed && clearSessionForMaxTurns
@@ -928,6 +952,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
       ...(incompleteToolCall ? { incompleteToolCall: true, stopReason: "incomplete_tool_call" } : {}),
       ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
+      ...(accountQuotaExhausted ? { accountQuotaExhausted: true } : {}),
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
     };
@@ -940,6 +965,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       errorCode: resolvedErrorCode,
       errorFamily: transientUpstream ? "transient_upstream" : null,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
+      ...(accountQuotaExhausted ? { accountQuotaExhausted: true } : {}),
       errorMeta,
       usage,
       sessionId: resolvedSessionId,

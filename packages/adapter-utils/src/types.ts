@@ -77,6 +77,13 @@ export interface AdapterExecutionResult {
   errorCode?: string | null;
   errorFamily?: AdapterExecutionErrorFamily | null;
   retryNotBefore?: string | null;
+  /**
+   * VANA-2662: set alongside `errorFamily === "transient_upstream"` when the
+   * failure is a reset-less account/org quota exhaustion (e.g. a monthly spend
+   * limit) that will not clear on the bounded-retry timescale. The heartbeat
+   * hands the issue straight to the recovery fallback agent instead of retrying.
+   */
+  accountQuotaExhausted?: boolean | null;
   errorMeta?: Record<string, unknown>;
   usage?: UsageSummary;
   /**

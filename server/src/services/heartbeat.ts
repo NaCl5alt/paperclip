@@ -338,12 +338,15 @@ function readTransientRetryNotBeforeFromRun(run: Pick<typeof heartbeatRuns.$infe
 function readTransientRecoveryContractFromRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
 ) {
-  return readHeartbeatRunErrorFamily(run) === "transient_upstream"
-    ? {
-        errorFamily: "transient_upstream" as const,
-        retryNotBefore: readTransientRetryNotBeforeFromRun(run),
-      }
-    : null;
+  if (readHeartbeatRunErrorFamily(run) !== "transient_upstream") return null;
+  const resultJson = parseObject(run.resultJson);
+  return {
+    errorFamily: "transient_upstream" as const,
+    retryNotBefore: readTransientRetryNotBeforeFromRun(run),
+    // VANA-2662: a reset-less account/org quota exhaustion (monthly spend limit
+    // etc.) triggers an immediate handoff rather than the bounded-retry ladder.
+    accountQuotaExhausted: resultJson.accountQuotaExhausted === true,
+  };
 }
 
 function mergeAdapterRecoveryMetadata(input: {
@@ -5948,7 +5951,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect;
     agent: typeof agents.$inferSelect;
     now: Date;
-    trigger: "retry_exhausted" | "retry_not_before_deferred";
+    trigger: "retry_exhausted" | "retry_not_before_deferred" | "account_quota_exhausted";
     retryNotBefore: Date | null;
     attempt: number;
     maxAttempts: number;
@@ -6039,11 +6042,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
 
+    const handoffHeadline =
+      input.trigger === "account_quota_exhausted"
+        ? "The assigned agent's account/org quota is exhausted with no upstream reset window (e.g. a monthly spend limit), so this issue was handed off immediately to the configured recovery fallback agent without running the retry ladder."
+        : "Transient upstream failures kept the assigned agent from making progress, so this issue was handed off to the configured recovery fallback agent.";
     try {
       await issuesSvc.addComment(
         issueId,
         [
-          "Transient upstream failures kept the assigned agent from making progress, so this issue was handed off to the configured recovery fallback agent.",
+          handoffHeadline,
           "",
           `- Trigger: \`${input.trigger}\``,
           `- New assignee: [${fallbackAgent.name}](/agents/${fallbackAgent.id})`,
@@ -6191,6 +6198,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
+    // VANA-2662: a reset-less account/org quota exhaustion (e.g. a monthly spend
+    // limit) never clears on the bounded-retry timescale, so hand the issue off
+    // to the configured recovery fallback agent immediately on the first failure
+    // rather than grinding through the ladder. Runs before the retryNotBefore
+    // deferral check because these failures carry no retryNotBefore at all. When
+    // the handoff is skipped (no fallback, guard failed), fall through to the
+    // normal retry schedule — identical to the retry_not_before_deferred path.
+    if (transientRecovery?.accountQuotaExhausted) {
+      const recoveryFallback = await failoverTransientUpstreamRunToRecoveryFallback({
+        run,
+        agent,
+        now,
+        trigger: "account_quota_exhausted",
+        retryNotBefore: null,
+        attempt: nextAttempt,
+        maxAttempts,
+      });
+      if (recoveryFallback.outcome === "failed_over") {
+        return {
+          outcome: "failed_over_to_recovery_fallback" as const,
+          attempt: nextAttempt,
+          maxAttempts,
+          fallbackAgentId: recoveryFallback.fallbackAgentId,
+          issueId: recoveryFallback.issueId,
+        };
+      }
+    }
     // VANA-775 Fix B(b): when the upstream retry window (e.g. a session-limit
     // reset) is too far away, hand the issue off to the configured recovery
     // fallback agent now instead of scheduling a long-deferred retry. When the
