@@ -144,21 +144,27 @@ export async function startServer(): Promise<StartedServer> {
     const autoApply = opts?.autoApply === true;
     let state = await inspectMigrations(connectionString);
     if (state.status === "needsMigrations" && state.reason === "pending-migrations") {
-      const applicability = await diagnoseMigrationApplicability(connectionString);
-      if (applicability.skippablePendingMigrations.length > 0) {
-        logger.warn(
-          { skippablePendingMigrations: applicability.skippablePendingMigrations },
-          `${label} has pending migrations whose journal \`when\` is <= the max applied created_at; ` +
-            "drizzle's native migrator skips these forever. Renumber them and bump the journal `when` above " +
-            "the max applied value (VANA-2651).",
-        );
-      }
-      if (applicability.unresolvedAppliedHashes.length > 0) {
-        logger.warn(
-          { unresolvedAppliedHashes: applicability.unresolvedAppliedHashes },
-          `${label} has applied migration hashes not present in this branch — likely a cross-branch numbering ` +
-            "collision. Confirm no branch-local migration reuses an index already applied from a sibling branch.",
-        );
+      // Advisory-only cross-branch diagnostic: it must never be able to abort
+      // startup, so any failure here is downgraded to a warning (VANA-2651).
+      try {
+        const applicability = await diagnoseMigrationApplicability(connectionString);
+        if (applicability.skippablePendingMigrations.length > 0) {
+          logger.warn(
+            { skippablePendingMigrations: applicability.skippablePendingMigrations },
+            `${label} has pending migrations whose journal \`when\` is <= the max applied created_at; ` +
+              "drizzle's native migrator skips these forever. Renumber them and bump the journal `when` above " +
+              "the max applied value (VANA-2651).",
+          );
+        }
+        if (applicability.unresolvedAppliedHashes.length > 0) {
+          logger.warn(
+            { unresolvedAppliedHashes: applicability.unresolvedAppliedHashes },
+            `${label} has applied migration hashes not present in this branch — likely a cross-branch numbering ` +
+              "collision. Confirm no branch-local migration reuses an index already applied from a sibling branch.",
+          );
+        }
+      } catch (error) {
+        logger.warn({ err: error }, `${label} migration applicability diagnostic failed; continuing startup.`);
       }
       const repair = await reconcilePendingMigrationHistory(connectionString);
       if (repair.repairedMigrations.length > 0) {

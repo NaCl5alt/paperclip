@@ -722,10 +722,14 @@ export async function diagnoseMigrationApplicability(
       state.reason === "pending-migrations" &&
       columnNames.has("created_at")
     ) {
+      // Mirror drizzle's cutoff exactly: it reads `ORDER BY created_at DESC LIMIT 1`
+      // (Postgres default NULLS FIRST) and applies a migration while
+      // `Number(created_at) < folderMillis`. A NULL/absent top row coerces to 0,
+      // i.e. drizzle would apply everything, so we must flag nothing as skippable.
       const maxRows = await sql.unsafe<{ created_at: string | number | null }[]>(
-        `SELECT created_at FROM ${qualifiedTable} ORDER BY created_at DESC NULLS LAST LIMIT 1`,
+        `SELECT created_at FROM ${qualifiedTable} ORDER BY created_at DESC LIMIT 1`,
       );
-      const maxAppliedCreatedAt = Number(maxRows[0]?.created_at ?? Number.NaN);
+      const maxAppliedCreatedAt = Number(maxRows[0]?.created_at ?? 0);
       if (Number.isFinite(maxAppliedCreatedAt)) {
         const journalEntries = await listJournalMigrationEntries();
         const whenByFile = new Map(journalEntries.map((entry) => [entry.fileName, entry.folderMillis]));
