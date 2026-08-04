@@ -657,6 +657,93 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
   }
 }
 
+export type SkippablePendingMigration = {
+  fileName: string;
+  when: number;
+  maxAppliedCreatedAt: number;
+};
+
+export type MigrationApplicabilityDiagnostic = {
+  /**
+   * Applied hashes in `__drizzle_migrations` that resolve to no current-branch
+   * migration file. This is the signature of a cross-branch numbering collision:
+   * a sibling branch's migration (e.g. its own `0100_*`) was applied to this DB
+   * under a number that this branch reuses for a different migration. The static
+   * `check:migrations` cannot see it because it never reads the DB (VANA-2651).
+   */
+  unresolvedAppliedHashes: string[];
+  /**
+   * Pending migrations whose journal `when` is <= the max applied `created_at`.
+   * drizzle's native migrator applies migrations only while
+   * `folderMillis > lastCreatedAt`, so such a migration is skipped forever and
+   * never runs. Fix by renumbering and bumping its `when` above the max applied
+   * value (VANA-2651).
+   */
+  skippablePendingMigrations: SkippablePendingMigration[];
+};
+
+/**
+ * DB-aware companion to the static `check:migrations` numbering check. Surfaces
+ * the two cross-branch failure modes that a file-only check is blind to:
+ * applied-but-absent hashes, and pending migrations whose `when` is dominated by
+ * the max applied `created_at` (perpetually skipped by drizzle).
+ */
+export async function diagnoseMigrationApplicability(
+  url: string,
+): Promise<MigrationApplicabilityDiagnostic> {
+  const state = await inspectMigrations(url);
+  const availableMigrations = await listMigrationFiles();
+
+  const sql = createUtilitySql(url);
+  try {
+    const migrationTableSchema = await discoverMigrationTableSchema(sql);
+    if (!migrationTableSchema) {
+      return { unresolvedAppliedHashes: [], skippablePendingMigrations: [] };
+    }
+
+    const qualifiedTable = `${quoteIdentifier(migrationTableSchema)}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
+    const columnNames = await getMigrationTableColumnNames(sql, migrationTableSchema);
+
+    let unresolvedAppliedHashes: string[] = [];
+    if (columnNames.has("hash")) {
+      const rows = await sql.unsafe<{ hash: string }[]>(
+        `SELECT hash FROM ${qualifiedTable} ORDER BY id`,
+      );
+      const knownHashes = new Set((await mapHashesToMigrationFiles(availableMigrations)).keys());
+      unresolvedAppliedHashes = rows
+        .map((row) => row.hash)
+        .filter((hash): hash is string => Boolean(hash))
+        .filter((hash) => !knownHashes.has(hash));
+    }
+
+    const skippablePendingMigrations: SkippablePendingMigration[] = [];
+    if (
+      state.status === "needsMigrations" &&
+      state.reason === "pending-migrations" &&
+      columnNames.has("created_at")
+    ) {
+      const maxRows = await sql.unsafe<{ created_at: string | number | null }[]>(
+        `SELECT created_at FROM ${qualifiedTable} ORDER BY created_at DESC NULLS LAST LIMIT 1`,
+      );
+      const maxAppliedCreatedAt = Number(maxRows[0]?.created_at ?? Number.NaN);
+      if (Number.isFinite(maxAppliedCreatedAt)) {
+        const journalEntries = await listJournalMigrationEntries();
+        const whenByFile = new Map(journalEntries.map((entry) => [entry.fileName, entry.folderMillis]));
+        for (const fileName of state.pendingMigrations) {
+          const when = whenByFile.get(fileName);
+          if (typeof when === "number" && when <= maxAppliedCreatedAt) {
+            skippablePendingMigrations.push({ fileName, when, maxAppliedCreatedAt });
+          }
+        }
+      }
+    }
+
+    return { unresolvedAppliedHashes, skippablePendingMigrations };
+  } finally {
+    await sql.end();
+  }
+}
+
 export async function applyPendingMigrations(url: string): Promise<void> {
   const initialState = await inspectMigrations(url);
   if (initialState.status === "upToDate") return;
