@@ -7,6 +7,7 @@ const CREATED_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
+  assertCheckoutOwner: vi.fn(async () => ({ adoptedFromRunId: null })),
 }));
 
 const mockInteractionService = vi.hoisted(() => ({
@@ -869,7 +870,50 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
-  it("allows agent-authored interaction creation and stamps the active run id", async () => {
+  it("allows the assignee agent to author an interaction on its own in_progress issue and stamps the active run id", async () => {
+    // The default fixture is in_progress / assigneeAgentId = ASSIGNEE_AGENT_ID. Under the
+    // 955f2a42b ownership boundary (VANA-2496), only the checked-out assignee may author on
+    // its own live issue, so the actor here is the assignee itself.
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "suggest_tasks",
+        idempotencyKey: "interaction:task-1",
+        payload: {
+          version: 1,
+          tasks: [{ clientKey: "task-1", title: "One" }],
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockInteractionService.create).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      expect.objectContaining({
+        kind: "suggest_tasks",
+        idempotencyKey: "interaction:task-1",
+        sourceRunId: "run-1",
+      }),
+      {
+        agentId: ASSIGNEE_AGENT_ID,
+        userId: null,
+      },
+    );
+  });
+
+  it("rejects a non-assignee agent authoring an interaction on another agent's in_progress issue with 409", async () => {
+    // VANA-2496 (955f2a42b) mandatory ownership guard: a live (in_progress) issue checked out
+    // by another agent is off-limits to peers *even with a manager/CEO override* — the override
+    // (issue:dispose) applies only to stalled, non-in_progress issues. Mirrors the canonical
+    // assertion in issue-agent-mutation-ownership-routes.test.ts
+    // ("returns 409 for in_progress issue even when dispose override is allowed"). Consistent
+    // with comment POST, which is gated by the same assertAgentIssueMutationAllowed guard.
     const app = await createApp({
       type: "agent",
       agentId: CREATED_AGENT_ID,
@@ -888,7 +932,34 @@ describe.sequential("issue thread interaction routes", () => {
         },
       });
 
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("Issue is checked out by another agent");
+    expect(mockInteractionService.create).not.toHaveBeenCalled();
+  });
+
+  it("allows a non-assignee agent to author an interaction on an unassigned issue", async () => {
+    // The ownership guard only fires when the issue is assigned to a *different* agent; an
+    // unassigned issue falls through to the standard issue:mutate boundary and is permitted.
+    mockIssueService.getById.mockResolvedValueOnce(createIssue({ assigneeAgentId: null }));
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+      .send({
+        kind: "suggest_tasks",
+        idempotencyKey: "interaction:task-1",
+        payload: {
+          version: 1,
+          tasks: [{ clientKey: "task-1", title: "One" }],
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(mockInteractionService.create).toHaveBeenCalledWith(
       expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
       expect.objectContaining({
