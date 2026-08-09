@@ -908,7 +908,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       !parsedIsError &&
       (proc.exitCode ?? 0) === 0 &&
       asString(parsed.subtype, "") === "success";
-    const failed = (proc.exitCode ?? 0) !== 0 || parsedIsError || incompleteToolCall;
+    // VANA-2891: the Claude CLI can emit a COMPLETE, successful result envelope
+    // (is_error:false, subtype:"success") and still exit non-zero. The dominant
+    // source is our own terminal-result cleanup: once the runner sees the result
+    // JSON on stdout it SIGTERMs (then SIGKILLs) the child to reap it (see
+    // packages/adapter-utils terminalResultCleanup), so the child exits 143
+    // (SIGTERM) or 1 during post-result teardown — with timeoutFired:false. The
+    // task work is already done; the non-zero exit is a teardown artifact, not a
+    // failure, so it must not be flipped to failed/transient_upstream. Kept
+    // deliberately narrow: is_error must be false AND subtype exactly "success",
+    // and the max-turns / incomplete-tool-call guards still win, so a genuinely
+    // incomplete run is never masked as success. NOTE: gate on the RAW
+    // parsedStream.incompleteToolCall signal, not the `incompleteToolCall`
+    // variable above — that variable is itself gated on exitCode === 0, so an
+    // incomplete-tool-call run that ALSO gets the teardown SIGTERM (exit 143)
+    // would slip through `!incompleteToolCall` and be masked as success
+    // (VANA-644/647 regression). The raw signal holds regardless of exit code.
+    const completeSuccessDespiteExit =
+      !parsedIsError &&
+      !parsedStream.incompleteToolCall &&
+      !clearSessionForMaxTurns &&
+      asString(parsed.subtype, "") === "success" &&
+      (proc.exitCode ?? 0) !== 0;
+    const failed =
+      ((proc.exitCode ?? 0) !== 0 && !completeSuccessDespiteExit) ||
+      parsedIsError ||
+      incompleteToolCall;
     const errorMessage = !failed
       ? null
       : incompleteToolCall
@@ -954,8 +979,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : incompleteToolCall
       ? "incomplete_tool_call"
       : null;
+    // VANA-2891: report exit 0 / no signal to the heartbeat for a
+    // complete-success-despite-exit run so the heartbeat's outcome derivation
+    // (succeeded iff exitCode === 0 && no errorMessage) records it as succeeded
+    // rather than adapter_failed. Preserve the real process exit code / signal
+    // in resultJson for forensics.
+    const reportedExitCode = completeSuccessDespiteExit ? 0 : proc.exitCode;
+    const reportedSignal = completeSuccessDespiteExit ? null : proc.signal;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
+      ...(completeSuccessDespiteExit
+        ? {
+            processExitCode: proc.exitCode,
+            processSignal: proc.signal,
+            exitCodeNormalizedReason: "complete_success_nonzero_exit",
+          }
+        : {}),
       ...(failed && clearSessionForMaxTurns ? { stopReason: "max_turns_exhausted" } : {}),
       ...(incompleteToolCall ? { incompleteToolCall: true, stopReason: "incomplete_tool_call" } : {}),
       ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
@@ -965,8 +1004,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
 
     return {
-      exitCode: proc.exitCode,
-      signal: proc.signal,
+      exitCode: reportedExitCode,
+      signal: reportedSignal,
       timedOut: false,
       errorMessage,
       errorCode: resolvedErrorCode,
