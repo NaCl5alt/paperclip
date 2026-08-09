@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   detectIncompleteToolCall,
+  extractClaudeRateLimitReset,
   extractClaudeRetryNotBefore,
   isClaudeAccountQuotaExhausted,
   isClaudeTransientUpstreamError,
@@ -339,5 +340,49 @@ describe("extractClaudeRetryNotBefore", () => {
     expect(
       extractClaudeRetryNotBefore({ errorMessage: "Overloaded. Try again later." }, new Date()),
     ).toBeNull();
+  });
+
+  // VANA-2670: structured rate_limit_event.resetsAt beats the free-text wording.
+  it("prefers the structured rate_limit_event reset over the spend-limit wording", () => {
+    const resetsAt = 1785829800; // five_hour window, same-day reset
+    const stdout = [
+      '{"type":"system","subtype":"init","session_id":"s1"}',
+      `{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":${resetsAt},"rateLimitType":"five_hour","overageStatus":"rejected","overageResetsAt":1788220800,"overageDisabledReason":"org_level_disabled_until","isUsingOverage":false}}`,
+      '{"type":"result","is_error":true,"result":"You\'ve hit your org\'s monthly spend limit"}',
+    ].join("\n");
+    const extracted = extractClaudeRetryNotBefore(
+      {
+        parsed: { is_error: true, result: "You've hit your org's monthly spend limit" },
+        stdout,
+      },
+      new Date("2026-08-04T06:34:00.000Z"),
+    );
+    expect(extracted?.getTime()).toBe(resetsAt * 1000);
+  });
+});
+
+describe("extractClaudeRateLimitReset", () => {
+  it("returns the resetsAt of the last rejected rate_limit_event", () => {
+    const stdout = [
+      '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1785800000,"rateLimitType":"five_hour"}}',
+      '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1785829800,"rateLimitType":"five_hour"}}',
+    ].join("\n");
+    expect(extractClaudeRateLimitReset({ stdout })?.getTime()).toBe(1785829800 * 1000);
+  });
+
+  it("ignores allowed_warning overage events and never reads overageResetsAt", () => {
+    // An allowed_warning overage record carries resetsAt at the calendar-month
+    // boundary; using it would re-introduce the VANA-2542 one-month-fallback trap.
+    const stdout =
+      '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1788220800,"rateLimitType":"overage","overageResetsAt":1788220800}}';
+    expect(extractClaudeRateLimitReset({ stdout })).toBeNull();
+  });
+
+  it("returns null when stdout carries no structured rate_limit_event", () => {
+    expect(
+      extractClaudeRateLimitReset({ stdout: '{"type":"result","is_error":true,"result":"boom"}' }),
+    ).toBeNull();
+    expect(extractClaudeRateLimitReset({ stdout: "" })).toBeNull();
+    expect(extractClaudeRateLimitReset({})).toBeNull();
   });
 });

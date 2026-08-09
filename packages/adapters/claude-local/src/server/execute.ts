@@ -824,8 +824,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // VANA-2662: a reset-less account/org quota exhaustion is still a
       // transient-upstream failure (errorFamily unchanged), but carries an extra
       // flag so the heartbeat can hand off immediately instead of retrying.
+      // VANA-2670: only reset-less. When a structured reset was extracted (i.e.
+      // transientRetryNotBefore is set), the failure has a known reset time and
+      // must take the retryNotBefore deferral path, not the immediate handoff.
       const accountQuotaExhausted =
         transientUpstream &&
+        !transientRetryNotBefore &&
         isClaudeAccountQuotaExhausted({
           parsed: null,
           stdout: proc.stdout,
@@ -930,8 +934,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     // VANA-2662: reset-less account/org quota exhaustion — flag it for immediate
     // handoff while keeping errorFamily === "transient_upstream" intact.
+    // VANA-2670: only when no structured reset was extracted; a known reset time
+    // (transientRetryNotBefore set) means the retryNotBefore deferral path owns it.
     const accountQuotaExhausted =
       transientUpstream &&
+      !transientRetryNotBefore &&
       isClaudeAccountQuotaExhausted({
         parsed,
         stdout: proc.stdout,

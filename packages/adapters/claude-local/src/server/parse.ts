@@ -396,6 +396,36 @@ function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: 
   return retryAt;
 }
 
+// VANA-2670: the claude stream-json stdout carries structured `rate_limit_event`
+// records whose `rate_limit_info.resetsAt` (unix seconds) is the authoritative
+// reset time. Measured in the field, every rejection is a same-day `five_hour`
+// window — the "monthly spend limit" copy is just the wording upstream prints for
+// it — so preferring this structured value over the free-text `resets at …` hint
+// gives an exact retry time and prevents the wording from being misread as a
+// reset-less quota exhaustion. Only `status === "rejected"` events are honoured:
+// `allowed_warning` overage records also carry a `resetsAt` (the calendar-month
+// boundary), and `overageResetsAt` is never used (that is the month boundary that
+// caused the VANA-2542 "stuck on a one-month fallback" misread). The last rejected
+// event wins.
+export function extractClaudeRateLimitReset(input: { stdout?: string | null }): Date | null {
+  const stdout = input.stdout ?? "";
+  if (!stdout) return null;
+  let latest: Date | null = null;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const event = parseJson(line);
+    if (!event) continue;
+    if (asString(event.type, "") !== "rate_limit_event") continue;
+    const info = parseObject(event.rate_limit_info);
+    if (asString(info.status, "") !== "rejected") continue;
+    const resetsAt = info.resetsAt;
+    if (typeof resetsAt !== "number" || !Number.isFinite(resetsAt) || resetsAt <= 0) continue;
+    latest = new Date(resetsAt * 1000);
+  }
+  return latest;
+}
+
 export function extractClaudeRetryNotBefore(
   input: {
     parsed?: Record<string, unknown> | null;
@@ -405,6 +435,9 @@ export function extractClaudeRetryNotBefore(
   },
   now = new Date(),
 ): Date | null {
+  // Structured reset (rate_limit_event) beats the free-text wording (VANA-2670).
+  const structured = extractClaudeRateLimitReset({ stdout: input.stdout });
+  if (structured) return structured;
   const haystack = buildClaudeTransientHaystack(input);
   const match = haystack.match(CLAUDE_EXTRA_USAGE_RESET_RE);
   if (!match) return null;
