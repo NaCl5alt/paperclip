@@ -62,11 +62,20 @@ const CLAUDE_TRANSIENT_UPSTREAM_RE =
   /(?:rate[-\s]?limit(?:ed)?|rate_limit_error|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|hit\s+your\s+session\s+limit|session\s+limit\s+reached|monthly\s+spend\s+limit|spend\s+limit|usage[-\s]?credits|credit\s+balance\s+is\s+too\s+low|insufficient\s+credits)/i;
 const CLAUDE_PROVIDER_QUOTA_RE =
   /(?:you(?:'|’)ve\s+hit\s+your\s+session\s+limit|session\s+limit\s+(?:reached|exceeded)|out\s+of\s+extra\s+usage|extra\s+usage\b|claude\s+usage\s+limit\s+reached|5[-\s]?hour\s+limit\s+reached|weekly\s+limit\s+reached|usage\s+limit\s+reached|usage\s+cap\s+reached|servicequotaexceededexception)/i;
-// (fork): reset-less account/org quota exhaustion. Deliberately
-// excludes the session-window wording so it never steals the bounded-retry
-// `retryNotBefore` deferral path.
+// Reset-less account/org-level quota exhaustion (e.g. a monthly spend limit or a
+// depleted credit balance). Unlike the 5-hour / weekly *session* windows, these
+// carry no upstream reset time, so waiting out a bounded-retry ladder never
+// clears them — the heartbeat hands the issue straight to the recovery fallback
+// This deliberately excludes the session-window wording so it never
+// steals the existing `retryNotBefore` deferral path.
+// the `usage-credits` alternative was removed. It only ever appeared as
+// the tail of the real wording ("run /usage-credits to ask your admin…"), which
+// still matches via `spend limit`, but the bare token `usage-credits` is also the
+// name of a Claude Code slash command echoed into every run's stdout stream (the
+// command registry) — so matching it against a full transcript flagged every
+// non-quota transient failure as quota-exhausted (measured 197/197 false positive).
 const CLAUDE_ACCOUNT_QUOTA_EXHAUSTED_RE =
-  /(?:monthly\s+spend\s+limit|spend\s+limit|usage[-\s]?credits|credit\s+balance\s+is\s+too\s+low|insufficient\s+credits)/i;
+  /(?:monthly\s+spend\s+limit|spend\s+limit|credit\s+balance\s+is\s+too\s+low|insufficient\s+credits)/i;
 const CLAUDE_MODEL_NOT_FOUND_RE =
   /(?:\b404\b[\s\S]{0,120})?(?:model[\s_-]*(?:not[\s_-]*found|does not exist|unknown|invalid)|unknown[\s_-]*model)/i;
 const CLAUDE_EXTRA_USAGE_RESET_RE =
@@ -398,12 +407,25 @@ export function isClaudeImageProcessingError(parsed: Record<string, unknown>): b
   );
 }
 
-function buildClaudeTransientHaystack(input: {
-  parsed?: Record<string, unknown> | null;
-  stdout?: string | null;
-  stderr?: string | null;
-  errorMessage?: string | null;
-}): string {
+function buildClaudeTransientHaystack(
+  input: {
+    parsed?: Record<string, unknown> | null;
+    stdout?: string | null;
+    stderr?: string | null;
+    errorMessage?: string | null;
+  },
+  // `stdout` is the FULL stream-json run transcript — every assistant
+  // turn, tool output, and the harness command registry (which literally lists
+  // slash commands like `usage-credits` / `extra-usage`). Scanning it is fine for
+  // the broad transient-upstream classifier, but the account-quota refinement uses
+  // narrower, more common wording ("spend limit", "credit balance is too low") that
+  // routinely appears in an agent's own prose or the command list. Callers that
+  // must not match on transcript content pass `includeStreamTranscript: false` so
+  // only the failure surface (errorMessage + parsed.result + parsed errors + the
+  // short stderr diagnostic stream) is scanned.
+  opts: { includeStreamTranscript?: boolean } = {},
+): string {
+  const includeStreamTranscript = opts.includeStreamTranscript ?? true;
   const parsed = input.parsed ?? null;
   const resultText = parsed ? asString(parsed.result, "") : "";
   const parsedErrors = parsed ? extractClaudeErrorMessages(parsed) : [];
@@ -411,7 +433,7 @@ function buildClaudeTransientHaystack(input: {
     input.errorMessage ?? "",
     resultText,
     ...parsedErrors,
-    input.stdout ?? "",
+    ...(includeStreamTranscript ? [input.stdout ?? ""] : []),
     input.stderr ?? "",
   ]
     .join("\n")
@@ -664,7 +686,13 @@ export function isClaudeAccountQuotaExhausted(input: {
   stderr?: string | null;
   errorMessage?: string | null;
 }): boolean {
-  const haystack = buildClaudeTransientHaystack(input);
+  // scan only the failure surface, never the full stdout transcript.
+  // The quota wording collides with the harness command registry (`usage-credits`)
+  // and with an agent's own prose, so matching it against the whole transcript
+  // flagged every non-quota transient failure (measured 197/197 false positive on
+  // DNS/connection errors). The genuine reset-less quota error always surfaces in
+  // errorMessage / parsed.result / stderr, so excluding stdout loses no real signal.
+  const haystack = buildClaudeTransientHaystack(input, { includeStreamTranscript: false });
   if (!haystack) return false;
   return CLAUDE_ACCOUNT_QUOTA_EXHAUSTED_RE.test(haystack);
 }

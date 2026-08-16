@@ -689,6 +689,61 @@ describe("isClaudeAccountQuotaExhausted", () => {
     // existing retryNotBefore deferral path keeps handling them.
     expect(isClaudeTransientUpstreamError({ errorMessage: "5-hour limit reached." })).toBe(true);
   });
+
+  // the classifier must never fire on the run's stdout transcript. The
+  // Claude CLI init stream lists the available slash commands — including
+  // `usage-credits` / `extra-usage` — so a DNS/connection blip on any run whose
+  // transcript carries that registry was flagged as quota-exhausted (197/197 false
+  // positive in the field). The failure surface here is a plain connection error.
+  it("does not flag a DNS/connection failure whose stdout transcript carries the command registry", () => {
+    const commandRegistryStdout =
+      '{"type":"system","subtype":"init","slash_commands":["ultrareview","security-review","usage-credits","extra-usage","usage","insights"]}\n' +
+      '{"type":"result","is_error":true,"result":"API Error: Unable to connect to API (ENOTFOUND)"}';
+    expect(
+      isClaudeAccountQuotaExhausted({
+        parsed: { is_error: true, result: "API Error: Unable to connect to API (ENOTFOUND)" },
+        stdout: commandRegistryStdout,
+        errorMessage: "API Error: Unable to connect to API (ENOTFOUND)",
+      }),
+    ).toBe(false);
+    // The bare `usage-credits` command token in a transcript is not a quota signal.
+    expect(
+      isClaudeAccountQuotaExhausted({ stdout: 'slash_commands:["usage-credits","extra-usage"]' }),
+    ).toBe(false);
+  });
+
+  // the run's echoed user prompt (agent instructions, issue
+  // body, thread comments) lands in the stdout transcript too — and cost-analysis
+  // prompts routinely contain the literal words "spend limit" / "usage limit" (the
+  // managed block itself does). A DNS blip on such a run must NOT be read
+  // as quota exhaustion just because the prompt discussed quotas. This is why
+  // excluding stdout — not merely dropping the `usage-credits` regex term — is the
+  // load-bearing fix: the quota wording is present in the transcript regardless.
+  it("does not flag a DNS failure whose echoed prompt in stdout discusses spend limits", () => {
+    const promptEchoStdout =
+      '{"type":"user","message":{"content":"…判定は r.error ilike \'%spend limit%\' or \'%usage limit%\'…"}}\n' +
+      '{"type":"result","is_error":true,"result":"API Error: Unable to connect to API (ENOTFOUND)"}';
+    expect(
+      isClaudeAccountQuotaExhausted({
+        parsed: { is_error: true, result: "API Error: Unable to connect to API (ENOTFOUND)" },
+        stdout: promptEchoStdout,
+        errorMessage: "API Error: Unable to connect to API (ENOTFOUND)",
+      }),
+    ).toBe(false);
+  });
+
+  it("still flags the genuine reset-less quota wording carried on the failure surface", () => {
+    expect(
+      isClaudeAccountQuotaExhausted({
+        parsed: { is_error: true, result: SPEND_LIMIT_TEXT },
+        // Even with a noisy transcript, the failure-surface wording drives the flag.
+        stdout: '{"type":"system","subtype":"init","slash_commands":["usage-credits"]}',
+      }),
+    ).toBe(true);
+    expect(
+      isClaudeAccountQuotaExhausted({ errorMessage: "Your credit balance is too low to run this." }),
+    ).toBe(true);
+  });
 });
 
 describe("detectIncompleteToolCall", () => {
