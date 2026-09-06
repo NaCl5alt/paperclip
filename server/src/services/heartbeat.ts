@@ -5951,7 +5951,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect;
     agent: typeof agents.$inferSelect;
     now: Date;
-    trigger: "retry_exhausted" | "retry_not_before_deferred" | "account_quota_exhausted";
+    trigger: "retry_exhausted" | "retry_not_before_deferred" | "account_quota_exhausted" | "auth_required";
     retryNotBefore: Date | null;
     attempt: number;
     maxAttempts: number;
@@ -6060,6 +6060,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const handoffHeadline =
       input.trigger === "account_quota_exhausted"
         ? "The assigned agent's account/org quota is exhausted with no upstream reset window (e.g. a monthly spend limit), so this issue was handed off immediately to the configured recovery fallback agent without running the retry ladder."
+        : input.trigger === "auth_required"
+          ? "The assigned agent's Claude OAuth/login session is broken (claude_auth_required), so this issue was handed off immediately to the configured recovery fallback agent. Auth breaks do not clear on retry."
         : "Transient upstream failures kept the assigned agent from making progress, so this issue was handed off to the configured recovery fallback agent.";
     try {
       await issuesSvc.addComment(
@@ -6140,6 +6142,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
+
+    // VANA-3914: Claude OAuth/login breaks are account-scoped and long-lived.
+    // Retrying the same adapter burns wake budget without progress, so hand off
+    // to recoveryFallbackAgentId immediately (same posture as account_quota_exhausted).
+    // B(2) — fallback paused — remains an ops concern outside this path.
+    if (run.errorCode === "claude_auth_required") {
+      const recoveryFallback = await failoverTransientUpstreamRunToRecoveryFallback({
+        run,
+        agent,
+        now,
+        trigger: "auth_required",
+        retryNotBefore: null,
+        attempt: nextAttempt,
+        maxAttempts,
+      });
+      if (recoveryFallback.outcome === "failed_over") {
+        return {
+          outcome: "failed_over_to_recovery_fallback" as const,
+          attempt: nextAttempt,
+          maxAttempts,
+          fallbackAgentId: recoveryFallback.fallbackAgentId,
+          issueId: recoveryFallback.issueId,
+        };
+      }
+      // No invokable fallback: do not grind a retry ladder on a hard auth break.
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "claude_auth_required with no invokable recovery fallback; skipping bounded retry ladder",
+        payload: {
+          errorCode: run.errorCode,
+          recoveryFallbackReason: recoveryFallback.reason,
+        },
+      });
+      return {
+        outcome: "retry_exhausted" as const,
+        attempt: nextAttempt,
+        maxAttempts,
+        recoveryFallback,
+      };
+    }
 
     if (!baseSchedule) {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -9328,6 +9372,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             });
           }
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
+          await scheduleBoundedRetryForRun(livenessRun, agent);
+        } else if (outcome === "failed" && livenessRun.errorCode === "claude_auth_required") {
+          // VANA-3914 defect B(1): auth breaks never enter the transient-upstream
+          // retry contract, so route them through the same scheduler entrypoint
+          // that now short-circuits to recovery fallback.
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
