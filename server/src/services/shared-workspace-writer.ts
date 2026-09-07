@@ -192,18 +192,49 @@ export async function acquireSharedWorkspaceWriter(
       }
 
       const isolatedIdentity = await claims.resolveIdentity(isolated.cwd);
-      if (isolatedIdentity.key !== candidateIdentity.key) {
+      // Compare paths, not keys. The candidate was claimed before the directory
+      // existed, so it was keyed `path:<cwd>`; realization creates it and the
+      // same directory now resolves to `inode:<dev>:<ino>`. Testing keys here
+      // would report "moved" on every first use of a slot and release the run's
+      // own claim, leaving it writing an unclaimed worktree.
+      if (isolatedIdentity.cwd !== candidateIdentity.cwd) {
         // Realization landed somewhere other than the target — the branch was
         // already registered to a different worktree. Claim where we actually
         // are, and give back the slot we reserved but did not use.
         const actualClaim = await claimFor(isolatedIdentity);
-        await claims
-          .releaseClaim(candidateClaim.claim.id, "isolation_target_moved")
-          .catch(() => false);
         if (!actualClaim.claimed) {
+          await claims.releaseClaim(candidateClaim.claim.id, "isolation_target_moved").catch(() => false);
           lastOwner = actualClaim.owner ?? lastOwner;
           continue;
         }
+        // Only release the reservation when it is a different row. `claimFor`
+        // can resolve to the *same* row via the cwd index, and releasing that
+        // would drop the claim we just confirmed.
+        //
+        // NOTE: this guard and the `cwd`-vs-`key` comparison above are two
+        // independent fixes for the same hole — either alone is sufficient, so
+        // neither dies to a mutation of the other. Both are kept deliberately;
+        // do not delete one on the grounds that the other covers it.
+        if (actualClaim.claim.id !== candidateClaim.claim.id) {
+          await claims.releaseClaim(candidateClaim.claim.id, "isolation_target_moved").catch(() => false);
+        }
+      } else if (isolatedIdentity.key !== candidateIdentity.key) {
+        // Same directory, now with an inode. Re-key the existing row so the
+        // claim is stored under the identity later contenders will compute.
+        await claimFor(isolatedIdentity);
+      }
+
+      // The post-condition this whole path exists for: the run leaves holding a
+      // live claim on the directory it is about to write.
+      const holdsIsolatedDirectory = await claims.holdsActiveClaim({
+        heartbeatRunId: input.heartbeatRunId,
+        cwd: isolatedIdentity.cwd,
+      });
+      if (!holdsIsolatedDirectory) {
+        throw new SharedWorkspaceIsolationError(
+          `Isolated worktree "${isolated.cwd}" is not claimed by this run after isolation; refusing to write an unclaimed checkout.`,
+          { contendedCwd, owner: lastOwner },
+        );
       }
 
       warnings.push(

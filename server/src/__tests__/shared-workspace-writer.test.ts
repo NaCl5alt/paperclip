@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -477,6 +477,119 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
 
     // And the incumbent keeps the checkout it was legitimately using.
     expect(stillHeld.map((row) => row.heartbeatRunId)).toEqual([runIds[0]]);
+  });
+
+  it("still holds the claim when the slot did not exist until it was realized", async () => {
+    // Production order: the candidate is claimed *before* it exists, so it is
+    // keyed `path:<cwd>`; realization then creates it and the same directory
+    // resolves to `inode:<dev>:<ino>`. Treating that key change as "the target
+    // moved" would release the run's own claim and leave it writing an
+    // unclaimed worktree — which the next contender would then find free.
+    const { companyId, agentId, runIds } = await seed(2);
+    const shared = await makeDir("shared");
+    // A realpath-canonical parent, matching production where the worktree path
+    // is derived from `git rev-parse --show-toplevel`.
+    const slotParent = await realpath(await makeDir("slots"));
+    const slot0 = path.join(slotParent, "isolated-slot");
+
+    await claims.claim({
+      identity: await claims.resolveIdentity(shared),
+      companyId, agentId, heartbeatRunId: runIds[0]!,
+    });
+
+    const result = await acquireSharedWorkspaceWriter({
+      claims, companyId, agentId, heartbeatRunId: runIds[1]!, issueId: null,
+      expectSharedCheckout: true,
+      predictedCwd: shared,
+      realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      resolveIsolationCandidateCwd: async (attempt) => (attempt === 0 ? slot0 : null),
+      realizeIsolated: async () => {
+        await mkdir(slot0, { recursive: true });
+        return workspaceAt(slot0, "git_worktree");
+      },
+      isolationAttempts: 2,
+    });
+
+    expect(result.mode).toBe("isolated");
+    expect(result.workspace.cwd).toBe(slot0);
+
+    const active = await db
+      .select()
+      .from(sharedWorkspaceClaims)
+      .where(eq(sharedWorkspaceClaims.status, "active"));
+    const mine = active.filter((row) => row.heartbeatRunId === runIds[1]);
+    expect(mine).toHaveLength(1);
+    expect(mine[0]?.cwd).toBe(slot0);
+    // And it is keyed by the inode now, so a later contender computing the
+    // identity of the realized directory collides with it.
+    expect(mine[0]?.claimKey).toBe((await claims.resolveIdentity(slot0)).key);
+  });
+
+  it("refuses to hand back a directory this run does not hold", async () => {
+    // Post-condition guard: whatever the bookkeeping does, a run must never be
+    // released to write a worktree it cannot demonstrate ownership of.
+    const { companyId, agentId, runIds } = await seed(2);
+    const shared = await makeDir("shared");
+    const slot0 = await makeDir("slot-0");
+    const elsewhere = await makeDir("elsewhere");
+
+    await claims.claim({
+      identity: await claims.resolveIdentity(shared),
+      companyId, agentId, heartbeatRunId: runIds[0]!,
+    });
+    // Another live run owns wherever realization is going to land.
+    await claims.claim({
+      identity: await claims.resolveIdentity(elsewhere),
+      companyId, agentId, heartbeatRunId: runIds[0]!,
+    });
+
+    await expect(acquireSharedWorkspaceWriter({
+      claims, companyId, agentId, heartbeatRunId: runIds[1]!, issueId: null,
+      expectSharedCheckout: true,
+      predictedCwd: shared,
+      realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      resolveIsolationCandidateCwd: async (attempt) => (attempt === 0 ? slot0 : null),
+      // Realization lands somewhere other than the claimed candidate, and that
+      // somewhere is already owned.
+      realizeIsolated: async () => workspaceAt(elsewhere, "git_worktree"),
+      isolationAttempts: 1,
+    })).rejects.toBeInstanceOf(SharedWorkspaceIsolationError);
+
+    const active = await db
+      .select()
+      .from(sharedWorkspaceClaims)
+      .where(eq(sharedWorkspaceClaims.status, "active"));
+    expect(active.every((row) => row.heartbeatRunId === runIds[0])).toBe(true);
+  });
+
+  it("fails closed if the ownership post-condition cannot be confirmed", async () => {
+    // Pins the post-condition guard on its own. The `cwd`-comparison and the
+    // same-row release guard are alternative fixes for the same hole, so neither
+    // dies to a mutation of the other; this asserts the last line of defence
+    // independently by forcing the ownership check to report false.
+    const { companyId, agentId, runIds } = await seed(2);
+    const shared = await makeDir("shared");
+    const slot0 = await makeDir("slot-0");
+
+    await claims.claim({
+      identity: await claims.resolveIdentity(shared),
+      companyId, agentId, heartbeatRunId: runIds[0]!,
+    });
+
+    const blindClaims = {
+      ...claims,
+      holdsActiveClaim: async () => false,
+    } as typeof claims;
+
+    await expect(acquireSharedWorkspaceWriter({
+      claims: blindClaims, companyId, agentId, heartbeatRunId: runIds[1]!, issueId: null,
+      expectSharedCheckout: true,
+      predictedCwd: shared,
+      realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      resolveIsolationCandidateCwd: async (attempt) => (attempt === 0 ? slot0 : null),
+      realizeIsolated: async () => workspaceAt(slot0, "git_worktree"),
+      isolationAttempts: 1,
+    })).rejects.toBeInstanceOf(SharedWorkspaceIsolationError);
   });
 });
 

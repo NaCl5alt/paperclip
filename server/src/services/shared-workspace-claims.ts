@@ -248,6 +248,25 @@ export function sharedWorkspaceClaimService(
       };
     },
 
+    /**
+     * Does `heartbeatRunId` hold a live claim covering `cwd`? Used as a
+     * post-condition check: the run must never proceed to write a directory it
+     * does not demonstrably own.
+     */
+    holdsActiveClaim: async (input: { heartbeatRunId: string; cwd: string }): Promise<boolean> => {
+      const rows = await db
+        .select({ id: sharedWorkspaceClaims.id })
+        .from(sharedWorkspaceClaims)
+        .where(
+          and(
+            eq(sharedWorkspaceClaims.status, "active"),
+            eq(sharedWorkspaceClaims.heartbeatRunId, input.heartbeatRunId),
+            eq(sharedWorkspaceClaims.cwd, input.cwd),
+          ),
+        );
+      return rows.length > 0;
+    },
+
     /** Release a single claim this run holds but no longer needs. */
     releaseClaim: async (claimId: string, reason: string): Promise<boolean> =>
       await releaseClaimRow(claimId, reason),
