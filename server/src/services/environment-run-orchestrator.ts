@@ -416,6 +416,43 @@ export function environmentRunOrchestrator(
       (typeof lease.metadata?.remoteCwd === "string" && lease.metadata.remoteCwd.trim().length > 0
         ? lease.metadata.remoteCwd.trim()
         : executionWorkspace.cwd);
+
+    // VANA-4049: single-writer guard for shared (project_primary) local checkouts.
+    // Concurrent runs can resolve the same on-disk cwd (VANA-3258); claim it for
+    // this lease so the DB records at most one active writer per directory
+    // (partial unique index environment_leases_active_shared_cwd_uq). git_worktree
+    // runs already have per-branch isolation, so only the shared strategy is
+    // claimed here. This is intentionally the *detection* step: on contention we
+    // record the owning lease rather than fail-closing, because shared-checkout
+    // collisions are currently routine across the fleet and a hard block would
+    // break existing runs. Enforcement (isolate-on-contention / fail-close) is a
+    // separate, board-gated change informed by the recorded contention rate. The
+    // whole path is best-effort and never fails the run.
+    if (environment.driver === "local" && executionWorkspace.strategy !== "git_worktree") {
+      try {
+        const claim = await environmentsSvc.claimSharedWorkspaceForLease({
+          companyId,
+          leaseId: lease.id,
+          cwd: realizedCwd,
+        });
+        if (!claim.claimed && claim.ownerLeaseId && claim.ownerLeaseId !== lease.id) {
+          const contentionLease = await environmentsSvc.updateLeaseMetadata(lease.id, {
+            ...(lease.metadata ?? {}),
+            sharedWorkspaceContention: {
+              cwd: claim.cwd,
+              ownerLeaseId: claim.ownerLeaseId,
+              detectedAt: new Date().toISOString(),
+            },
+          });
+          if (contentionLease) {
+            lease = contentionLease;
+          }
+        }
+      } catch {
+        // Best-effort detection only; never block a run on the single-writer path.
+      }
+    }
+
     if (provisionCommand && environment.driver !== "local") {
       try {
         const provisionResult = await environmentRuntime.execute({
