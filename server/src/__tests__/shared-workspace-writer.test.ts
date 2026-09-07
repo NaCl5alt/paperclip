@@ -109,6 +109,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       expectSharedCheckout: true,
       predictedCwd: shared,
       realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      resolveIsolationCandidateCwd: async () => { throw new Error("must not isolate"); },
       realizeIsolated: async () => { throw new Error("must not isolate"); },
       isolationAttempts: 1,
     });
@@ -138,6 +139,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
         configuredRealizeCalls += 1;
         return workspaceAt(shared, "project_primary");
       },
+      resolveIsolationCandidateCwd: async () => isolated,
       realizeIsolated: async () => workspaceAt(isolated, "git_worktree"),
       isolationAttempts: 1,
     });
@@ -167,6 +169,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       expectSharedCheckout: true,
       predictedCwd: shared,
       realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      resolveIsolationCandidateCwd: async () => isolated,
       realizeIsolated: async () => workspaceAt(isolated, "git_worktree"),
       isolationAttempts: 1,
     });
@@ -196,6 +199,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       expectSharedCheckout: true,
       predictedCwd: shared,
       realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      resolveIsolationCandidateCwd: async () => { throw new Error("not a git checkout"); },
       realizeIsolated: async () => { throw new Error("not a git checkout"); },
       isolationAttempts: 1,
     })).rejects.toBeInstanceOf(SharedWorkspaceIsolationError);
@@ -225,6 +229,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       expectSharedCheckout: false,
       predictedCwd: worktree,
       realizeConfigured: async () => workspaceAt(worktree, "git_worktree"),
+      resolveIsolationCandidateCwd: async () => isolated,
       realizeIsolated: async () => workspaceAt(isolated, "git_worktree"),
       isolationAttempts: 1,
     });
@@ -243,6 +248,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       expectSharedCheckout: false,
       predictedCwd: repoRoot,
       realizeConfigured: async () => workspaceAt(worktree, "git_worktree"),
+      resolveIsolationCandidateCwd: async () => { throw new Error("must not isolate"); },
       realizeIsolated: async () => { throw new Error("must not isolate"); },
       isolationAttempts: 1,
     });
@@ -268,6 +274,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       expectSharedCheckout: true,
       predictedCwd: predicted,
       realizeConfigured: async () => workspaceAt(actual, "git_worktree"),
+      resolveIsolationCandidateCwd: async () => { throw new Error("must not isolate"); },
       realizeIsolated: async () => { throw new Error("must not isolate"); },
       isolationAttempts: 1,
     });
@@ -291,6 +298,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
         expectSharedCheckout: true,
         predictedCwd: shared,
         realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+        resolveIsolationCandidateCwd: async () => isolatedFor[runId]!,
         realizeIsolated: async () => workspaceAt(isolatedFor[runId]!, "git_worktree"),
         isolationAttempts: 1,
       }),
@@ -323,6 +331,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       expectSharedCheckout: true,
       predictedCwd: shared,
       realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      resolveIsolationCandidateCwd: async (attempt) => slots[attempt] ?? null,
       realizeIsolated: async (attempt) => workspaceAt(slots[attempt]!, "git_worktree"),
       isolationAttempts: slots.length,
     });
@@ -336,6 +345,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       expectSharedCheckout: true,
       predictedCwd: shared,
       realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      resolveIsolationCandidateCwd: async (attempt) => slots[attempt] ?? null,
       realizeIsolated: async (attempt) => workspaceAt(slots[attempt]!, "git_worktree"),
       isolationAttempts: slots.length,
     });
@@ -363,6 +373,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       expectSharedCheckout: true,
       predictedCwd: shared,
       realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      resolveIsolationCandidateCwd: async (attempt) => slots[attempt] ?? null,
       realizeIsolated: async (attempt) => workspaceAt(slots[attempt]!, "git_worktree"),
       isolationAttempts: slots.length,
     });
@@ -388,9 +399,84 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       expectSharedCheckout: true,
       predictedCwd: shared,
       realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      resolveIsolationCandidateCwd: async () => slot0,
       realizeIsolated: async () => workspaceAt(slot0, "git_worktree"),
       isolationAttempts: 1,
     })).rejects.toBeInstanceOf(SharedWorkspaceIsolationError);
+  });
+
+  it("never realizes an isolation slot held by another live run", async () => {
+    // Realizing a git worktree is not read-only: an existing worktree at the
+    // target path is *reused*, which runs the configured provisionCommand inside
+    // it. A stub that merely returns a path cannot show that, so this one records
+    // the write the real code would perform.
+    const { companyId, agentId, runIds } = await seed(3);
+    const shared = await makeDir("shared");
+    const slot0 = await makeDir("slot-0");
+    const slot1 = await makeDir("slot-1");
+    const slots = [slot0, slot1];
+    const realizedInto: string[] = [];
+
+    await claims.claim({
+      identity: await claims.resolveIdentity(shared),
+      companyId, agentId, heartbeatRunId: runIds[0]!,
+    });
+    // Another live run is already working in slot 0.
+    await claims.claim({
+      identity: await claims.resolveIdentity(slot0),
+      companyId, agentId, heartbeatRunId: runIds[1]!,
+    });
+
+    const result = await acquireSharedWorkspaceWriter({
+      claims, companyId, agentId, heartbeatRunId: runIds[2]!, issueId: null,
+      expectSharedCheckout: true,
+      predictedCwd: shared,
+      realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      resolveIsolationCandidateCwd: async (attempt) => slots[attempt] ?? null,
+      realizeIsolated: async (attempt) => {
+        realizedInto.push(slots[attempt]!);
+        return workspaceAt(slots[attempt]!, "git_worktree");
+      },
+      isolationAttempts: slots.length,
+    });
+
+    expect(result.workspace.cwd).toBe(slot1);
+    // The point of the test: slot 0 was skipped without ever being realized.
+    expect(realizedInto).toEqual([slot1]);
+    expect(realizedInto).not.toContain(slot0);
+    expect(result.claimedBeforeCheckout).toBe(true);
+  });
+
+  it("gives the slot back when realizing it fails", async () => {
+    const { companyId, agentId, runIds } = await seed(3);
+    const shared = await makeDir("shared");
+    const slot0 = await makeDir("slot-0");
+    await claims.claim({
+      identity: await claims.resolveIdentity(shared),
+      companyId, agentId, heartbeatRunId: runIds[0]!,
+    });
+
+    await expect(acquireSharedWorkspaceWriter({
+      claims, companyId, agentId, heartbeatRunId: runIds[1]!, issueId: null,
+      expectSharedCheckout: true,
+      predictedCwd: shared,
+      realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      resolveIsolationCandidateCwd: async () => slot0,
+      realizeIsolated: async () => { throw new Error("worktree add failed"); },
+      isolationAttempts: 1,
+    })).rejects.toBeInstanceOf(SharedWorkspaceIsolationError);
+
+    // A slot reserved and then not used must not stay locked for the rest of the
+    // failed run, or one bad realization would poison the slot for everyone.
+    const slotIdentity = await claims.resolveIdentity(slot0);
+    const stillHeld = await db
+      .select()
+      .from(sharedWorkspaceClaims)
+      .where(eq(sharedWorkspaceClaims.status, "active"));
+    expect(stillHeld.some((row) => row.claimKey === slotIdentity.key)).toBe(false);
+
+    // And the incumbent keeps the checkout it was legitimately using.
+    expect(stillHeld.map((row) => row.heartbeatRunId)).toEqual([runIds[0]]);
   });
 });
 

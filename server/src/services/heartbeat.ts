@@ -98,6 +98,7 @@ import {
   persistAdapterManagedRuntimeServices,
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
+  resolveExecutionWorktreeTarget,
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
   sanitizeRuntimeServiceBaseEnv,
@@ -8495,17 +8496,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         recorder: workspaceOperationRecorder,
       });
     };
+    const isolationConfigFor = (attempt: number) => ({
+      ...hostExecutionWorkspaceConfig,
+      workspaceStrategy: {
+        ...configuredWorkspaceStrategy,
+        type: "git_worktree",
+        branchTemplate: isolationBranchNames[Math.min(attempt, isolationBranchNames.length - 1)],
+      },
+    });
+    // Resolved through the same helper realization uses, so the directory we
+    // claim and the directory we write cannot drift apart.
+    const resolveIsolationCandidateCwd = async (attempt: number): Promise<string | null> => {
+      const target = await resolveExecutionWorktreeTarget({
+        base: executionWorkspaceBase,
+        config: isolationConfigFor(attempt),
+        issue: issueRef,
+        agent: {
+          id: agent.id,
+          name: agent.name,
+          companyId: agent.companyId,
+        },
+      });
+      return target.worktreePath;
+    };
     const realizeIsolatedExecutionWorkspace = async (attempt: number): Promise<RealizedExecutionWorkspace> =>
       await realizeExecutionWorkspace({
         base: executionWorkspaceBase,
-        config: {
-          ...hostExecutionWorkspaceConfig,
-          workspaceStrategy: {
-            ...configuredWorkspaceStrategy,
-            type: "git_worktree",
-            branchTemplate: isolationBranchNames[Math.min(attempt, isolationBranchNames.length - 1)],
-          },
-        },
+        config: isolationConfigFor(attempt),
         issue: issueRef,
         agent: {
           id: agent.id,
@@ -8523,6 +8540,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       expectSharedCheckout,
       predictedCwd: predictedCheckoutCwd,
       realizeConfigured: realizeConfiguredExecutionWorkspace,
+      resolveIsolationCandidateCwd,
       realizeIsolated: realizeIsolatedExecutionWorkspace,
       isolationAttempts: isolationBranchNames.length,
       logger,

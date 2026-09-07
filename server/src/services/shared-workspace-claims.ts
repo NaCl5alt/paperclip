@@ -98,6 +98,7 @@ export function sharedWorkspaceClaimService(
           ),
         ),
       )
+      .orderBy(sharedWorkspaceClaims.claimedAt)
       .then((rows) => rows[0] ?? null);
   }
 
@@ -177,7 +178,11 @@ export function sharedWorkspaceClaimService(
       metadata?: Record<string, unknown> | null;
     }): Promise<SharedWorkspaceClaimResult> => {
       const { identity } = input;
-      for (let attempt = 0; attempt < 3; attempt += 1) {
+      // Two partial unique indexes can block independently, and each dead
+      // blocker costs one attempt to clear, so the budget must exceed the number
+      // of indexes or a directory with two stale claims would force a needless
+      // isolation.
+      for (let attempt = 0; attempt < 4; attempt += 1) {
         try {
           const inserted = await db
             .insert(sharedWorkspaceClaims)
@@ -242,6 +247,10 @@ export function sharedWorkspaceClaimService(
         owner: finalOwner ? toOwner(finalOwner) : null,
       };
     },
+
+    /** Release a single claim this run holds but no longer needs. */
+    releaseClaim: async (claimId: string, reason: string): Promise<boolean> =>
+      await releaseClaimRow(claimId, reason),
 
     /** Refresh the liveness signal of every claim held by a run. */
     touch: async (heartbeatRunId: string): Promise<number> => {

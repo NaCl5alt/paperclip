@@ -24,7 +24,17 @@ import type {
 
 export type SharedWorkspaceWriterMode = "exclusive" | "isolated";
 
-/** How many stable (reusable) isolation slots precede the run-scoped fallback. */
+/**
+ * How many stable (reusable) isolation slots precede the run-scoped fallback.
+ *
+ * Slot names are derived from the issue identifier (or agent name), so reuse
+ * happens across *runs of one issue*, not across issues. The number of isolation
+ * worktrees is therefore bounded by the number of distinct issues that ever
+ * contend — better than one worktree per contention event, but NOT bounded by
+ * peak concurrency. Reclamation is tracked separately; slots are deliberately
+ * not shared between issues, which would bound the count but would also let one
+ * issue's half-finished edits appear in another issue's working directory.
+ */
 export const STABLE_ISOLATION_SLOTS = 3;
 
 /**
@@ -80,11 +90,12 @@ export type SharedWorkspaceWriterResult = {
   workspace: RealizedExecutionWorkspace;
   mode: SharedWorkspaceWriterMode;
   /**
-   * True when the directory handed back was claimed before any checkout work ran
-   * for this run. False means the claim could only be taken after realization
-   * (the `git_worktree` path, whose target is not knowable in advance), so git
-   * touched the directory first. Recorded because it is the ordering guarantee
-   * this whole mechanism turns on, and it is otherwise invisible after the fact.
+   * True when every directory this run wrote to was claimed before any checkout
+   * work ran against it. False means the claim could only be taken after
+   * realization — the configured `git_worktree` path, whose target depends on
+   * template rendering the caller does not resolve up front — so git touched the
+   * directory first. Recorded because it is the ordering guarantee this whole
+   * mechanism turns on, and is otherwise invisible after the fact.
    */
   claimedBeforeCheckout: boolean;
   claimKey: string | null;
@@ -112,16 +123,20 @@ export type SharedWorkspaceWriterInput = {
   /** Realize the workspace the run was configured for (reuse or fresh). */
   realizeConfigured: () => Promise<RealizedExecutionWorkspace>;
   /**
-   * Realize isolation candidate `attempt` (0-based) as a git worktree.
+   * Where isolation candidate `attempt` (0-based) *would* be realized, resolved
+   * without touching it.
    *
-   * Candidates are tried in order and each is claimed before use, so earlier
-   * candidates can be *reused* directories: whoever holds one is its single
-   * writer, and the next contender simply moves to the next candidate. That
-   * bounds the number of isolation worktrees by peak concurrent contention
-   * rather than by total contention events. Throwing means isolation failed.
+   * Required because realizing a `git_worktree` is not read-only: an existing
+   * worktree at the target path is reused, which runs the configured
+   * `provisionCommand` inside it. Since the leading candidates are stable,
+   * reusable slots, a slot may already belong to another live run — so it must
+   * be claimed before it is realized, exactly as the shared checkout is.
+   * Returning null means the path cannot be resolved (e.g. not a git checkout).
    */
+  resolveIsolationCandidateCwd: (attempt: number) => Promise<string | null>;
+  /** Realize isolation candidate `attempt`, which this run has already claimed. */
   realizeIsolated: (attempt: number) => Promise<RealizedExecutionWorkspace>;
-  /** How many isolation candidates `realizeIsolated` can produce. */
+  /** How many isolation candidates the two callbacks above can produce. */
   isolationAttempts: number;
   logger?: { warn: (obj: unknown, msg: string) => void; info?: (obj: unknown, msg: string) => void };
 };
@@ -147,25 +162,50 @@ export async function acquireSharedWorkspaceWriter(
     owner: SharedWorkspaceClaimOwner | null,
   ): Promise<SharedWorkspaceWriterResult> {
     let lastOwner = owner;
+    let lastError: unknown = null;
     for (let attempt = 0; attempt < input.isolationAttempts; attempt += 1) {
+      // Claim the slot before realizing it. Realizing first would reuse — and
+      // run provisioning inside — a worktree another live run is working in,
+      // which is the same double-write this whole path exists to prevent.
+      const candidateCwd = await input.resolveIsolationCandidateCwd(attempt).catch((error: unknown) => {
+        lastError = error;
+        return null;
+      });
+      if (!candidateCwd) break;
+      const candidateIdentity = await claims.resolveIdentity(candidateCwd);
+      const candidateClaim = await claimFor(candidateIdentity);
+      if (!candidateClaim.claimed) {
+        // Slot belongs to another live run; move on without touching it.
+        lastOwner = candidateClaim.owner ?? lastOwner;
+        continue;
+      }
+
       let isolated: RealizedExecutionWorkspace;
       try {
         isolated = await input.realizeIsolated(attempt);
       } catch (error) {
-        // Fail-close: we know another live writer owns the directory and we
-        // cannot move out of its way, so continuing would double-write it.
-        throw new SharedWorkspaceIsolationError(
-          `Shared checkout "${contendedCwd}" is already claimed by another live run and this run could not be isolated into its own worktree.`,
-          { contendedCwd, owner: lastOwner, cause: error },
-        );
+        await claims
+          .releaseClaim(candidateClaim.claim.id, "isolation_realize_failed")
+          .catch(() => false);
+        lastError = error;
+        break;
       }
+
       const isolatedIdentity = await claims.resolveIdentity(isolated.cwd);
-      const isolatedClaim = await claimFor(isolatedIdentity);
-      if (!isolatedClaim.claimed) {
-        // This isolation slot is held by yet another live run; try the next one.
-        lastOwner = isolatedClaim.owner ?? lastOwner;
-        continue;
+      if (isolatedIdentity.key !== candidateIdentity.key) {
+        // Realization landed somewhere other than the target — the branch was
+        // already registered to a different worktree. Claim where we actually
+        // are, and give back the slot we reserved but did not use.
+        const actualClaim = await claimFor(isolatedIdentity);
+        await claims
+          .releaseClaim(candidateClaim.claim.id, "isolation_target_moved")
+          .catch(() => false);
+        if (!actualClaim.claimed) {
+          lastOwner = actualClaim.owner ?? lastOwner;
+          continue;
+        }
       }
+
       warnings.push(
         `Another live run holds the shared checkout ${contendedCwd}; this run was isolated into ${isolated.cwd}.`,
       );
@@ -183,7 +223,7 @@ export async function acquireSharedWorkspaceWriter(
       return {
         workspace: isolated,
         mode: "isolated",
-        claimedBeforeCheckout: input.expectSharedCheckout,
+        claimedBeforeCheckout: true,
         claimKey: isolatedIdentity.key,
         claimedCwd: isolatedIdentity.cwd,
         contention: {
@@ -198,9 +238,11 @@ export async function acquireSharedWorkspaceWriter(
         warnings,
       };
     }
+    // Fail-close: another live writer owns the directory and we could not move
+    // out of its way, so continuing would double-write it.
     throw new SharedWorkspaceIsolationError(
-      `Shared checkout "${contendedCwd}" is contended and all ${input.isolationAttempts} isolation candidates are held by other live runs.`,
-      { contendedCwd, owner: lastOwner },
+      `Shared checkout "${contendedCwd}" is already claimed by another live run and this run could not be isolated into its own worktree.`,
+      { contendedCwd, owner: lastOwner, cause: lastError },
     );
   }
 
