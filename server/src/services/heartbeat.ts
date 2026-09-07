@@ -146,7 +146,11 @@ import {
   findExistingRunLivenessContinuationWake,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
+  ACCOUNT_FAILURE_GATE_DEFAULT_MAX_FAILURE_AGE_MS,
+  classifyAccountFailureGate,
+  deriveAccountKey,
 } from "./recovery/index.js";
+import type { AccountFailureGate } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
   recoveryAssigneeAdapterOverrides,
@@ -10101,6 +10105,69 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await startNextQueuedRunForAgent(promotedRun.agentId);
   }
 
+  // VANA-4048: derive whether the credential account an agent runs under is in
+  // a confirmed auth-failure state, from the account's recent terminal runs.
+  // Read-only and fail-open: any error, or an account whose credential scope
+  // cannot be determined, yields null so the gate can only ever suppress an
+  // automated wake, never manufacture a new outage. The account auto-releases
+  // the instant a newer successful run is observed on any agent that shares it
+  // (classifyAccountFailureGate keys on the most-recent terminal outcome).
+  async function getActiveAccountFailureGate(
+    agent: typeof agents.$inferSelect,
+  ): Promise<AccountFailureGate | null> {
+    try {
+      const accountKey = deriveAccountKey(
+        agent.adapterType,
+        parseObject(agent.adapterConfig).env,
+      );
+      if (!accountKey) return null;
+
+      const companyAgents = await db
+        .select({
+          id: agents.id,
+          adapterType: agents.adapterType,
+          adapterConfig: agents.adapterConfig,
+        })
+        .from(agents)
+        .where(eq(agents.companyId, agent.companyId));
+      const accountAgentIds = companyAgents
+        .filter(
+          (candidate) =>
+            deriveAccountKey(
+              candidate.adapterType,
+              parseObject(candidate.adapterConfig).env,
+            ) === accountKey,
+        )
+        .map((candidate) => candidate.id);
+      if (accountAgentIds.length === 0) return null;
+
+      const windowStart = new Date(
+        Date.now() - ACCOUNT_FAILURE_GATE_DEFAULT_MAX_FAILURE_AGE_MS,
+      );
+      const recentRuns = await db
+        .select({
+          runId: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+          finishedAt: heartbeatRuns.finishedAt,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, agent.companyId),
+            inArray(heartbeatRuns.agentId, accountAgentIds),
+            gte(heartbeatRuns.finishedAt, windowStart),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.finishedAt))
+        .limit(50);
+
+      return classifyAccountFailureGate(accountKey, recentRuns);
+    } catch {
+      return null;
+    }
+  }
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -10243,6 +10310,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         invalidOrgChain: invokability.invalidOrgChain,
         ...invokability.details,
       });
+    }
+
+    // VANA-4048: suppress automated wakes to an account whose credentials are in
+    // a confirmed deterministic-failure (auth-required) state, so one dead
+    // account does not fan a per-issue retry out across every issue that shares
+    // it. User-initiated wakes are never suppressed — they carry human intent,
+    // are low volume, and a success on one releases the gate for the account.
+    if (opts.requestedByActorType !== "user") {
+      const accountFailureGate = await getActiveAccountFailureGate(agent);
+      if (accountFailureGate) {
+        await writeSkippedRequest("account_failure_gate_active", {
+          payload: {
+            ...(payload ?? {}),
+            accountFailureGate: {
+              accountKey: accountFailureGate.accountKey,
+              errorCode: accountFailureGate.errorCode,
+              sinceRunId: accountFailureGate.sinceRunId,
+            },
+          },
+        });
+        return null;
+      }
     }
 
     const policy = parseHeartbeatPolicy(agent);
