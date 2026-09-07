@@ -8654,14 +8654,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       existingExecutionWorkspace &&
       persistedExecutionWorkspace &&
       existingExecutionWorkspace.id !== persistedExecutionWorkspace.id &&
-      existingExecutionWorkspace.status === "active"
+      existingExecutionWorkspace.status === "active" &&
+      // VANA-4055: an isolated run moved aside from a workspace another live run
+      // is still writing. Idling that row here would retire a workspace that is
+      // in active use by its rightful owner.
+      sharedWorkspaceWriter.mode !== "isolated"
     ) {
       await executionWorkspacesSvc.update(existingExecutionWorkspace.id, {
         status: "idle",
         cleanupReason: null,
       });
     }
-    if (issueId && persistedExecutionWorkspace) {
+    // VANA-4055: isolation is a per-run detour around a transient collision, not
+    // a reconfiguration of the issue. Repointing the issue at a run-scoped
+    // worktree here would make one race permanently change where the issue works.
+    if (issueId && persistedExecutionWorkspace && sharedWorkspaceWriter.mode !== "isolated") {
       const nextIssueWorkspaceMode = issueExecutionWorkspaceModeForPersistedWorkspace(persistedExecutionWorkspace.mode);
       const shouldSwitchIssueToExistingWorkspace =
         issueRef?.executionWorkspacePreference === "reuse_existing" ||
