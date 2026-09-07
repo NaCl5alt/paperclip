@@ -252,6 +252,11 @@ export function sharedWorkspaceClaimService(
      * Does `heartbeatRunId` hold a live claim covering `cwd`? Used as a
      * post-condition check: the run must never proceed to write a directory it
      * does not demonstrably own.
+     *
+     * Matches `cwd` by exact string. That is safe only because every row's `cwd`
+     * is written from a `SharedWorkspaceIdentity`, so callers must pass the
+     * identity's `cwd` and not a raw path — an un-normalized path would miss and
+     * produce a spurious fail-close.
      */
     holdsActiveClaim: async (input: { heartbeatRunId: string; cwd: string }): Promise<boolean> => {
       const rows = await db

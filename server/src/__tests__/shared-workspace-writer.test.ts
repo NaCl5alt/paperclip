@@ -591,6 +591,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       isolationAttempts: 1,
     })).rejects.toBeInstanceOf(SharedWorkspaceIsolationError);
   });
+
 });
 
 describe("buildIsolationBranchNames", () => {

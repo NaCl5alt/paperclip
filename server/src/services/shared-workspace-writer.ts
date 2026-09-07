@@ -192,12 +192,15 @@ export async function acquireSharedWorkspaceWriter(
       }
 
       const isolatedIdentity = await claims.resolveIdentity(isolated.cwd);
-      // Compare paths, not keys. The candidate was claimed before the directory
-      // existed, so it was keyed `path:<cwd>`; realization creates it and the
-      // same directory now resolves to `inode:<dev>:<ino>`. Testing keys here
-      // would report "moved" on every first use of a slot and release the run's
-      // own claim, leaving it writing an unclaimed worktree.
-      if (isolatedIdentity.cwd !== candidateIdentity.cwd) {
+      // Re-resolve the candidate now that it exists, and compare *that* to where
+      // realization landed. Two things change across realization for a directory
+      // that never moved: the key (`path:<cwd>` before it exists, `inode:` after)
+      // and, under a symlinked parent, the normalized path itself (realpath only
+      // resolves once the directory is there). Comparing the pre-realization
+      // identity on either field reports "moved" when nothing did — which then
+      // releases the run's own claim and leaves it writing an unclaimed worktree.
+      const candidateAfterRealize = await claims.resolveIdentity(candidateCwd);
+      if (isolatedIdentity.cwd !== candidateAfterRealize.cwd) {
         // Realization landed somewhere other than the target — the branch was
         // already registered to a different worktree. Claim where we actually
         // are, and give back the slot we reserved but did not use.
@@ -211,10 +214,15 @@ export async function acquireSharedWorkspaceWriter(
         // can resolve to the *same* row via the cwd index, and releasing that
         // would drop the claim we just confirmed.
         //
-        // NOTE: this guard and the `cwd`-vs-`key` comparison above are two
+        // NOTE: this guard and the re-resolved `cwd` comparison above are two
         // independent fixes for the same hole — either alone is sufficient, so
-        // neither dies to a mutation of the other. Both are kept deliberately;
-        // do not delete one on the grounds that the other covers it.
+        // neither dies to a mutation of the other, and no honest test separates
+        // them (while the comparison is correct, one inode cannot present two
+        // normalized paths, so the same-row case is unreachable). What *is*
+        // pinned is that breaking BOTH fails closed via the ownership
+        // post-condition below rather than silently double-writing. Both are
+        // kept deliberately; do not delete one on the grounds that the other
+        // covers it.
         if (actualClaim.claim.id !== candidateClaim.claim.id) {
           await claims.releaseClaim(candidateClaim.claim.id, "isolation_target_moved").catch(() => false);
         }
