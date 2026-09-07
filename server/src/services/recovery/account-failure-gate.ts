@@ -20,9 +20,12 @@
 //     and never on an outcome (a cancellation, a transient upstream error) that
 //     carries no evidence the credential works again.
 //   * Fail-open: any ambiguity (no runs, an unknown account, a non-auth latest
-//     failure, or a stale failure past the re-probe window) yields "not gated".
-//     The gate can only ever *suppress*, never manufacture a new outage — it
-//     must not become a fleet-wide single point of failure.
+//     failure, an `*_auth_required` code the run's own error text does not
+//     corroborate, or a stale failure past the re-probe window) yields "not
+//     gated". The gate can only ever *suppress*, never manufacture a new outage
+//     — it must not become a fleet-wide single point of failure. That property
+//     is what forces the corroboration step: the code alone is 83.5% false on
+//     the live fleet, and suppression that broad *is* a new outage.
 
 // The deterministic credential-failure codes emitted by the local adapters.
 // These are the codes that will not clear by retrying on the same account.
@@ -121,6 +124,12 @@ export type AccountRunOutcome = {
   runId: string;
   status: string;
   errorCode: string | null;
+  // The run's own terminal error string (`heartbeat_runs.error`). Required, not
+  // optional: arming reads it (see `errorTextAssertsCredentialFailure`), and an
+  // optional field would let a caller that forgets to select the column silently
+  // disable the gate — the exact fail-open-by-omission shape that left this gate
+  // dead once already (the un-imported `gte` fixed in 5d725821d).
+  errorText: string | null;
   finishedAt: Date | null;
 };
 
@@ -130,6 +139,62 @@ export type AccountFailureGate = {
   sinceRunId: string;
   sinceFinishedAt: Date | null;
 };
+
+// Arming additionally requires the failing run's *own* terminal error text to
+// say that the credential is what broke. The error code alone is not
+// trustworthy evidence: `detectClaudeLoginRequired()` matches the legacy
+// `CLAUDE_AUTH_REQUIRED_RE` against the adapter's entire stream-json stdout,
+// which echoes the prompt (agent instructions, issue body, whole thread) and
+// every file the agent read — the same contaminated haystack that made
+// `accountQuotaExhausted` 0%-precision in VANA-3255.
+//
+// Measured on the live fleet over 90 days (VANA-4067 B-II1): of the 79 runs
+// stored as `claude_auth_required`, 66 (83.5%) carry no auth wording anywhere
+// in their own error — session limits (19), `ENOTFOUND` (5), `Connection closed
+// mid-response` (11), spend limits (5), and even ordinary agent completion
+// reports. Reading the code alone, each of those arms the gate and silences
+// every agent sharing the account for up to the re-probe window; on the default
+// account that is 25 agents, 41 times in 90 days. That is the gate manufacturing
+// the very outage its docstring promises it can never manufacture.
+//
+// Re-applying the classifier's own vocabulary to a haystack that cannot be
+// contaminated loses no genuine failure. Against the same 90 days it keeps all
+// 13 genuine `claude_auth_required` runs, all 96 `gemini_auth_required` runs,
+// and all 2,088 runs of the real 2026-09-05 default-account outage (whose error
+// is `Failed to authenticate: OAuth session expired and could not be
+// refreshed`), while dropping all 66 false positives.
+export const ACCOUNT_GATE_CREDENTIAL_ERROR_TEXT_PATTERN_SOURCE =
+  "(oauth session expired|not logged in|please log in|please run claude login|login required|requires? login|unauthorized|authentication required|failed to authenticate)";
+
+// The adapter puts the reason at the front of the error string: across the 90-day
+// sample the latest genuine match started at offset 37 and the longest genuine
+// auth error was 69 characters. An agent narrative that merely *quotes* a login
+// prompt carries it deep in the body — the one residual false positive in that
+// sample sat at roughly offset 500 of a 1,616-character completion report. So
+// bounding the haystack to a prefix drops that last case with ~200 characters of
+// margin over every genuine one, and the bound is stable: 120, 160, 200, 300 and
+// 500 all yield the identical 108-kept / 69-dropped split.
+export const ACCOUNT_GATE_CREDENTIAL_ERROR_TEXT_MAX_CHARS = 240;
+
+// One source of truth for both haystacks. The SQL pre-filter in heartbeat.ts
+// compiles the same pattern with `~*` and the same bound with `left()`. The two
+// slicings differ in units — Postgres `left()` counts characters, JS `slice()`
+// counts UTF-16 code units — so on astral input SQL sees at least as much text
+// as this does. The asymmetry only ever runs one way (SQL can keep a row this
+// filter then skips, never the reverse), which is the fail-open direction.
+const CREDENTIAL_ERROR_TEXT_RE = new RegExp(
+  ACCOUNT_GATE_CREDENTIAL_ERROR_TEXT_PATTERN_SOURCE,
+  "i",
+);
+
+export function errorTextAssertsCredentialFailure(
+  errorText: string | null | undefined,
+): boolean {
+  if (typeof errorText !== "string") return false;
+  return CREDENTIAL_ERROR_TEXT_RE.test(
+    errorText.slice(0, ACCOUNT_GATE_CREDENTIAL_ERROR_TEXT_MAX_CHARS),
+  );
+}
 
 // A terminal run only carries information about the account's credential when
 // it either *used* the credential successfully or *failed on* it. Every other
@@ -150,14 +215,24 @@ export type AccountFailureGate = {
 function isInformativeAboutCredential(run: AccountRunOutcome): boolean {
   if (run.status === "succeeded") return true;
   const errorCode = typeof run.errorCode === "string" ? run.errorCode.trim() : "";
-  return AUTH_REQUIRED_ERROR_CODES.has(errorCode);
+  if (!AUTH_REQUIRED_ERROR_CODES.has(errorCode)) return false;
+  // An `*_auth_required` code whose own error text says nothing about the
+  // credential is a misclassification, not evidence. It is *skipped*, not read
+  // as recovery: a session-limit rejection is no more proof the credential works
+  // than proof it is broken.
+  return errorTextAssertsCredentialFailure(run.errorText);
 }
 
 // The subset of run shapes the gate is willing to read, as a SQL-side predicate
 // can express it. Kept next to `isInformativeAboutCredential` so the database
-// pre-filter in heartbeat.ts and this in-memory filter cannot drift apart: the
-// caller narrows the fetch to these rows, and this module re-applies the same
-// rule so a caller that fetches everything still behaves identically.
+// pre-filter in heartbeat.ts and this in-memory filter stay in step: the caller
+// narrows the fetch to these rows *and* to the credential-text predicate above,
+// and this module re-applies both rules so a caller that fetches everything
+// still behaves identically. The two are not byte-identical — this module trims
+// the code and slices by UTF-16 code unit where SQL compares the raw column and
+// slices by character — but both deviations only ever make the in-memory filter
+// the narrower of the pair, so SQL can never admit a row this module would arm
+// on.
 export const ACCOUNT_GATE_INFORMATIVE_ERROR_CODES: readonly string[] = [
   ...AUTH_REQUIRED_ERROR_CODES,
 ];
@@ -167,8 +242,11 @@ export const ACCOUNT_GATE_INFORMATIVE_ERROR_CODES: readonly string[] = [
 // nothing about the credential are skipped over entirely, and the most-recent
 // *informative* outcome governs:
 //   * succeeded → not gated (recovery actually observed).
-//   * an `*_auth_required` failure within the re-probe window → gated.
-//   * an `*_auth_required` failure older than the window → not gated, so a
+//   * an `*_auth_required` failure whose own error text names the credential,
+//     within the re-probe window → gated.
+//   * an `*_auth_required` failure whose error text does not → skipped, exactly
+//     like a cancellation: it neither arms nor releases.
+//   * a corroborated `*_auth_required` failure older than the window → not gated, so a
 //     probe run is allowed through to re-test (time never *confirms* recovery,
 //     it only lets a probe through; a real success still does the releasing).
 //   * no informative run at all → not gated (fail-open).
@@ -199,6 +277,7 @@ export function classifyAccountFailureGate(
   // Unreachable given the filter above; kept so the gate still fails open if the
   // informative-run predicate is ever widened without revisiting this branch.
   if (!AUTH_REQUIRED_ERROR_CODES.has(errorCode)) return null;
+  if (!errorTextAssertsCredentialFailure(latest.errorText)) return null;
 
   const ageMs = now.getTime() - latest.finishedAt.getTime();
   if (maxFailureAgeMs > 0 && ageMs > maxFailureAgeMs) return null;

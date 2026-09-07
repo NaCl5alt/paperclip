@@ -5,15 +5,27 @@ import {
   type AccountRunOutcome,
   classifyAccountFailureGate,
   deriveAccountKey,
+  errorTextAssertsCredentialFailure,
 } from "./account-failure-gate.js";
 
 const now = new Date("2026-09-07T12:00:00.000Z");
 const minutesAgo = (m: number) => new Date(now.getTime() - m * 60_000);
 
+// Verbatim from the live fleet: the terse string the claude-local adapter writes
+// when the credential really is gone, and the string every run of the real
+// 2026-09-05 default-account outage carried.
+const GENUINE_LOGIN_ERROR = "Claude run failed: subtype=success: Not logged in \u00b7 Please run /login";
+const GENUINE_OAUTH_ERROR =
+  "Claude run failed: subtype=success: Failed to authenticate: OAuth session expired and could not be refreshed";
+
 function run(overrides: Partial<AccountRunOutcome> & { runId: string }): AccountRunOutcome {
   return {
     status: "failed",
     errorCode: null,
+    // Default to a corroborated credential failure so the tests below stay about
+    // the property each one names; the tests that are about corroboration pass
+    // an explicit errorText.
+    errorText: GENUINE_LOGIN_ERROR,
     finishedAt: minutesAgo(1),
     ...overrides,
   };
@@ -301,6 +313,130 @@ describe("classifyAccountFailureGate", () => {
     ).not.toBeNull();
   });
 
+  // --- the code alone is not evidence (VANA-4067 B-II1) ---
+  //
+  // `detectClaudeLoginRequired()` matches the legacy auth regex against the
+  // adapter's whole stream-json stdout, which contains the echoed prompt and
+  // every file the agent read. Measured over 90 days on the live fleet, 66 of
+  // the 79 runs stored as `claude_auth_required` carry no auth wording in their
+  // own error at all. Arming on the code alone turns each of those into up to a
+  // full re-probe window of silence for every agent on the account (25 agents on
+  // the default one, 41 times in 90 days) — the gate manufacturing an outage,
+  // which its whole design forbids.
+
+  it.each([
+    ["a session-limit rejection", "Claude run failed: subtype=success: You've hit your session limit \u00b7 resets 6pm (Asia/Tokyo)"],
+    ["a DNS failure", "Claude run failed: subtype=success: API Error: Unable to connect to API (ENOTFOUND)"],
+    ["a truncated response", "Claude run failed: subtype=success: API Error: Connection closed mid-response."],
+    ["a spend-limit rejection", "Claude run failed: subtype=success: You've hit your org's monthly spend limit"],
+    ["an ordinary completion report", "Claude run failed: subtype=success: Heartbeat complete on [VANA-1045]. What changed: ..."],
+  ])("does not arm on %s misclassified as auth-required", (_label, errorText) => {
+    expect(
+      classifyAccountFailureGate(
+        key,
+        [run({ runId: "misclassified", errorCode: "claude_auth_required", errorText, finishedAt: minutesAgo(2) })],
+        { now },
+      ),
+    ).toBeNull();
+  });
+
+  it("still arms on the terse errors the adapter writes for a real credential failure", () => {
+    for (const errorText of [GENUINE_LOGIN_ERROR, GENUINE_OAUTH_ERROR]) {
+      expect(
+        classifyAccountFailureGate(
+          key,
+          [run({ runId: "real", errorCode: "claude_auth_required", errorText, finishedAt: minutesAgo(2) })],
+          { now },
+        )?.sinceRunId,
+      ).toBe("real");
+    }
+    // The gemini adapter's own wording, which must survive the same predicate.
+    expect(
+      classifyAccountFailureGate(
+        key,
+        [run({
+          runId: "gemini",
+          errorCode: "gemini_auth_required",
+          errorText: "Authentication required. Please visit the URL to log in:",
+          finishedAt: minutesAgo(2),
+        })],
+        { now },
+      )?.sinceRunId,
+    ).toBe("gemini");
+  });
+
+  it("skips an uncorroborated auth code rather than reading it as recovery", () => {
+    // Skipped, not released: a session limit is no more proof the credential
+    // works than proof it is broken, so an older corroborated failure still
+    // governs.
+    const gate = classifyAccountFailureGate(
+      key,
+      [
+        run({ runId: "real-auth", errorCode: "claude_auth_required", finishedAt: minutesAgo(10) }),
+        run({
+          runId: "session-limit",
+          errorCode: "claude_auth_required",
+          errorText: "Claude run failed: subtype=success: You've hit your session limit",
+          finishedAt: minutesAgo(1),
+        }),
+      ],
+      { now },
+    );
+    expect(gate?.sinceRunId).toBe("real-auth");
+  });
+
+  it("does not arm on an agent narrative that merely quotes a login prompt", () => {
+    // The one residual false positive in the 90-day sample: a 1,616-character
+    // completion report whose body quoted the adapter's own login prompt as
+    // sample output, roughly 500 characters in. Bounding the haystack to a
+    // prefix is what excludes it, so this run must not arm even though the
+    // wording is present.
+    //
+    // The offset here is a literal, deliberately: deriving it from
+    // ACCOUNT_GATE_CREDENTIAL_ERROR_TEXT_MAX_CHARS would make the fixture track
+    // the constant and the test would survive any widening of the bound.
+    const narrative =
+      "Claude run failed: subtype=success: " +
+      "x".repeat(500) +
+      " Not logged in \u00b7 Please run /login";
+    expect(
+      classifyAccountFailureGate(
+        key,
+        [run({ runId: "narrative", errorCode: "claude_auth_required", errorText: narrative, finishedAt: minutesAgo(2) })],
+        { now },
+      ),
+    ).toBeNull();
+  });
+
+  it("does not arm when the error text is missing entirely", () => {
+    // A caller that fails to read `heartbeat_runs.error` must fail open, never
+    // arm on the code alone.
+    for (const errorText of [null, ""]) {
+      expect(
+        classifyAccountFailureGate(
+          key,
+          [run({ runId: "no-text", errorCode: "claude_auth_required", errorText, finishedAt: minutesAgo(2) })],
+          { now },
+        ),
+      ).toBeNull();
+    }
+  });
+
+  it("leaves release-on-success independent of the error text", () => {
+    // Corroboration constrains arming only. A successful run releases the gate
+    // whatever its (empty) error text says.
+    expect(
+      classifyAccountFailureGate(
+        key,
+        [
+          run({ runId: "auth", errorCode: "claude_auth_required", finishedAt: minutesAgo(5) }),
+          run({ runId: "ok", status: "succeeded", errorCode: null, errorText: null, finishedAt: minutesAgo(1) }),
+        ],
+        { now },
+      ),
+    ).toBeNull();
+  });
+
   // --- before/after evidence: one dead account no longer multiplies retries ---
 
   it("suppresses N-1 of N per-issue wakes on a shared dead account (was N runs → 1)", () => {
@@ -320,5 +456,40 @@ describe("classifyAccountFailureGate", () => {
     }
     expect(dispatched).toBe(1);
     expect(suppressed).toBe(N - 1);
+  });
+});
+
+describe("errorTextAssertsCredentialFailure", () => {
+  // Both sides of the bound are pinned with literal offsets taken from the
+  // measured fleet data, never from ACCOUNT_GATE_CREDENTIAL_ERROR_TEXT_MAX_CHARS
+  // itself. A fixture built from the constant moves with it, so widening or
+  // shrinking the bound would leave the test passing.
+  it("matches every genuine adapter error, which all sit at the front of the string", () => {
+    // Verbatim, with their real offsets: claude at 35, gemini at 0, and the
+    // longest genuine string on the fleet at 69 characters.
+    for (const errorText of [
+      "Claude run failed: subtype=success: Not logged in \u00b7 Please run /login",
+      "Claude run failed: subtype=success: Failed to authenticate: OAuth session expired and could not be refreshed",
+      "Authentication required. Please visit the URL to log in:",
+    ]) {
+      expect(errorTextAssertsCredentialFailure(errorText)).toBe(true);
+    }
+    // Margin: still matched a full 120 characters in, well past any genuine
+    // error, so the bound cannot be shrunk to the point of dropping real ones
+    // without failing here.
+    expect(errorTextAssertsCredentialFailure("x".repeat(120) + " authentication required")).toBe(true);
+  });
+
+  it("ignores wording that appears only deep inside a long narrative", () => {
+    // The residual false-positive shape: quoted output ~500 characters into a
+    // 1,616-character completion report.
+    expect(errorTextAssertsCredentialFailure("x".repeat(500) + " authentication required")).toBe(false);
+    expect(errorTextAssertsCredentialFailure("x".repeat(1200) + " not logged in")).toBe(false);
+  });
+
+  it("is case-insensitive and rejects non-strings", () => {
+    expect(errorTextAssertsCredentialFailure("FAILED TO AUTHENTICATE")).toBe(true);
+    expect(errorTextAssertsCredentialFailure(null)).toBe(false);
+    expect(errorTextAssertsCredentialFailure(undefined)).toBe(false);
   });
 });

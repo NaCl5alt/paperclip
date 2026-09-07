@@ -157,6 +157,8 @@ import {
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
   ACCOUNT_FAILURE_GATE_DEFAULT_MAX_FAILURE_AGE_MS,
+  ACCOUNT_GATE_CREDENTIAL_ERROR_TEXT_MAX_CHARS,
+  ACCOUNT_GATE_CREDENTIAL_ERROR_TEXT_PATTERN_SOURCE,
   ACCOUNT_GATE_INFORMATIVE_ERROR_CODES,
   classifyAccountFailureGate,
   deriveAccountKey,
@@ -10333,6 +10335,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           runId: heartbeatRuns.id,
           status: heartbeatRuns.status,
           errorCode: heartbeatRuns.errorCode,
+          // Arming corroborates the code against the run's own error text; see
+          // ACCOUNT_GATE_CREDENTIAL_ERROR_TEXT_PATTERN_SOURCE for why the code
+          // alone is 83.5% false on the live fleet.
+          errorText: heartbeatRuns.error,
           finishedAt: heartbeatRuns.finishedAt,
         })
         .from(heartbeatRuns)
@@ -10347,7 +10353,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // the auth failure that should gate the account is never read.
             or(
               eq(heartbeatRuns.status, "succeeded"),
-              inArray(heartbeatRuns.errorCode, [...ACCOUNT_GATE_INFORMATIVE_ERROR_CODES]),
+              and(
+                inArray(heartbeatRuns.errorCode, [...ACCOUNT_GATE_INFORMATIVE_ERROR_CODES]),
+                // Same corroboration the in-memory filter applies, so the rows
+                // this LIMIT window holds are the rows that can actually decide
+                // the gate. Without it the window fills with misclassified
+                // session-limit / DNS failures (66 of 79 over 90 days) and the
+                // deciding run is pushed out.
+                sql`left(coalesce(${heartbeatRuns.error}, ''), ${ACCOUNT_GATE_CREDENTIAL_ERROR_TEXT_MAX_CHARS}) ~* ${ACCOUNT_GATE_CREDENTIAL_ERROR_TEXT_PATTERN_SOURCE}`,
+              ),
             ),
           ),
         )

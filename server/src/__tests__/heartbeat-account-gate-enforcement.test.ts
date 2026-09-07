@@ -112,10 +112,14 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     return agentId;
   }
 
+  // `error` is required, not defaulted: arming corroborates the error code
+  // against the run's own error text (VANA-4067 B-II1), so a fixture that omits
+  // it would quietly stop exercising the gate. Making the compiler ask keeps
+  // every case in this file explicit about which text it is asserting on.
   async function recordTerminalRun(
     companyId: string,
     agentId: string,
-    opts: { status: string; errorCode: string | null; finishedAt: Date },
+    opts: { status: string; errorCode: string | null; error: string | null; finishedAt: Date },
   ) {
     const runId = randomUUID();
     await db.insert(heartbeatRuns).values({
@@ -127,6 +131,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
       startedAt: new Date(opts.finishedAt.getTime() - 1_000),
       finishedAt: opts.finishedAt,
       errorCode: opts.errorCode,
+      error: opts.error,
       createdAt: new Date(opts.finishedAt.getTime() - 1_000),
       updatedAt: opts.finishedAt,
     });
@@ -140,6 +145,11 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
 
   const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000);
 
+  // The terse string the claude-local adapter writes when the credential really
+  // is gone. Verbatim from the live fleet.
+  const AUTH_ERROR_TEXT =
+    "Claude run failed: subtype=success: Not logged in \u00b7 Please run /login";
+
   it("suppresses an automated wake to an agent sharing a dead account", async () => {
     const companyId = await seedCompany();
     const dead = await seedClaudeAgent(companyId, "Dead", "/tmp/acct-a");
@@ -147,6 +157,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     await recordTerminalRun(companyId, dead, {
       status: "failed",
       errorCode: "claude_auth_required",
+      error: AUTH_ERROR_TEXT,
       finishedAt: minutesAgo(5),
     });
 
@@ -168,6 +179,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     await recordTerminalRun(companyId, dead, {
       status: "failed",
       errorCode: "claude_auth_required",
+      error: AUTH_ERROR_TEXT,
       finishedAt: minutesAgo(5),
     });
 
@@ -186,6 +198,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     await recordTerminalRun(companyId, dead, {
       status: "failed",
       errorCode: "claude_auth_required",
+      error: AUTH_ERROR_TEXT,
       finishedAt: minutesAgo(5),
     });
 
@@ -206,6 +219,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     await recordTerminalRun(companyId, dead, {
       status: "failed",
       errorCode: "claude_auth_required",
+      error: AUTH_ERROR_TEXT,
       finishedAt: minutesAgo(10),
     });
 
@@ -219,6 +233,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     await recordTerminalRun(companyId, dead, {
       status: "succeeded",
       errorCode: null,
+      error: null,
       finishedAt: minutesAgo(1),
     });
 
@@ -236,6 +251,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     await recordTerminalRun(companyId, dead, {
       status: "failed",
       errorCode: "claude_auth_required",
+      error: AUTH_ERROR_TEXT,
       finishedAt: minutesAgo(10),
     });
     // Exactly what the co-shipped VANA-3914 failover produces: it reassigns the
@@ -246,6 +262,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     await recordTerminalRun(companyId, dead, {
       status: "cancelled",
       errorCode: "issue_assignee_changed",
+      error: `Claude run failed: subtype=success: issue_assignee_changed`,
       finishedAt: minutesAgo(1),
     });
 
@@ -263,6 +280,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     await recordTerminalRun(companyId, dead, {
       status: "failed",
       errorCode: "claude_auth_required",
+      error: AUTH_ERROR_TEXT,
       finishedAt: minutesAgo(30),
     });
     // This is the assertion the pure classifier cannot make. The classifier
@@ -275,6 +293,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
       await recordTerminalRun(companyId, dead, {
         status: "cancelled",
         errorCode: "issue_assignee_changed",
+        error: `Claude run failed: subtype=success: issue_assignee_changed`,
         finishedAt: minutesAgo(20 - i),
       });
     }
@@ -292,12 +311,14 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     await recordTerminalRun(companyId, dead, {
       status: "failed",
       errorCode: "claude_auth_required",
+      error: AUTH_ERROR_TEXT,
       finishedAt: minutesAgo(30),
     });
     for (let i = 0; i < 12; i += 1) {
       await recordTerminalRun(companyId, dead, {
         status: "cancelled",
         errorCode: "issue_assignee_changed",
+        error: `Claude run failed: subtype=success: issue_assignee_changed`,
         finishedAt: minutesAgo(20 - i),
       });
     }
@@ -312,6 +333,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     await recordTerminalRun(companyId, dead, {
       status: "succeeded",
       errorCode: null,
+      error: null,
       finishedAt: minutesAgo(1),
     });
     expect(
@@ -328,6 +350,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     await recordTerminalRun(companyId, dead, {
       status: "failed",
       errorCode: "claude_auth_required",
+      error: AUTH_ERROR_TEXT,
       finishedAt: minutesAgo(5),
     });
 
@@ -364,6 +387,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     await recordTerminalRun(companyId, contended, {
       status: "failed",
       errorCode: "shared_workspace_isolation_failed",
+      error: `Claude run failed: subtype=success: shared_workspace_isolation_failed`,
       finishedAt: minutesAgo(1),
     });
 
@@ -380,6 +404,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     await recordTerminalRun(companyId, dead, {
       status: "failed",
       errorCode: "claude_auth_required",
+      error: AUTH_ERROR_TEXT,
       finishedAt: minutesAgo(10),
     });
     // The interaction in the direction the specificity test above cannot see:
@@ -389,7 +414,81 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     await recordTerminalRun(companyId, dead, {
       status: "failed",
       errorCode: "shared_workspace_isolation_failed",
+      error: `Claude run failed: subtype=success: shared_workspace_isolation_failed`,
       finishedAt: minutesAgo(1),
+    });
+
+    const heartbeat = heartbeatService(db);
+    expect(
+      await heartbeat.wakeup(sibling, { source: "automation", triggerDetail: "issue_assigned" }),
+    ).toBeNull();
+  });
+  // --- the error code alone must not arm the gate (VANA-4067 B-II1) ---
+
+  it("does not suppress the account when an auth code is not corroborated by the run's own error", async () => {
+    const companyId = await seedCompany();
+    const dead = await seedClaudeAgent(companyId, "Misclassified", "/tmp/acct-a");
+    const sibling = await seedClaudeAgent(companyId, "Sibling", "/tmp/acct-a");
+    // Verbatim from the live fleet: a session-limit rejection stored as
+    // `claude_auth_required` because `detectClaudeLoginRequired()` scans the
+    // whole stream-json stdout, prompt echo included. 66 of the 79 runs carrying
+    // this code over 90 days are of this shape. Arming on the code alone would
+    // silence all 25 agents on the default account for up to the re-probe
+    // window, 41 times in 90 days.
+    await recordTerminalRun(companyId, dead, {
+      status: "failed",
+      errorCode: "claude_auth_required",
+      error: "Claude run failed: subtype=success: You've hit your session limit \u00b7 resets 6pm (Asia/Tokyo)",
+      finishedAt: minutesAgo(5),
+    });
+
+    const heartbeat = heartbeatService(db);
+    expect(
+      await heartbeat.wakeup(sibling, { source: "automation", triggerDetail: "issue_assigned" }),
+    ).not.toBeNull();
+  });
+
+  it("does not let an uncorroborated auth code bury the real failure that armed the gate", async () => {
+    const companyId = await seedCompany();
+    const dead = await seedClaudeAgent(companyId, "Dead", "/tmp/acct-a");
+    const sibling = await seedClaudeAgent(companyId, "Sibling", "/tmp/acct-a");
+    await recordTerminalRun(companyId, dead, {
+      status: "failed",
+      errorCode: "claude_auth_required",
+      error: AUTH_ERROR_TEXT,
+      finishedAt: minutesAgo(30),
+    });
+    // Enough misclassified rows to overrun the LIMIT window the fetch uses. They
+    // must be filtered out in SQL, not merely skipped in memory: if they reach
+    // the window they push the corroborated failure out of it and the gate goes
+    // quiet during a real outage. Skipping (not releasing) is what this asserts.
+    for (let i = 0; i < 8; i += 1) {
+      await recordTerminalRun(companyId, dead, {
+        status: "failed",
+        errorCode: "claude_auth_required",
+        error: "Claude run failed: subtype=success: API Error: Unable to connect to API (ENOTFOUND)",
+        finishedAt: minutesAgo(20 - i),
+      });
+    }
+
+    const heartbeat = heartbeatService(db);
+    expect(
+      await heartbeat.wakeup(sibling, { source: "automation", triggerDetail: "issue_assigned" }),
+    ).toBeNull();
+  });
+
+  it("still suppresses on the OAuth-expiry wording of the real 2026-09-05 outage", async () => {
+    const companyId = await seedCompany();
+    const dead = await seedClaudeAgent(companyId, "Dead", "/tmp/acct-a");
+    const sibling = await seedClaudeAgent(companyId, "Sibling", "/tmp/acct-a");
+    // All 2,088 runs of that outage carried this string. Narrowing the arming
+    // predicate must not cost the case the gate exists for.
+    await recordTerminalRun(companyId, dead, {
+      status: "failed",
+      errorCode: "claude_auth_required",
+      error:
+        "Claude run failed: subtype=success: Failed to authenticate: OAuth session expired and could not be refreshed",
+      finishedAt: minutesAgo(5),
     });
 
     const heartbeat = heartbeatService(db);
