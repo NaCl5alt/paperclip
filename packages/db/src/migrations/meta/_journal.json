@@ -722,6 +722,13 @@
       "when": 1780534600000,
       "tag": "0102_environment_lease_shared_cwd_single_writer",
       "breakpoints": true
+    },
+    {
+      "idx": 103,
+      "version": "7",
+      "when": 1780534700000,
+      "tag": "0103_shared_workspace_claims",
+      "breakpoints": true
     }
   ]
 }
