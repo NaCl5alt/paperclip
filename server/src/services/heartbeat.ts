@@ -110,6 +110,7 @@ import {
   acquireSharedWorkspaceWriter,
   buildIsolationBranchNames,
   SharedWorkspaceIsolationError,
+  SHARED_WORKSPACE_ISOLATION_FAILURE_CODE,
 } from "./shared-workspace-writer.js";
 import { issueService } from "./issues.js";
 import {
@@ -947,6 +948,23 @@ async function ensureManagedProjectWorkspace(input: {
 
 function isWorkspaceValidationFailure(error: unknown): error is WorkspaceValidationFailure {
   return error instanceof WorkspaceValidationFailure;
+}
+
+// Map a throw from the pre-execution setup phase onto the run's `error_code`.
+//
+// `heartbeat_runs.error_code` is what every downstream consumer classifies on
+// (continuation retry budget, adapter re-routing, the account failure gate, and
+// operational queries), and a thrown error's own `code` reaches it only if this
+// function recognises the class. Anything unrecognised is recorded as the
+// generic `adapter_failed`, which is not a neutral default: it is a member of
+// both the transient-infra retry set and the adapter-failure set, so an
+// unmapped failure silently acquires a 3x retry ladder and gets re-routed to a
+// different adapter. Add a case here whenever a setup-phase error class needs
+// to be distinguishable in the run record.
+function resolveSetupFailureErrorCode(error: unknown): string {
+  if (isWorkspaceValidationFailure(error)) return error.code;
+  if (error instanceof SharedWorkspaceIsolationError) return SHARED_WORKSPACE_ISOLATION_FAILURE_CODE;
+  return "adapter_failed";
 }
 
 function isWorkspaceValidationFailedRun(
@@ -9627,7 +9645,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await getCurrentUserRedactionOptions(),
       );
       const workspaceValidationFailure = isWorkspaceValidationFailure(err) ? err : null;
-      const failureErrorCode = workspaceValidationFailure?.code ?? "adapter_failed";
+      const failureErrorCode = resolveSetupFailureErrorCode(err);
       logger.error({ err, runId }, "heartbeat execution failed");
 
       let logSummary: { bytes: number; sha256?: string; compressed: boolean } | null = null;
@@ -9710,14 +9728,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // The inner catch did not fire, so we must record the failure here.
           const message = outerErr instanceof Error ? outerErr.message : "Unknown setup failure";
           logger.error({ err: outerErr, runId }, "heartbeat execution setup failed");
+          // The inner catch is bypassed entirely when the throw happens before
+          // adapter.execute, so the class-to-code mapping has to be applied here
+          // too; hardcoding `adapter_failed` here is what made every fail-close
+          // from workspace isolation indistinguishable from an adapter fault.
+          const setupFailureErrorCode = resolveSetupFailureErrorCode(outerErr);
           const setupFailureAgent = await getAgent(run.agentId).catch(() => null);
           await setRunStatus(runId, "failed", {
             error: message,
-            errorCode: "adapter_failed",
+            errorCode: setupFailureErrorCode,
             finishedAt: new Date(),
             ...(setupFailureAgent ? {
               resultJson: mergeRunStopMetadataForAgent(setupFailureAgent, "failed", {
-                errorCode: "adapter_failed",
+                errorCode: setupFailureErrorCode,
                 errorMessage: message,
               }),
             } : {}),

@@ -26,6 +26,7 @@ import {
   routines,
 } from "@paperclipai/db";
 import { AUTH_REQUIRED_ERROR_CODES } from "./account-failure-gate.js";
+import { SHARED_WORKSPACE_ISOLATION_FAILURE_CODE } from "../shared-workspace-writer.js";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { forbidden, notFound } from "../../errors.js";
@@ -171,6 +172,14 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "codex_transient_upstream",
   "claude_transient_upstream",
   "timeout",
+  // A shared checkout was contended and could not be isolated (VANA-4055).
+  // Contention is genuinely transient — the run holding the directory finishes
+  // and the next attempt either takes the claim or isolates cleanly — so the
+  // backed-off retry ladder is the right budget. What it must NOT be is a
+  // member of ADAPTER_FAILURE_ERROR_CODES below: nothing is wrong with the
+  // adapter, and re-routing the issue to a different one neither frees the
+  // directory nor is undone once it does free.
+  SHARED_WORKSPACE_ISOLATION_FAILURE_CODE,
 ]);
 
 const TRANSIENT_UPSTREAM_FAILOVER_ERROR_CODES = new Set<string>([
@@ -186,6 +195,20 @@ const ADAPTER_FAILURE_ERROR_CODES = new Set<string>([
   "adapter_failed",
   "gemini_auth_required",
 ]);
+
+/**
+ * Whether a run's error code means "the adapter itself is broken", which makes
+ * recovery re-route the issue to an owner on a *different* adapter.
+ *
+ * Exported so membership is directly assertable. The distinction is easy to get
+ * wrong by omission rather than by commission: a failure that has no code of
+ * its own is recorded as `adapter_failed` and therefore joins this set silently
+ * (see `resolveSetupFailureErrorCode` in heartbeat.ts), which is how a
+ * shared-checkout conflict came to be diagnosed as an adapter fault.
+ */
+export function isAdapterFailureErrorCode(errorCode: string | null | undefined): boolean {
+  return typeof errorCode === "string" && ADAPTER_FAILURE_ERROR_CODES.has(errorCode);
+}
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "agent_not_invokable",

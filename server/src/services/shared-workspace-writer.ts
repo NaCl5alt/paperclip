@@ -61,8 +61,21 @@ export function buildIsolationBranchNames(input: { label: string; runId: string 
   return names;
 }
 
+/**
+ * Run error code recorded when isolation was required but impossible.
+ *
+ * Exported because the code has to be recognised in three places that must not
+ * drift: the throw site (this module), the setup-failure handler that copies it
+ * onto `heartbeat_runs.error_code` (heartbeat.ts), and continuation
+ * classification (recovery/service.ts). Before it was propagated, a fail-close
+ * was recorded as the generic `adapter_failed`, which put shared-checkout
+ * contention into the adapter-failure class and re-routed the issue to a
+ * different adapter for what is a local directory conflict.
+ */
+export const SHARED_WORKSPACE_ISOLATION_FAILURE_CODE = "shared_workspace_isolation_failed";
+
 export class SharedWorkspaceIsolationError extends Error {
-  readonly code = "shared_workspace_isolation_failed";
+  readonly code = SHARED_WORKSPACE_ISOLATION_FAILURE_CODE;
   readonly contendedCwd: string;
   readonly owner: SharedWorkspaceClaimOwner | null;
   override readonly cause?: unknown;

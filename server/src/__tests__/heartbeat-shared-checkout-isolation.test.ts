@@ -90,6 +90,21 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
     return root;
   }
 
+  /**
+   * A shared checkout that is NOT a git repository.
+   *
+   * This is the fail-close configuration: the directory is still a shared
+   * checkout (`project_primary`, so a claim is taken on it), but there is no
+   * repo to cut an isolation worktree from, so `resolveExecutionWorktreeTarget`
+   * throws for every candidate and the contender has nowhere to move.
+   */
+  async function makeNonGitCheckout(): Promise<string> {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-nongit-checkout-"));
+    tempRoots.push(root);
+    await writeFile(path.join(root, "README.md"), "not a repo\n");
+    return root;
+  }
+
   async function seedProject(workspaceRoot: string) {
     const companyId = randomUUID();
     const projectId = randomUUID();
@@ -459,4 +474,66 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
     expect(cwds.every((cwd) => typeof cwd === "string" && cwd.length > 0)).toBe(true);
     expect(new Set(cwds).size).toBe(3);
   }, 90_000);
+  // ── fail-close path (VANA-4067 B-I2) ───────────────────────────────────────
+  //
+  // Every case above is a *successful* isolation. The branch that decides what
+  // happens when isolation is impossible had no end-to-end coverage at all,
+  // which is how the run record for a fail-close came to be indistinguishable
+  // from an adapter fault: `SharedWorkspaceIsolationError.code` existed but was
+  // never copied onto `heartbeat_runs.error_code`, so the throw landed on the
+  // hardcoded `adapter_failed` in the setup-failure handler.
+  //
+  // The code is not cosmetic. `adapter_failed` is a member of
+  // ADAPTER_FAILURE_ERROR_CODES, so recovery reads a local directory conflict
+  // as "this adapter is broken" and re-homes the issue onto a different
+  // adapter, which neither frees the directory nor is undone when it frees.
+
+  it("records a fail-closed isolation under its own error code, not adapter_failed", async () => {
+    const workspaceRoot = await makeNonGitCheckout();
+    const { companyId, projectId } = await seedProject(workspaceRoot);
+    const holderId = await seedAgent(companyId, "Holder", 4_000);
+    const contenderId = await seedAgent(companyId, "Contender", 0);
+
+    const heartbeat = heartbeatService(db);
+    const holderRun = await heartbeat.wakeup(holderId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      contextSnapshot: { projectId },
+    });
+    expect(holderRun).not.toBeNull();
+    // The contender must arrive while the checkout is genuinely held; without
+    // this the run would simply succeed and the assertions below would be
+    // asserting nothing.
+    expect(await waitForClaim(holderRun!.id)).toBe(true);
+
+    const contenderRun = await heartbeat.wakeup(contenderId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      contextSnapshot: { projectId },
+    });
+    expect(contenderRun).not.toBeNull();
+
+    const finishedContender = await waitForRun(heartbeat, contenderRun!.id);
+    await waitForRun(heartbeat, holderRun!.id);
+
+    // Fail-close: the run is failed rather than allowed to share the directory.
+    expect(finishedContender?.status).toBe("failed");
+    expect(finishedContender?.error).toContain("could not be isolated");
+    // The point of the test. Asserting the positive code alone would still pass
+    // if the code were merely renamed, so pin the wrong value out explicitly.
+    expect(finishedContender?.errorCode).toBe("shared_workspace_isolation_failed");
+    expect(finishedContender?.errorCode).not.toBe("adapter_failed");
+
+    // The stop metadata written alongside the run record has to agree, since
+    // that is the copy operational queries read.
+    const stopMetadata = (finishedContender?.resultJson ?? {}) as Record<string, unknown>;
+    expect(JSON.stringify(stopMetadata)).toContain("shared_workspace_isolation_failed");
+
+    // A fail-close must not leak the directory it could not use.
+    const stillActive = await db
+      .select()
+      .from(sharedWorkspaceClaims)
+      .where(eq(sharedWorkspaceClaims.status, "active"));
+    expect(stillActive.some((row) => row.heartbeatRunId === contenderRun!.id)).toBe(false);
+  }, 60_000);
 });

@@ -1,3 +1,5 @@
+import { SHARED_WORKSPACE_ISOLATION_FAILURE_CODE } from "./shared-workspace-writer.js";
+
 export type HeartbeatRunOutcome = "succeeded" | "failed" | "cancelled" | "timed_out";
 
 export type HeartbeatRunStopReason =
@@ -8,6 +10,7 @@ export type HeartbeatRunStopReason =
   | "paused"
   | "max_turns_exhausted"
   | "process_lost"
+  | "shared_workspace_isolation_failed"
   | "adapter_failed";
 
 export interface HeartbeatRunTimeoutPolicy {
@@ -87,6 +90,16 @@ export function inferHeartbeatRunStopReason(input: {
   if (maxTurnStopReason) return maxTurnStopReason;
   if (input.outcome === "timed_out") return "timeout";
   if (input.outcome === "failed" && input.errorCode === "process_lost") return "process_lost";
+  // A shared checkout was contended and could not be isolated. Distinguished
+  // from the `adapter_failed` catch-all below because nothing is wrong with the
+  // adapter; folding it in there made a local directory conflict read as an
+  // execution-system fault on every operator-facing surface.
+  if (
+    input.outcome === "failed" &&
+    input.errorCode === SHARED_WORKSPACE_ISOLATION_FAILURE_CODE
+  ) {
+    return SHARED_WORKSPACE_ISOLATION_FAILURE_CODE;
+  }
   if (input.outcome === "cancelled") {
     const message = (input.errorMessage ?? "").toLowerCase();
     if (message.includes("budget")) return "budget_paused";
