@@ -10109,9 +10109,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // a confirmed auth-failure state, from the account's recent terminal runs.
   // Read-only and fail-open: any error, or an account whose credential scope
   // cannot be determined, yields null so the gate can only ever suppress an
-  // automated wake, never manufacture a new outage. The account auto-releases
-  // the instant a newer successful run is observed on any agent that shares it
-  // (classifyAccountFailureGate keys on the most-recent terminal outcome).
+  // automated wake, never manufacture a new outage.
+  //
+  // Release is by observed recovery, not by time: classifyAccountFailureGate
+  // keys on the account's most-recent terminal outcome, so a newer success (or
+  // any non-auth terminal outcome) clears the gate. User-initiated wakes bypass
+  // the gate entirely, so an operator poke that succeeds releases it at once. A
+  // fully-automated account with no user traffic re-probes only after the
+  // failure ages past the re-probe window (worst-case recovery latency), which
+  // is the sole time dependency and never *confirms* recovery on its own.
   async function getActiveAccountFailureGate(
     agent: typeof agents.$inferSelect,
   ): Promise<AccountFailureGate | null> {
@@ -10160,7 +10166,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         )
         .orderBy(desc(heartbeatRuns.finishedAt))
-        .limit(50);
+        // Only the account's most-recent terminal outcome governs the gate; a
+        // small margin above 1 tolerates finishedAt ties without over-fetching.
+        .limit(5);
 
       return classifyAccountFailureGate(accountKey, recentRuns);
     } catch {

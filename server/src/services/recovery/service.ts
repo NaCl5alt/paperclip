@@ -25,6 +25,7 @@ import {
   issues,
   routines,
 } from "@paperclipai/db";
+import { AUTH_REQUIRED_ERROR_CODES } from "./account-failure-gate.js";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { forbidden, notFound } from "../../errors.js";
@@ -198,10 +199,10 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   // per-issue continuation retry only burns a run and re-emits the same code.
   // Treat them as non-retryable so the issue escalates straight to `blocked`;
   // the account-level gate (account-failure-gate.ts) additionally stops the
-  // failure from fanning out across every issue that shares the account.
-  "claude_auth_required",
-  "acpx_auth_required",
-  "gemini_auth_required",
+  // failure from fanning out across every issue that shares the account. The
+  // code set is shared with that gate so a newly added adapter auth code cannot
+  // drift between the two call sites.
+  ...AUTH_REQUIRED_ERROR_CODES,
 ]);
 
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
