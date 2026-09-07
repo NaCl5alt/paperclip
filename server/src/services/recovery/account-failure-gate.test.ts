@@ -46,6 +46,42 @@ describe("deriveAccountKey", () => {
     expect(deriveAccountKey("", {})).toBeNull();
   });
 
+  // Regression (VANA-4064): the live fleet stores CLAUDE_CONFIG_DIR as the
+  // `{ type: "plain", value }` binding record, not a bare string. Reading only
+  // the bare-string form made 19 of 44 claude agents — three distinct accounts
+  // (~/.claude, ~/.claude_revorn, ~/.claude_nishika) — resolve to the single
+  // default sentinel, so one account's auth break gated the whole fleet and no
+  // single account could stay gated once any other account ran successfully.
+  it("reads a plain env binding record, not only a bare string", () => {
+    expect(
+      deriveAccountKey("claude_local", {
+        CLAUDE_CONFIG_DIR: { type: "plain", value: "/home/u/.claude_revorn" },
+      }),
+    ).toBe("claude:/home/u/.claude_revorn");
+  });
+
+  it("does not collapse record-shaped config dirs onto the default account", () => {
+    const revorn = deriveAccountKey("claude_local", {
+      CLAUDE_CONFIG_DIR: { type: "plain", value: "/home/u/.claude_revorn" },
+    });
+    const nishika = deriveAccountKey("claude_local", {
+      CLAUDE_CONFIG_DIR: { type: "plain", value: "/home/u/.claude_nishika" },
+    });
+    const dflt = deriveAccountKey("claude_local", {});
+    expect(new Set([revorn, nishika, dflt]).size).toBe(3);
+  });
+
+  it("fails open on a binding it cannot resolve instead of assuming the default account", () => {
+    // A secret-backed config dir is a real account whose identity is unknown
+    // here; folding it into `__default__` would gate unrelated agents.
+    expect(
+      deriveAccountKey("claude_local", {
+        CLAUDE_CONFIG_DIR: { type: "secret", secretId: "s1" },
+      }),
+    ).toBeNull();
+    expect(deriveAccountKey("claude_local", { CLAUDE_CONFIG_DIR: 12 })).toBeNull();
+  });
+
   it("resolves acpx and gemini families", () => {
     expect(deriveAccountKey("acpx-local", { ACPX_CONFIG_DIR: "/x" })).toBe("acpx:/x");
     expect(deriveAccountKey("gemini-local", {})).toBe("gemini:__default__");

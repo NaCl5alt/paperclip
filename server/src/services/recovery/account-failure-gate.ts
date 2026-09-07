@@ -56,10 +56,41 @@ function normalizeAdapterType(adapterType: string | null | undefined): string | 
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function readEnvString(env: unknown, key: string): string | null {
-  if (!env || typeof env !== "object") return null;
+// Reading an agent env binding. Bindings are stored either as a bare string or
+// as the `{ type: "plain", value }` record the rest of the server uses (see
+// `assertLowTrustEnvConfigAllowed` in heartbeat.ts); on the live fleet 19 of 44
+// claude agents use the record form, so treating only the bare-string form as
+// "present" silently collapsed every one of them onto the default-account
+// sentinel and merged three distinct credential scopes into one key.
+// The three outcomes are deliberately distinct:
+//   * `{ kind: "absent" }`   — no binding: the adapter's default account.
+//   * `{ kind: "value" }`    — a readable plain binding: that account.
+//   * `{ kind: "opaque" }`   — present but not resolvable here (e.g. a secret
+//     reference). The account is real but unknown, so the caller must fail open
+//     rather than fold it into the default account.
+type EnvBindingRead =
+  | { kind: "absent" }
+  | { kind: "value"; value: string }
+  | { kind: "opaque" };
+
+function readEnvBinding(env: unknown, key: string): EnvBindingRead {
+  if (!env || typeof env !== "object") return { kind: "absent" };
+  if (!(key in (env as Record<string, unknown>))) return { kind: "absent" };
   const value = (env as Record<string, unknown>)[key];
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+  if (value === null || value === undefined) return { kind: "absent" };
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? { kind: "value", value: trimmed } : { kind: "absent" };
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if (record.type === "plain" && typeof record.value === "string") {
+      const trimmed = record.value.trim();
+      return trimmed.length > 0 ? { kind: "value", value: trimmed } : { kind: "absent" };
+    }
+    return { kind: "opaque" };
+  }
+  return { kind: "opaque" };
 }
 
 // Stable key identifying the credential scope an agent runs under. Agents that
@@ -76,7 +107,11 @@ export function deriveAccountKey(
   );
   if (!match) return null;
   const [prefix, envKey] = match;
-  const configDir = readEnvString(env, envKey) ?? DEFAULT_ACCOUNT_SENTINEL;
+  const binding = readEnvBinding(env, envKey);
+  // An unresolvable binding names a real but unidentifiable account; returning
+  // null keeps the gate fail-open instead of merging it into the default one.
+  if (binding.kind === "opaque") return null;
+  const configDir = binding.kind === "value" ? binding.value : DEFAULT_ACCOUNT_SENTINEL;
   return `${prefix}:${configDir}`;
 }
 
