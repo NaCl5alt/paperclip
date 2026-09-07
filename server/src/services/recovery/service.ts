@@ -193,6 +193,15 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "budget_exhausted",
   "issue_paused",
   "issue_dependencies_blocked",
+  // Deterministic credential failures (VANA-4048 / VANA-4041): an expired or
+  // absent credential does not heal by retrying on the same account, so a
+  // per-issue continuation retry only burns a run and re-emits the same code.
+  // Treat them as non-retryable so the issue escalates straight to `blocked`;
+  // the account-level gate (account-failure-gate.ts) additionally stops the
+  // failure from fanning out across every issue that shares the account.
+  "claude_auth_required",
+  "acpx_auth_required",
+  "gemini_auth_required",
 ]);
 
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
@@ -220,7 +229,7 @@ type ContinuationRetryClassification = {
   errorCode: string | null;
 };
 
-function classifyContinuationFailure(latestRun: LatestIssueRun): ContinuationRetryClassification {
+export function classifyContinuationFailure(latestRun: LatestIssueRun): ContinuationRetryClassification {
   const errorCode = readNonEmptyString(latestRun?.errorCode);
   if (errorCode && NON_RETRYABLE_CONTINUATION_ERROR_CODES.has(errorCode)) {
     return { kind: "non_retryable", maxAttempts: 0, baseBackoffMs: 0, errorCode };
