@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { agents, companies, createDb, environmentLeases, environments, heartbeatRuns } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -107,6 +107,107 @@ describeEmbeddedPostgres("environmentService leases", () => {
 
     expect(released?.status).toBe("released");
     expect(released?.releasedAt).not.toBeNull();
+  });
+
+  // --- VANA-4049: shared-checkout single-writer mechanism -------------------
+  // Reproduces the shared-workspace concurrency defect (VANA-3258): two runs
+  // whose realized workspace resolves to the SAME on-disk cwd must not both
+  // become writers. Removing migration 0102's partial unique index (or the
+  // isUniqueViolation catch in claimSharedWorkspaceForLease) makes this go RED
+  // because both concurrent claims succeed.
+  async function seedSecondRun(companyId: string, agentId: string) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "manual",
+      status: "running",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return runId;
+  }
+
+  it("lets only one concurrent active lease claim a shared checkout cwd", async () => {
+    const { companyId, agentId, environmentId, runId } = await seedEnvironment();
+    const otherRunId = await seedSecondRun(companyId, agentId);
+
+    const leaseA = await svc.acquireLease({ companyId, environmentId, heartbeatRunId: runId });
+    const leaseB = await svc.acquireLease({ companyId, environmentId, heartbeatRunId: otherRunId });
+
+    const sharedCwd = "/tmp/paperclip-shared-checkout/acme";
+    const [claimA, claimB] = await Promise.all([
+      svc.claimSharedWorkspaceForLease({ companyId, leaseId: leaseA.id, cwd: sharedCwd }),
+      svc.claimSharedWorkspaceForLease({ companyId, leaseId: leaseB.id, cwd: sharedCwd }),
+    ]);
+
+    const claims = [claimA, claimB];
+    const winners = claims.filter((c) => c.claimed);
+    const losers = claims.filter((c) => !c.claimed);
+    expect(winners).toHaveLength(1);
+    expect(losers).toHaveLength(1);
+    // The loser is told which lease owns the checkout so the caller can isolate
+    // into its own workspace (preferred) or fail-close.
+    expect(losers[0]!.ownerLeaseId).toBe(winners[0]!.ownerLeaseId);
+
+    // DB ground truth: exactly one active lease physically holds the cwd.
+    const holders = await db
+      .select({ id: environmentLeases.id })
+      .from(environmentLeases)
+      .where(
+        and(
+          eq(environmentLeases.sharedWorkspaceCwd, sharedCwd),
+          eq(environmentLeases.status, "active"),
+        ),
+      );
+    expect(holders).toHaveLength(1);
+    expect(holders[0]!.id).toBe(winners[0]!.ownerLeaseId);
+  });
+
+  it("normalizes cwd so trailing-slash variants collide on the same writer", async () => {
+    const { companyId, agentId, environmentId, runId } = await seedEnvironment();
+    const otherRunId = await seedSecondRun(companyId, agentId);
+
+    const leaseA = await svc.acquireLease({ companyId, environmentId, heartbeatRunId: runId });
+    const leaseB = await svc.acquireLease({ companyId, environmentId, heartbeatRunId: otherRunId });
+
+    const first = await svc.claimSharedWorkspaceForLease({
+      companyId,
+      leaseId: leaseA.id,
+      cwd: "/tmp/paperclip-shared-checkout/acme",
+    });
+    const second = await svc.claimSharedWorkspaceForLease({
+      companyId,
+      leaseId: leaseB.id,
+      cwd: "/tmp/paperclip-shared-checkout/acme/",
+    });
+
+    expect(first.claimed).toBe(true);
+    expect(second.claimed).toBe(false);
+    expect(second.ownerLeaseId).toBe(leaseA.id);
+  });
+
+  it("frees the checkout for the next run once the owning lease is released", async () => {
+    const { companyId, agentId, environmentId, runId } = await seedEnvironment();
+    const otherRunId = await seedSecondRun(companyId, agentId);
+
+    const leaseA = await svc.acquireLease({ companyId, environmentId, heartbeatRunId: runId });
+    const sharedCwd = "/tmp/paperclip-shared-checkout/acme";
+    const claimA = await svc.claimSharedWorkspaceForLease({ companyId, leaseId: leaseA.id, cwd: sharedCwd });
+    expect(claimA.claimed).toBe(true);
+
+    // While A holds it, B cannot claim.
+    const leaseB = await svc.acquireLease({ companyId, environmentId, heartbeatRunId: otherRunId });
+    const blocked = await svc.claimSharedWorkspaceForLease({ companyId, leaseId: leaseB.id, cwd: sharedCwd });
+    expect(blocked.claimed).toBe(false);
+
+    // Releasing A drops the active writer; the write-exclusion is release-bound
+    // (unlike execution_workspaces.status), so B may now claim it.
+    await svc.releaseLease(leaseA.id);
+    const afterRelease = await svc.claimSharedWorkspaceForLease({ companyId, leaseId: leaseB.id, cwd: sharedCwd });
+    expect(afterRelease.claimed).toBe(true);
+    expect(afterRelease.ownerLeaseId).toBe(leaseB.id);
   });
 
   it("releases all active leases for a run without touching unrelated rows", async () => {
