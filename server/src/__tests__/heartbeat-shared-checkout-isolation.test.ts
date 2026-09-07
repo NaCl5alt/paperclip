@@ -91,12 +91,35 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
   }
 
   /**
+   * A git checkout whose isolation worktrees cannot be created.
+   *
+   * The run-scoped final isolation candidate makes git isolation succeed for any
+   * realistic contention, so the only way a *git* checkout fails closed e2e is a
+   * genuine worktree-creation error. Planting a regular file at the worktree
+   * parent (`.paperclip`) makes `fs.mkdir(.paperclip/worktrees)` throw ENOTDIR
+   * for every candidate, while the directory stays a real git repo — so
+   * `isCheckoutGitManaged` is true, fail-open is not taken, and the contender
+   * fails closed. This preserves the VANA-4067 B-I2 coverage (the isolation
+   * failure is recorded under its own error code, not `adapter_failed`) now that
+   * the non-git fixture fails open instead.
+   */
+  async function makeGitCheckoutWithBlockedWorktrees(): Promise<string> {
+    const root = await makeGitCheckout();
+    await writeFile(path.join(root, ".paperclip"), "not a directory\n");
+    return root;
+  }
+
+  /**
    * A shared checkout that is NOT a git repository.
    *
-   * This is the fail-close configuration: the directory is still a shared
-   * checkout (`project_primary`, so a claim is taken on it), but there is no
-   * repo to cut an isolation worktree from, so `resolveExecutionWorktreeTarget`
-   * throws for every candidate and the contender has nowhere to move.
+   * This is production's dominant shape (agent home directories, plain project
+   * workspaces). The directory is still a shared checkout (`project_primary`, so
+   * a claim is taken on it), but there is no repo to cut an isolation worktree
+   * from. VANA-4071: contention here must **fail open** (share the directory)
+   * rather than drop the run — there is no concurrent-git failure mode to
+   * protect against. Before the fix, `resolveExecutionWorktreeTarget` threw for
+   * every candidate and the contender was failed, which is what regressed the
+   * 2026-09-07 rollout.
    */
   async function makeNonGitCheckout(): Promise<string> {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-nongit-checkout-"));
@@ -474,21 +497,21 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
     expect(cwds.every((cwd) => typeof cwd === "string" && cwd.length > 0)).toBe(true);
     expect(new Set(cwds).size).toBe(3);
   }, 90_000);
-  // ── fail-close path (VANA-4067 B-I2) ───────────────────────────────────────
+  // ── non-git fail-open path (VANA-4071) ──────────────────────────────────────
   //
-  // Every case above is a *successful* isolation. The branch that decides what
-  // happens when isolation is impossible had no end-to-end coverage at all,
-  // which is how the run record for a fail-close came to be indistinguishable
-  // from an adapter fault: `SharedWorkspaceIsolationError.code` existed but was
-  // never copied onto `heartbeat_runs.error_code`, so the throw landed on the
-  // hardcoded `adapter_failed` in the setup-failure handler.
+  // The 2026-09-07 rollout of git-only fail-close regressed because the fixtures
+  // above are all `makeGitCheckout()`: in that world the isolation worktree can
+  // always be created, so the fail-close branch never fires. Production's
+  // dominant workspace shape is a *non-git* directory (agent home, plain project
+  // workspace), where no worktree can be cut. Fail-close there dropped routine
+  // same-agent overlap on startup — 7 runs across 3 agents in 10 minutes.
   //
-  // The code is not cosmetic. `adapter_failed` is a member of
-  // ADAPTER_FAILURE_ERROR_CODES, so recovery reads a local directory conflict
-  // as "this adapter is broken" and re-homes the issue onto a different
-  // adapter, which neither frees the directory nor is undone when it frees.
+  // The invariant this pins: a non-git shared checkout, when contended, is
+  // *shared* (fail-open) and the run completes. There is nothing to isolate and
+  // no concurrent-git index to corrupt, so sharing is the correct — and
+  // pre-VANA-4055 — behaviour.
 
-  it("records a fail-closed isolation under its own error code, not adapter_failed", async () => {
+  it("shares a contended non-git checkout instead of dropping the run (fail-open)", async () => {
     const workspaceRoot = await makeNonGitCheckout();
     const { companyId, projectId } = await seedProject(workspaceRoot);
     const holderId = await seedAgent(companyId, "Holder", 4_000);
@@ -501,9 +524,66 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
       contextSnapshot: { projectId },
     });
     expect(holderRun).not.toBeNull();
-    // The contender must arrive while the checkout is genuinely held; without
-    // this the run would simply succeed and the assertions below would be
-    // asserting nothing.
+    // The contender must arrive while the checkout is genuinely held, or it would
+    // simply take the checkout uncontended and this would assert nothing about
+    // the contention path.
+    expect(await waitForClaim(holderRun!.id)).toBe(true);
+
+    const contenderRun = await heartbeat.wakeup(contenderId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      contextSnapshot: { projectId },
+    });
+    expect(contenderRun).not.toBeNull();
+
+    const finishedContender = await waitForRun(heartbeat, contenderRun!.id);
+    const finishedHolder = await waitForRun(heartbeat, holderRun!.id);
+
+    // Fail-open: the run runs to completion on the shared directory rather than
+    // being dropped. This is the exact regression VANA-4071 fixes.
+    expect(finishedContender?.status).toBe("succeeded");
+    expect(finishedHolder?.status).toBe("succeeded");
+    // It must NOT be recorded as an isolation failure — that error code is what
+    // the re-deploy monitor watches, and a non-git share must never emit it.
+    expect(finishedContender?.errorCode).not.toBe("shared_workspace_isolation_failed");
+    expect(finishedContender?.error ?? "").not.toContain("could not be isolated");
+    const stopMetadata = (finishedContender?.resultJson ?? {}) as Record<string, unknown>;
+    expect(JSON.stringify(stopMetadata)).not.toContain("shared_workspace_isolation_failed");
+
+    // The contender shared the checkout rather than isolating into a worktree.
+    const contenderShared = sharedWorkspaceContext(finishedContender?.contextSnapshot);
+    expect(contenderShared?.mode).toBe("shared");
+
+    // Fail-open takes no claim of its own, so once both runs end nothing is left
+    // held.
+    const stillActive = await db
+      .select()
+      .from(sharedWorkspaceClaims)
+      .where(eq(sharedWorkspaceClaims.status, "active"));
+    expect(stillActive).toHaveLength(0);
+  }, 60_000);
+
+  // ── git fail-close path (VANA-4067 B-I2, preserved under VANA-4071) ─────────
+  //
+  // Fail-open only applies to non-git checkouts. A *git* checkout whose
+  // isolation is genuinely impossible must still fail closed, and the run record
+  // must carry the isolation error code rather than the generic `adapter_failed`
+  // (a member of ADAPTER_FAILURE_ERROR_CODES, which would make recovery re-home
+  // the issue onto a different adapter for a local directory conflict).
+
+  it("records a git isolation failure under its own error code, not adapter_failed", async () => {
+    const workspaceRoot = await makeGitCheckoutWithBlockedWorktrees();
+    const { companyId, projectId } = await seedProject(workspaceRoot);
+    const holderId = await seedAgent(companyId, "Holder", 4_000);
+    const contenderId = await seedAgent(companyId, "Contender", 0);
+
+    const heartbeat = heartbeatService(db);
+    const holderRun = await heartbeat.wakeup(holderId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      contextSnapshot: { projectId },
+    });
+    expect(holderRun).not.toBeNull();
     expect(await waitForClaim(holderRun!.id)).toBe(true);
 
     const contenderRun = await heartbeat.wakeup(contenderId, {
@@ -516,16 +596,15 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
     const finishedContender = await waitForRun(heartbeat, contenderRun!.id);
     await waitForRun(heartbeat, holderRun!.id);
 
-    // Fail-close: the run is failed rather than allowed to share the directory.
+    // Fail-close: the git checkout is held and no worktree can be cut, so the run
+    // is failed rather than allowed to share it.
     expect(finishedContender?.status).toBe("failed");
     expect(finishedContender?.error).toContain("could not be isolated");
-    // The point of the test. Asserting the positive code alone would still pass
-    // if the code were merely renamed, so pin the wrong value out explicitly.
+    // Asserting the positive code alone would still pass if it were renamed, so
+    // pin the wrong value out explicitly.
     expect(finishedContender?.errorCode).toBe("shared_workspace_isolation_failed");
     expect(finishedContender?.errorCode).not.toBe("adapter_failed");
 
-    // The stop metadata written alongside the run record has to agree, since
-    // that is the copy operational queries read.
     const stopMetadata = (finishedContender?.resultJson ?? {}) as Record<string, unknown>;
     expect(JSON.stringify(stopMetadata)).toContain("shared_workspace_isolation_failed");
 

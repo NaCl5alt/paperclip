@@ -20,9 +20,22 @@ import type {
  * isolation is impossible: sharing the directory anyway risks losing a
  * concurrent run's work and, on client checkouts, mixing NDA-separated code into
  * one commit — strictly worse than failing the run.
+ *
+ * VANA-4071: the enforcement above only makes sense for **git-managed** shared
+ * checkouts. A non-git shared workspace (the agent home directory, a plain
+ * project workspace) cannot be moved into a git worktree — there is no repo to
+ * cut one from — and it has no concurrent-git-index failure mode to protect
+ * against in the first place. The whole failure this module prevents (two live
+ * writers committing over each other) is git-specific. So for a non-git
+ * contended checkout the run fails **open**: it shares the directory, exactly as
+ * every run did before VANA-4055 added enforcement. Fail-close stays the rule
+ * for git checkouts where isolation is genuinely impossible. This is why the
+ * 2026-09-07 rollout of the git-only fail-close regressed: in production most
+ * shared workspaces are not git repositories, so fail-close was the main path,
+ * not the exception, and routine same-agent overlap dropped runs on startup.
  */
 
-export type SharedWorkspaceWriterMode = "exclusive" | "isolated";
+export type SharedWorkspaceWriterMode = "exclusive" | "isolated" | "shared";
 
 /**
  * How many stable (reusable) isolation slots precede the run-scoped fallback.
@@ -151,6 +164,25 @@ export type SharedWorkspaceWriterInput = {
   realizeIsolated: (attempt: number) => Promise<RealizedExecutionWorkspace>;
   /** How many isolation candidates the two callbacks above can produce. */
   isolationAttempts: number;
+  /**
+   * Whether the contended checkout is a git repository (VANA-4071).
+   *
+   * Isolation-or-fail-close only applies to git-managed checkouts: a non-git
+   * shared directory cannot be moved into a worktree and has no concurrent-git
+   * failure mode to protect against, so on contention it is shared (fail-open)
+   * rather than failed. Optional so existing call sites keep the fail-close
+   * behaviour by default; absence is read as "assume git-managed", which never
+   * fails a run open by accident. Production wires this to `isGitCheckout`
+   * (a `git rev-parse --git-dir`), which resolves any directory that is not
+   * positively a git checkout — including one that cannot be read — as non-git,
+   * i.e. shared. That is deliberate: after the 2026-09-07 fail-close regression,
+   * the safe default for this fleet is to share rather than drop a run, and a
+   * directory that does not resolve as git has no git index to corrupt. If the
+   * callback itself throws (as opposed to returning false), the `.catch` below
+   * treats that as git-managed and fails closed; the wired `isGitCheckout` never
+   * throws, so the effective rule is "share unless positively git-managed".
+   */
+  isCheckoutGitManaged?: (cwd: string) => Promise<boolean>;
   logger?: { warn: (obj: unknown, msg: string) => void; info?: (obj: unknown, msg: string) => void };
 };
 
@@ -173,7 +205,43 @@ export async function acquireSharedWorkspaceWriter(
   async function isolate(
     contendedCwd: string,
     owner: SharedWorkspaceClaimOwner | null,
+    alreadyRealized?: RealizedExecutionWorkspace,
   ): Promise<SharedWorkspaceWriterResult> {
+    // VANA-4071 fail-open: a non-git contended checkout cannot be isolated into a
+    // worktree and has no concurrent-git failure mode, so share it rather than
+    // fail the run. Default to git-managed when the callback is absent or errors,
+    // which keeps the fail-close path for anything we cannot positively confirm
+    // is non-git. `realizeConfigured` is only reached on the shared-checkout path
+    // (where it has not run yet); the git_worktree path passes its already
+    // realized workspace, but that path is always git so this branch is unreached.
+    const contendedIsGitManaged = input.isCheckoutGitManaged
+      ? await input.isCheckoutGitManaged(contendedCwd).catch(() => true)
+      : true;
+    if (!contendedIsGitManaged) {
+      const workspace = alreadyRealized ?? (await input.realizeConfigured());
+      warnings.push(
+        `Another live run holds the non-git shared checkout ${contendedCwd}; sharing it because it cannot be isolated into a worktree and has no concurrent-git failure mode.`,
+      );
+      input.logger?.info?.(
+        {
+          heartbeatRunId: input.heartbeatRunId,
+          issueId: input.issueId,
+          contendedCwd,
+          ownerRunId: owner?.heartbeatRunId ?? null,
+        },
+        "Non-git shared checkout contended; sharing it (fail-open)",
+      );
+      return {
+        workspace,
+        mode: "shared",
+        claimedBeforeCheckout: false,
+        claimKey: null,
+        claimedCwd: null,
+        contention: null,
+        warnings,
+      };
+    }
+
     let lastOwner = owner;
     let lastError: unknown = null;
     for (let attempt = 0; attempt < input.isolationAttempts; attempt += 1) {
@@ -343,8 +411,11 @@ export async function acquireSharedWorkspaceWriter(
   const realizedClaim = await claimFor(realized);
   if (!realizedClaim.claimed) {
     // Two runs resolved to the same worktree (e.g. concurrent runs of one issue,
-    // which render the same branch name). Same hazard, same remedy.
-    return await isolate(realized.cwd, realizedClaim.owner);
+    // which render the same branch name). Same hazard, same remedy. This path is
+    // reached only for git_worktree runs, so the fail-open branch inside
+    // `isolate` never fires; the realized workspace is passed so that, if it
+    // ever did, it would reuse this checkout instead of realizing a second time.
+    return await isolate(realized.cwd, realizedClaim.owner, workspace);
   }
   return {
     workspace,

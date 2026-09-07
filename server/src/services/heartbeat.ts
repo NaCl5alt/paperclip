@@ -96,6 +96,7 @@ import {
   ensurePersistedExecutionWorkspaceAvailable,
   ensureRuntimeServicesForRun,
   persistAdapterManagedRuntimeServices,
+  isGitCheckout,
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
   resolveExecutionWorktreeTarget,
@@ -8612,6 +8613,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       resolveIsolationCandidateCwd,
       realizeIsolated: realizeIsolatedExecutionWorkspace,
       isolationAttempts: isolationBranchNames.length,
+      // VANA-4071: enforce isolation-or-fail-close only for git-managed
+      // checkouts. A non-git shared workspace has no worktree to isolate into
+      // and no concurrent-git failure mode, so contention shares it (fail-open)
+      // rather than dropping the run — which is what regressed on 2026-09-07.
+      isCheckoutGitManaged: (cwd) => isGitCheckout(cwd),
       logger,
     }).catch((error: unknown) => {
       if (error instanceof SharedWorkspaceIsolationError) {

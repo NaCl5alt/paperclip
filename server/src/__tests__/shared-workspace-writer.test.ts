@@ -192,7 +192,8 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       companyId, agentId, heartbeatRunId: runIds[0]!,
     });
 
-    // Non-git checkout / worktree creation failure. Sharing anyway would let two
+    // A git checkout whose worktree creation fails (default `isCheckoutGitManaged`
+    // is git-managed, so fail-open is not taken). Sharing anyway would let two
     // live runs commit over each other, so the run is failed instead.
     await expect(acquireSharedWorkspaceWriter({
       claims, companyId, agentId, heartbeatRunId: runIds[1]!, issueId: null,
@@ -210,6 +211,68 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       .where(eq(sharedWorkspaceClaims.status, "active"));
     expect(active).toHaveLength(1);
     expect(active[0]?.heartbeatRunId).toBe(runIds[0]);
+  });
+
+  it("shares a non-git contended checkout instead of failing (fail-open)", async () => {
+    // VANA-4071: a non-git shared directory cannot be moved into a worktree and
+    // has no concurrent-git failure mode, so contention shares it rather than
+    // dropping the run. Isolation must not even be attempted.
+    const { companyId, agentId, runIds } = await seed(2);
+    const shared = await makeDir("shared");
+    await claims.claim({
+      identity: await claims.resolveIdentity(shared),
+      companyId, agentId, heartbeatRunId: runIds[0]!,
+    });
+
+    let isolateAttempts = 0;
+    const result = await acquireSharedWorkspaceWriter({
+      claims, companyId, agentId, heartbeatRunId: runIds[1]!, issueId: null,
+      expectSharedCheckout: true,
+      predictedCwd: shared,
+      realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      resolveIsolationCandidateCwd: async () => { isolateAttempts += 1; throw new Error("must not isolate a non-git checkout"); },
+      realizeIsolated: async () => { isolateAttempts += 1; throw new Error("must not isolate a non-git checkout"); },
+      isolationAttempts: 1,
+      isCheckoutGitManaged: async () => false,
+    });
+
+    expect(result.mode).toBe("shared");
+    expect(result.workspace.cwd).toBe(shared);
+    expect(result.contention).toBeNull();
+    expect(result.claimedCwd).toBeNull();
+    expect(isolateAttempts).toBe(0);
+    expect(result.warnings.join(" ")).toContain(shared);
+
+    // Fail-open takes no claim of its own: only the incumbent holds one.
+    const active = await db
+      .select()
+      .from(sharedWorkspaceClaims)
+      .where(eq(sharedWorkspaceClaims.status, "active"));
+    expect(active).toHaveLength(1);
+    expect(active[0]?.heartbeatRunId).toBe(runIds[0]);
+  });
+
+  it("fails closed when the git-managed check itself errors", async () => {
+    // A callback that throws must not be read as "non-git" — that would fail a
+    // run open on an unreadable directory. The safe default is git-managed, so
+    // an impossible isolation still fails closed.
+    const { companyId, agentId, runIds } = await seed(2);
+    const shared = await makeDir("shared");
+    await claims.claim({
+      identity: await claims.resolveIdentity(shared),
+      companyId, agentId, heartbeatRunId: runIds[0]!,
+    });
+
+    await expect(acquireSharedWorkspaceWriter({
+      claims, companyId, agentId, heartbeatRunId: runIds[1]!, issueId: null,
+      expectSharedCheckout: true,
+      predictedCwd: shared,
+      realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      resolveIsolationCandidateCwd: async () => { throw new Error("not a git checkout"); },
+      realizeIsolated: async () => { throw new Error("not a git checkout"); },
+      isolationAttempts: 1,
+      isCheckoutGitManaged: async () => { throw new Error("git rev-parse failed"); },
+    })).rejects.toBeInstanceOf(SharedWorkspaceIsolationError);
   });
 
   it("isolates two concurrent runs that resolve to the same worktree", async () => {
