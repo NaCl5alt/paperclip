@@ -25,6 +25,7 @@ import {
   issues,
   routines,
 } from "@paperclipai/db";
+import { AUTH_REQUIRED_ERROR_CODES } from "./account-failure-gate.js";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { forbidden, notFound } from "../../errors.js";
@@ -193,6 +194,15 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "budget_exhausted",
   "issue_paused",
   "issue_dependencies_blocked",
+  // Deterministic credential failures (VANA-4048 / VANA-4041): an expired or
+  // absent credential does not heal by retrying on the same account, so a
+  // per-issue continuation retry only burns a run and re-emits the same code.
+  // Treat them as non-retryable so the issue escalates straight to `blocked`;
+  // the account-level gate (account-failure-gate.ts) additionally stops the
+  // failure from fanning out across every issue that shares the account. The
+  // code set is shared with that gate so a newly added adapter auth code cannot
+  // drift between the two call sites.
+  ...AUTH_REQUIRED_ERROR_CODES,
 ]);
 
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
@@ -220,7 +230,7 @@ type ContinuationRetryClassification = {
   errorCode: string | null;
 };
 
-function classifyContinuationFailure(latestRun: LatestIssueRun): ContinuationRetryClassification {
+export function classifyContinuationFailure(latestRun: LatestIssueRun): ContinuationRetryClassification {
   const errorCode = readNonEmptyString(latestRun?.errorCode);
   if (errorCode && NON_RETRYABLE_CONTINUATION_ERROR_CODES.has(errorCode)) {
     return { kind: "non_retryable", maxAttempts: 0, baseBackoffMs: 0, errorCode };

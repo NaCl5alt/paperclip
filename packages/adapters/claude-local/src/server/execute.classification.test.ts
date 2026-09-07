@@ -257,4 +257,85 @@ describe("claude_local execute classification (VANA-2891)", () => {
     // No normalization marker when the exit was already clean.
     expect(resultJson.exitCodeNormalizedReason).toBeUndefined();
   });
+
+  it("classifies OAuth session-expired wording in parsed.result as claude_auth_required (VANA-3914)", async () => {
+    const root = await makeTempRoot();
+    const oauthMessage =
+      "Failed to authenticate: OAuth session expired and could not be refreshed";
+    const stdout = [
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "claude-session-vana3914",
+        model: "claude-sonnet",
+      }),
+      JSON.stringify({
+        type: "result",
+        subtype: "error",
+        is_error: true,
+        session_id: "claude-session-vana3914",
+        result: oauthMessage,
+        usage: { input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 0 },
+      }),
+    ].join("\n");
+    runProcessMock.mockResolvedValue({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      stdout,
+      stderr: "",
+    });
+
+    const result = await execute(await buildContext(root));
+
+    expect(result.errorCode).toBe("claude_auth_required");
+    expect(result.exitCode).not.toBe(0);
+    expect(result.errorMessage).toContain("OAuth session expired");
+  });
+
+  it("does NOT classify OAuth session-expired wording that appears only in stdout (VANA-3914 / VANA-3255)", async () => {
+    const root = await makeTempRoot();
+    // Prompt-echo trap: the incident wording lives only in raw stdout (as if
+    // the agent prompt quoted VANA-3914). parsed.result is a normal success, so
+    // the narrow OAuth haystack must not fire.
+    const echoed =
+      "Failed to authenticate: OAuth session expired and could not be refreshed";
+    const stdout = [
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "claude-session-vana3914",
+        model: "claude-sonnet",
+      }),
+      JSON.stringify({
+        type: "assistant",
+        session_id: "claude-session-vana3914",
+        message: { content: [{ type: "text", text: echoed }] },
+      }),
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        stop_reason: "end_turn",
+        num_turns: 1,
+        session_id: "claude-session-vana3914",
+        result: "All good — credentials are fine.",
+        usage: { input_tokens: 10, cache_read_input_tokens: 0, output_tokens: 5 },
+      }),
+    ].join("\n");
+    runProcessMock.mockResolvedValue({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout,
+      stderr: "",
+    });
+
+    const result = await execute(await buildContext(root));
+
+    expect(result.errorCode).not.toBe("claude_auth_required");
+    expect(result.exitCode).toBe(0);
+    expect(result.errorMessage).toBeNull();
+  });
+
 });

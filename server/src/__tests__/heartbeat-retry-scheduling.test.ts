@@ -1353,15 +1353,18 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     retryNotBefore?: string | null;
     scheduledRetryAttempt?: number;
     accountQuotaExhausted?: boolean;
+    errorCode?: string;
     issueStatus?: "todo" | "in_progress" | "in_review" | "blocked" | "backlog" | "done" | "cancelled";
   }) {
+    const errorCode = input.errorCode ?? "claude_transient_upstream";
+    const isAuthRequired = errorCode === "claude_auth_required";
     await seedRetryFixture({
       runId: input.runId,
       companyId: input.companyId,
       agentId: input.agentId,
       now: input.now,
-      errorCode: "claude_transient_upstream",
-      errorFamily: "transient_upstream",
+      errorCode,
+      errorFamily: isAuthRequired ? null : "transient_upstream",
       adapterType: "claude_local",
       retryNotBefore: input.retryNotBefore ?? null,
       scheduledRetryAttempt: input.scheduledRetryAttempt,
@@ -1373,7 +1376,13 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
               accountQuotaExhausted: true,
             },
           }
-        : {}),
+        : isAuthRequired
+          ? {
+              resultJson: {
+                result: "Failed to authenticate: OAuth session expired and could not be refreshed",
+              },
+            }
+          : {}),
     });
 
     const issuePrefix = `T${input.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
@@ -1736,6 +1745,54 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments.some((comment) => comment.body.includes("account_quota_exhausted"))).toBe(true);
+  });
+
+
+  // VANA-3914: claude_auth_required hands off immediately — auth breaks do not
+  // clear on the bounded-retry timescale, and they never enter the transient
+  // upstream contract.
+  it("hands a claude_auth_required issue off immediately at attempt 1 without retrying", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-04-21T09:00:00.000Z");
+    const { fallbackAgentId } = await seedRecoveryFallbackFixture({
+      companyId,
+      agentId,
+      runId,
+      issueId,
+      now,
+      errorCode: "claude_auth_required",
+    });
+
+    const result = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(result).toMatchObject({
+      outcome: "failed_over_to_recovery_fallback",
+      fallbackAgentId,
+      issueId,
+      attempt: 1,
+    });
+
+    const issue = await db
+      .select({ assigneeAgentId: issues.assigneeAgentId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.assigneeAgentId).toBe(fallbackAgentId);
+
+    const scheduledRetries = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "scheduled_retry")));
+    expect(scheduledRetries).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) => comment.body.includes("auth_required"))).toBe(true);
   });
 
   it("falls through to the bounded retry ladder when account quota is exhausted but no fallback is configured", async () => {

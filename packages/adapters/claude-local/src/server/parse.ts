@@ -7,6 +7,12 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 
 const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|unauthorized|authentication\s+required)/i;
+// VANA-3914: OAuth session-expiry wording from the Claude CLI. Matched only
+// against parsed.result / structured error messages — never raw stdout/stderr —
+// so a prompt that merely quotes this issue (VANA-3255) cannot flip the
+// classifier. The legacy CLAUDE_AUTH_REQUIRED_RE haystack stays unchanged.
+const CLAUDE_OAUTH_SESSION_EXPIRED_RE =
+  /(?:failed\s+to\s+authenticate:\s*)?oauth\s+session\s+expired(?:\s+and\s+could\s+not\s+be\s+refreshed)?/i;
 const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
 
 // Tool-call markup that the model is supposed to emit as a structured tool_use
@@ -179,15 +185,25 @@ export function detectClaudeLoginRequired(input: {
   stderr: string;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const resultText = asString(input.parsed?.result, "").trim();
-  const messages = [resultText, ...extractClaudeErrorMessages(input.parsed ?? {}), input.stdout, input.stderr]
+  const structuredErrors = extractClaudeErrorMessages(input.parsed ?? {});
+  const messages = [resultText, ...structuredErrors, input.stdout, input.stderr]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
 
-  const requiresLogin = messages.some((line) => CLAUDE_AUTH_REQUIRED_RE.test(line));
+  const loginPrompt = messages.some((line) => CLAUDE_AUTH_REQUIRED_RE.test(line));
+  // Narrow haystack: parsed.result + structured errors only (VANA-3914 / VANA-3255).
+  const terminalText = [resultText, ...structuredErrors]
+    .join("\n")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+  const oauthSessionExpired = terminalText.length > 0 && CLAUDE_OAUTH_SESSION_EXPIRED_RE.test(terminalText);
+
   return {
-    requiresLogin,
+    requiresLogin: loginPrompt || oauthSessionExpired,
     loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
   };
 }

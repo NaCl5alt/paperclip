@@ -62,3 +62,13 @@ export type {
   SuccessfulRunHandoffNotice,
   SuccessfulRunHandoffDecision,
 } from "./successful-run-handoff.js";
+export {
+  ACCOUNT_FAILURE_GATE_DEFAULT_MAX_FAILURE_AGE_MS,
+  AUTH_REQUIRED_ERROR_CODES,
+  classifyAccountFailureGate,
+  deriveAccountKey,
+} from "./account-failure-gate.js";
+export type {
+  AccountFailureGate,
+  AccountRunOutcome,
+} from "./account-failure-gate.js";

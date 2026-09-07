@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, gte, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -146,7 +146,11 @@ import {
   findExistingRunLivenessContinuationWake,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
+  ACCOUNT_FAILURE_GATE_DEFAULT_MAX_FAILURE_AGE_MS,
+  classifyAccountFailureGate,
+  deriveAccountKey,
 } from "./recovery/index.js";
+import type { AccountFailureGate } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
 import {
   recoveryAssigneeAdapterOverrides,
@@ -5951,7 +5955,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     run: typeof heartbeatRuns.$inferSelect;
     agent: typeof agents.$inferSelect;
     now: Date;
-    trigger: "retry_exhausted" | "retry_not_before_deferred" | "account_quota_exhausted";
+    trigger: "retry_exhausted" | "retry_not_before_deferred" | "account_quota_exhausted" | "auth_required";
     retryNotBefore: Date | null;
     attempt: number;
     maxAttempts: number;
@@ -6060,6 +6064,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const handoffHeadline =
       input.trigger === "account_quota_exhausted"
         ? "The assigned agent's account/org quota is exhausted with no upstream reset window (e.g. a monthly spend limit), so this issue was handed off immediately to the configured recovery fallback agent without running the retry ladder."
+        : input.trigger === "auth_required"
+          ? "The assigned agent's Claude OAuth/login session is broken (claude_auth_required), so this issue was handed off immediately to the configured recovery fallback agent. Auth breaks do not clear on retry."
         : "Transient upstream failures kept the assigned agent from making progress, so this issue was handed off to the configured recovery fallback agent.";
     try {
       await issuesSvc.addComment(
@@ -6140,6 +6146,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
+
+    // VANA-3914: Claude OAuth/login breaks are account-scoped and long-lived.
+    // Retrying the same adapter burns wake budget without progress, so hand off
+    // to recoveryFallbackAgentId immediately (same posture as account_quota_exhausted).
+    // B(2) — fallback paused — remains an ops concern outside this path.
+    if (run.errorCode === "claude_auth_required") {
+      const recoveryFallback = await failoverTransientUpstreamRunToRecoveryFallback({
+        run,
+        agent,
+        now,
+        trigger: "auth_required",
+        retryNotBefore: null,
+        attempt: nextAttempt,
+        maxAttempts,
+      });
+      if (recoveryFallback.outcome === "failed_over") {
+        return {
+          outcome: "failed_over_to_recovery_fallback" as const,
+          attempt: nextAttempt,
+          maxAttempts,
+          fallbackAgentId: recoveryFallback.fallbackAgentId,
+          issueId: recoveryFallback.issueId,
+        };
+      }
+      // No invokable fallback: do not grind a retry ladder on a hard auth break.
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: "claude_auth_required with no invokable recovery fallback; skipping bounded retry ladder",
+        payload: {
+          errorCode: run.errorCode,
+          recoveryFallbackReason: recoveryFallback.reason,
+        },
+      });
+      return {
+        outcome: "retry_exhausted" as const,
+        attempt: nextAttempt,
+        maxAttempts,
+        recoveryFallback,
+      };
+    }
 
     if (!baseSchedule) {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -9329,6 +9377,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
+        } else if (outcome === "failed" && livenessRun.errorCode === "claude_auth_required") {
+          // VANA-3914 defect B(1): auth breaks never enter the transient-upstream
+          // retry contract, so route them through the same scheduler entrypoint
+          // that now short-circuits to recovery fallback.
+          await scheduleBoundedRetryForRun(livenessRun, agent);
         }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
@@ -10052,6 +10105,77 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await startNextQueuedRunForAgent(promotedRun.agentId);
   }
 
+  // VANA-4048: derive whether the credential account an agent runs under is in
+  // a confirmed auth-failure state, from the account's recent terminal runs.
+  // Read-only and fail-open: any error, or an account whose credential scope
+  // cannot be determined, yields null so the gate can only ever suppress an
+  // automated wake, never manufacture a new outage.
+  //
+  // Release is by observed recovery, not by time: classifyAccountFailureGate
+  // keys on the account's most-recent terminal outcome, so a newer success (or
+  // any non-auth terminal outcome) clears the gate. User-initiated wakes bypass
+  // the gate entirely, so an operator poke that succeeds releases it at once. A
+  // fully-automated account with no user traffic re-probes only after the
+  // failure ages past the re-probe window (worst-case recovery latency), which
+  // is the sole time dependency and never *confirms* recovery on its own.
+  async function getActiveAccountFailureGate(
+    agent: typeof agents.$inferSelect,
+  ): Promise<AccountFailureGate | null> {
+    try {
+      const accountKey = deriveAccountKey(
+        agent.adapterType,
+        parseObject(agent.adapterConfig).env,
+      );
+      if (!accountKey) return null;
+
+      const companyAgents = await db
+        .select({
+          id: agents.id,
+          adapterType: agents.adapterType,
+          adapterConfig: agents.adapterConfig,
+        })
+        .from(agents)
+        .where(eq(agents.companyId, agent.companyId));
+      const accountAgentIds = companyAgents
+        .filter(
+          (candidate) =>
+            deriveAccountKey(
+              candidate.adapterType,
+              parseObject(candidate.adapterConfig).env,
+            ) === accountKey,
+        )
+        .map((candidate) => candidate.id);
+      if (accountAgentIds.length === 0) return null;
+
+      const windowStart = new Date(
+        Date.now() - ACCOUNT_FAILURE_GATE_DEFAULT_MAX_FAILURE_AGE_MS,
+      );
+      const recentRuns = await db
+        .select({
+          runId: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          errorCode: heartbeatRuns.errorCode,
+          finishedAt: heartbeatRuns.finishedAt,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, agent.companyId),
+            inArray(heartbeatRuns.agentId, accountAgentIds),
+            gte(heartbeatRuns.finishedAt, windowStart),
+          ),
+        )
+        .orderBy(desc(heartbeatRuns.finishedAt))
+        // Only the account's most-recent terminal outcome governs the gate; a
+        // small margin above 1 tolerates finishedAt ties without over-fetching.
+        .limit(5);
+
+      return classifyAccountFailureGate(accountKey, recentRuns);
+    } catch {
+      return null;
+    }
+  }
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -10194,6 +10318,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         invalidOrgChain: invokability.invalidOrgChain,
         ...invokability.details,
       });
+    }
+
+    // VANA-4048: suppress automated wakes to an account whose credentials are in
+    // a confirmed deterministic-failure (auth-required) state, so one dead
+    // account does not fan a per-issue retry out across every issue that shares
+    // it. User-initiated wakes are never suppressed — they carry human intent,
+    // are low volume, and a success on one releases the gate for the account.
+    if (opts.requestedByActorType !== "user") {
+      const accountFailureGate = await getActiveAccountFailureGate(agent);
+      if (accountFailureGate) {
+        await writeSkippedRequest("account_failure_gate_active", {
+          payload: {
+            ...(payload ?? {}),
+            accountFailureGate: {
+              accountKey: accountFailureGate.accountKey,
+              errorCode: accountFailureGate.errorCode,
+              sinceRunId: accountFailureGate.sinceRunId,
+            },
+          },
+        });
+        return null;
+      }
     }
 
     const policy = parseHeartbeatPolicy(agent);
