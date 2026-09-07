@@ -156,6 +156,7 @@ import {
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   readContinuationAttempt,
   ACCOUNT_FAILURE_GATE_DEFAULT_MAX_FAILURE_AGE_MS,
+  ACCOUNT_GATE_INFORMATIVE_ERROR_CODES,
   classifyAccountFailureGate,
   deriveAccountKey,
 } from "./recovery/index.js";
@@ -10262,8 +10263,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // automated wake, never manufacture a new outage.
   //
   // Release is by observed recovery, not by time: classifyAccountFailureGate
-  // keys on the account's most-recent terminal outcome, so a newer success (or
-  // any non-auth terminal outcome) clears the gate. User-initiated wakes bypass
+  // keys on the account's most-recent outcome that carries evidence about the
+  // credential, so a newer success clears the gate while cancellations and
+  // unrelated failures are skipped over (see the module docstring for why the
+  // co-shipped auth handoff makes that distinction load-bearing). The fetch
+  // below applies the same predicate in SQL so those uninformative rows cannot
+  // push the deciding run out of the LIMIT window. User-initiated wakes bypass
   // the gate entirely, so an operator poke that succeeds releases it at once. A
   // fully-automated account with no user traffic re-probes only after the
   // failure ages past the re-probe window (worst-case recovery latency), which
@@ -10313,10 +10318,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             eq(heartbeatRuns.companyId, agent.companyId),
             inArray(heartbeatRuns.agentId, accountAgentIds),
             gte(heartbeatRuns.finishedAt, windowStart),
+            // Only rows that say something about the credential. Without this
+            // predicate the LIMIT below is filled by the cancellations the auth
+            // handoff emits (295 of 301 releases in the 2026-09-05 replay), and
+            // the auth failure that should gate the account is never read.
+            or(
+              eq(heartbeatRuns.status, "succeeded"),
+              inArray(heartbeatRuns.errorCode, [...ACCOUNT_GATE_INFORMATIVE_ERROR_CODES]),
+            ),
           ),
         )
         .orderBy(desc(heartbeatRuns.finishedAt))
-        // Only the account's most-recent terminal outcome governs the gate; a
+        // Only the account's most-recent informative outcome governs the gate; a
         // small margin above 1 tolerates finishedAt ties without over-fetching.
         .limit(5);
 

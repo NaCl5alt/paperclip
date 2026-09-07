@@ -15,8 +15,10 @@
 // write path — the gate is *derived* from recent terminal runs. Two properties
 // fall out of that for free:
 //   * Auto-release on recovery: the gate keys on the account's most-recent
-//     terminal outcome, so the next successful (or non-auth) run clears it.
-//     Release never depends on time elapsing alone.
+//     outcome that actually says something about the credential, so the next
+//     successful run clears it. Release never depends on time elapsing alone,
+//     and never on an outcome (a cancellation, a transient upstream error) that
+//     carries no evidence the credential works again.
 //   * Fail-open: any ambiguity (no runs, an unknown account, a non-auth latest
 //     failure, or a stale failure past the re-probe window) yields "not gated".
 //     The gate can only ever *suppress*, never manufacture a new outage — it
@@ -129,14 +131,51 @@ export type AccountFailureGate = {
   sinceFinishedAt: Date | null;
 };
 
+// A terminal run only carries information about the account's credential when
+// it either *used* the credential successfully or *failed on* it. Every other
+// outcome — a `cancelled` run, a transient upstream failure, a lost process —
+// says nothing about whether the credential is still expired, so it must not be
+// read as evidence of recovery.
+//
+// This distinction is load-bearing, not hygiene. The earlier rule ("any
+// non-auth latest outcome releases the gate") is defeated by the auth handoff
+// this gate ships alongside: when VANA-3914 fails an issue over to a fallback
+// agent it reassigns the issue, and every queued run on the old assignee is
+// cancelled with `issue_assignee_changed`. That cancellation lands *after* the
+// auth failure that armed the gate, so the handoff released the gate it had
+// just armed. Replayed against the real 2026-09-05 default-account outage, the
+// old rule flipped the gate 601 times and left it OFF for 19.6% of the window;
+// of its 301 releases, 295 were `issue_assignee_changed` cancellations, 5 were
+// unrelated failures, and exactly 1 was a real success.
+function isInformativeAboutCredential(run: AccountRunOutcome): boolean {
+  if (run.status === "succeeded") return true;
+  const errorCode = typeof run.errorCode === "string" ? run.errorCode.trim() : "";
+  return AUTH_REQUIRED_ERROR_CODES.has(errorCode);
+}
+
+// The subset of run shapes the gate is willing to read, as a SQL-side predicate
+// can express it. Kept next to `isInformativeAboutCredential` so the database
+// pre-filter in heartbeat.ts and this in-memory filter cannot drift apart: the
+// caller narrows the fetch to these rows, and this module re-applies the same
+// rule so a caller that fetches everything still behaves identically.
+export const ACCOUNT_GATE_INFORMATIVE_ERROR_CODES: readonly string[] = [
+  ...AUTH_REQUIRED_ERROR_CODES,
+];
+
 // Decide whether an account is currently auth-gated from its recent terminal
-// runs (any order; only runs with a finishedAt are considered). The account's
-// most-recent terminal outcome governs:
-//   * succeeded, or any non-auth failure → not gated (recovery observed).
+// runs (any order; only runs with a finishedAt are considered). Runs that say
+// nothing about the credential are skipped over entirely, and the most-recent
+// *informative* outcome governs:
+//   * succeeded → not gated (recovery actually observed).
 //   * an `*_auth_required` failure within the re-probe window → gated.
 //   * an `*_auth_required` failure older than the window → not gated, so a
 //     probe run is allowed through to re-test (time never *confirms* recovery,
 //     it only lets a probe through; a real success still does the releasing).
+//   * no informative run at all → not gated (fail-open).
+//
+// Skipping rather than releasing cannot strand the fleet: the re-probe window
+// still bounds total suppression at `maxFailureAgeMs` measured from the auth
+// failure itself, regardless of how many uninformative runs pile up after it.
 export function classifyAccountFailureGate(
   accountKey: string,
   recentTerminalRuns: readonly AccountRunOutcome[],
@@ -149,6 +188,7 @@ export function classifyAccountFailureGate(
     .filter((run): run is AccountRunOutcome & { finishedAt: Date } =>
       run.finishedAt instanceof Date && !Number.isNaN(run.finishedAt.getTime())
     )
+    .filter(isInformativeAboutCredential)
     .sort((a, b) => b.finishedAt.getTime() - a.finishedAt.getTime());
 
   const latest = terminal[0];
@@ -156,6 +196,8 @@ export function classifyAccountFailureGate(
   if (latest.status === "succeeded") return null;
 
   const errorCode = typeof latest.errorCode === "string" ? latest.errorCode.trim() : "";
+  // Unreachable given the filter above; kept so the gate still fails open if the
+  // informative-run predicate is ever widened without revisiting this branch.
   if (!AUTH_REQUIRED_ERROR_CODES.has(errorCode)) return null;
 
   const ageMs = now.getTime() - latest.finishedAt.getTime();

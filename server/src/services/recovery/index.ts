@@ -64,6 +64,7 @@ export type {
 } from "./successful-run-handoff.js";
 export {
   ACCOUNT_FAILURE_GATE_DEFAULT_MAX_FAILURE_AGE_MS,
+  ACCOUNT_GATE_INFORMATIVE_ERROR_CODES,
   AUTH_REQUIRED_ERROR_CODES,
   classifyAccountFailureGate,
   deriveAccountKey,

@@ -227,6 +227,98 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     ).not.toBeNull();
   });
 
+  // ── release condition: only observed recovery releases (VANA-4067 B-I1) ────
+
+  it("stays gated when the auth handoff cancels the account's queued runs", async () => {
+    const companyId = await seedCompany();
+    const dead = await seedClaudeAgent(companyId, "Dead", "/tmp/acct-a");
+    const sibling = await seedClaudeAgent(companyId, "Sibling", "/tmp/acct-a");
+    await recordTerminalRun(companyId, dead, {
+      status: "failed",
+      errorCode: "claude_auth_required",
+      finishedAt: minutesAgo(10),
+    });
+    // Exactly what the co-shipped VANA-3914 failover produces: it reassigns the
+    // issue away from the dead account, and every queued run on the old
+    // assignee is cancelled with this code — newer than the auth failure that
+    // armed the gate. Reading it as "recovery" let the handoff release the gate
+    // it had just armed.
+    await recordTerminalRun(companyId, dead, {
+      status: "cancelled",
+      errorCode: "issue_assignee_changed",
+      finishedAt: minutesAgo(1),
+    });
+
+    const heartbeat = heartbeatService(db);
+    expect(
+      await heartbeat.wakeup(sibling, { source: "automation", triggerDetail: "issue_assigned" }),
+    ).toBeNull();
+    expect(await runsFor(sibling)).toHaveLength(0);
+  });
+
+  it("finds the deciding run even when more cancellations follow it than the query fetches", async () => {
+    const companyId = await seedCompany();
+    const dead = await seedClaudeAgent(companyId, "Dead", "/tmp/acct-a");
+    const sibling = await seedClaudeAgent(companyId, "Sibling", "/tmp/acct-a");
+    await recordTerminalRun(companyId, dead, {
+      status: "failed",
+      errorCode: "claude_auth_required",
+      finishedAt: minutesAgo(30),
+    });
+    // This is the assertion the pure classifier cannot make. The classifier
+    // skips uninformative runs, but it can only skip what it was handed: the
+    // enforcement query fetches a bounded, finishedAt-ordered window, so unless
+    // that query filters too, a cancellation burst fills the window and the
+    // auth failure is never read at all. During the real outage the account
+    // produced hundreds of these in minutes.
+    for (let i = 0; i < 12; i += 1) {
+      await recordTerminalRun(companyId, dead, {
+        status: "cancelled",
+        errorCode: "issue_assignee_changed",
+        finishedAt: minutesAgo(20 - i),
+      });
+    }
+
+    const heartbeat = heartbeatService(db);
+    expect(
+      await heartbeat.wakeup(sibling, { source: "automation", triggerDetail: "issue_assigned" }),
+    ).toBeNull();
+  });
+
+  it("still releases on a real success recorded after the cancellations", async () => {
+    const companyId = await seedCompany();
+    const dead = await seedClaudeAgent(companyId, "Dead", "/tmp/acct-a");
+    const sibling = await seedClaudeAgent(companyId, "Sibling", "/tmp/acct-a");
+    await recordTerminalRun(companyId, dead, {
+      status: "failed",
+      errorCode: "claude_auth_required",
+      finishedAt: minutesAgo(30),
+    });
+    for (let i = 0; i < 12; i += 1) {
+      await recordTerminalRun(companyId, dead, {
+        status: "cancelled",
+        errorCode: "issue_assignee_changed",
+        finishedAt: minutesAgo(20 - i),
+      });
+    }
+
+    const heartbeat = heartbeatService(db);
+    expect(
+      await heartbeat.wakeup(sibling, { source: "automation", triggerDetail: "issue_assigned" }),
+    ).toBeNull();
+
+    // Suppression is still bounded by evidence, not by exhaustion: one real
+    // success on the account clears it even under the same cancellation noise.
+    await recordTerminalRun(companyId, dead, {
+      status: "succeeded",
+      errorCode: null,
+      finishedAt: minutesAgo(1),
+    });
+    expect(
+      await heartbeat.wakeup(sibling, { source: "automation", triggerDetail: "issue_assigned" }),
+    ).not.toBeNull();
+  });
+
   // ── cross-change interaction with the shared-checkout single-writer work ────
 
   it("leaves no shared workspace claim behind when it suppresses a wake", async () => {
@@ -263,6 +355,12 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     // Isolation fails closed and fails the run. That is a workspace contention
     // outcome, not a credential outcome, so it must not suppress the whole
     // account — otherwise a checkout storm would masquerade as an auth outage.
+    //
+    // The code seeded here is the one a fail-close actually writes; the
+    // end-to-end proof that a real fail-close records it (rather than the
+    // generic `adapter_failed` it used to collapse onto) is in
+    // `heartbeat-shared-checkout-isolation.test.ts`. Both are needed: without
+    // that test this seed asserts a code no production path emits.
     await recordTerminalRun(companyId, contended, {
       status: "failed",
       errorCode: "shared_workspace_isolation_failed",
@@ -273,5 +371,30 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     expect(
       await heartbeat.wakeup(sibling, { source: "automation", triggerDetail: "issue_assigned" }),
     ).not.toBeNull();
+  });
+
+  it("does not let a fail-closed isolation release a gate that a real auth failure armed", async () => {
+    const companyId = await seedCompany();
+    const dead = await seedClaudeAgent(companyId, "Dead", "/tmp/acct-a");
+    const sibling = await seedClaudeAgent(companyId, "Sibling", "/tmp/acct-a");
+    await recordTerminalRun(companyId, dead, {
+      status: "failed",
+      errorCode: "claude_auth_required",
+      finishedAt: minutesAgo(10),
+    });
+    // The interaction in the direction the specificity test above cannot see:
+    // the fail-close is newer than the auth failure, so under a "latest
+    // non-auth outcome releases" rule the shared-checkout half of this merge
+    // would switch the credential gate off for the whole account.
+    await recordTerminalRun(companyId, dead, {
+      status: "failed",
+      errorCode: "shared_workspace_isolation_failed",
+      finishedAt: minutesAgo(1),
+    });
+
+    const heartbeat = heartbeatService(db);
+    expect(
+      await heartbeat.wakeup(sibling, { source: "automation", triggerDetail: "issue_assigned" }),
+    ).toBeNull();
   });
 });

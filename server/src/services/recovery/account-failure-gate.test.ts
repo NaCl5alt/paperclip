@@ -140,6 +140,123 @@ describe("classifyAccountFailureGate", () => {
     expect(gate).toBeNull();
   });
 
+  // --- uninformative outcomes must not be read as recovery (VANA-4067 B-I1) ---
+  //
+  // The gate ships alongside the VANA-3914 auth handoff, which reassigns an
+  // issue when it sees `claude_auth_required` and thereby cancels every queued
+  // run on the old assignee with `issue_assignee_changed`. Those cancellations
+  // land immediately *after* the auth failure that armed the gate. Under the
+  // earlier "any non-auth latest outcome releases" rule the handoff therefore
+  // released the gate it had just armed: replaying the real 2026-09-05
+  // default-account outage produced 601 gate flips, 19.6% of the window
+  // un-gated, and 295 of 301 releases attributable to that one cancellation.
+
+  it("does not release the gate on the cancellation the auth handoff itself emits", () => {
+    const gate = classifyAccountFailureGate(
+      key,
+      [
+        run({ runId: "auth", errorCode: "claude_auth_required", finishedAt: minutesAgo(5) }),
+        run({
+          runId: "handoff-cancel",
+          status: "cancelled",
+          errorCode: "issue_assignee_changed",
+          finishedAt: minutesAgo(1),
+        }),
+      ],
+      { now },
+    );
+    expect(gate?.sinceRunId).toBe("auth");
+  });
+
+  it("does not release the gate on an unrelated failure that never touched the credential", () => {
+    for (const errorCode of ["adapter_failed", "claude_transient_upstream", "process_lost", "timeout"]) {
+      const gate = classifyAccountFailureGate(
+        key,
+        [
+          run({ runId: "auth", errorCode: "claude_auth_required", finishedAt: minutesAgo(5) }),
+          run({ runId: "noise", errorCode, finishedAt: minutesAgo(1) }),
+        ],
+        { now },
+      );
+      expect(gate?.sinceRunId).toBe("auth");
+    }
+  });
+
+  it("does not release the gate on a fail-closed shared-workspace isolation", () => {
+    // The other half of the merged change. A contended checkout that could not
+    // be isolated is a directory conflict, so it neither arms nor releases the
+    // credential gate.
+    const gate = classifyAccountFailureGate(
+      key,
+      [
+        run({ runId: "auth", errorCode: "claude_auth_required", finishedAt: minutesAgo(5) }),
+        run({ runId: "fail-close", errorCode: "shared_workspace_isolation_failed", finishedAt: minutesAgo(1) }),
+      ],
+      { now },
+    );
+    expect(gate?.sinceRunId).toBe("auth");
+  });
+
+  it("reads past an arbitrarily long run of uninformative outcomes to the deciding one", () => {
+    // Skipping, not releasing: no volume of cancellations can bury the auth
+    // failure, which is what makes the SQL pre-filter in heartbeat.ts necessary
+    // rather than an optimisation.
+    const history: AccountRunOutcome[] = [
+      run({ runId: "auth", errorCode: "claude_auth_required", finishedAt: minutesAgo(40) }),
+    ];
+    for (let i = 0; i < 200; i += 1) {
+      history.push(run({
+        runId: `cancel-${i}`,
+        status: "cancelled",
+        errorCode: "issue_assignee_changed",
+        finishedAt: minutesAgo(30 - i * 0.1),
+      }));
+    }
+    expect(classifyAccountFailureGate(key, history, { now })?.sinceRunId).toBe("auth");
+  });
+
+  it("still bounds total suppression by the re-probe window, not by the skipped runs", () => {
+    // Skipping cannot strand an account forever: the age check is measured from
+    // the auth failure itself, so a stale failure buried under fresh
+    // cancellations still lets a probe through.
+    const stale = new Date(now.getTime() - ACCOUNT_FAILURE_GATE_DEFAULT_MAX_FAILURE_AGE_MS - 60_000);
+    expect(
+      classifyAccountFailureGate(
+        key,
+        [
+          run({ runId: "old-auth", errorCode: "claude_auth_required", finishedAt: stale }),
+          run({ runId: "cancel", status: "cancelled", errorCode: "issue_assignee_changed", finishedAt: minutesAgo(1) }),
+        ],
+        { now },
+      ),
+    ).toBeNull();
+  });
+
+  it("still releases on a real success that follows the uninformative runs", () => {
+    const gate = classifyAccountFailureGate(
+      key,
+      [
+        run({ runId: "auth", errorCode: "claude_auth_required", finishedAt: minutesAgo(10) }),
+        run({ runId: "cancel", status: "cancelled", errorCode: "issue_assignee_changed", finishedAt: minutesAgo(5) }),
+        run({ runId: "ok", status: "succeeded", errorCode: null, finishedAt: minutesAgo(1) }),
+      ],
+      { now },
+    );
+    expect(gate).toBeNull();
+  });
+
+  it("does not gate when the only informative run is a success, whatever follows it", () => {
+    const gate = classifyAccountFailureGate(
+      key,
+      [
+        run({ runId: "ok", status: "succeeded", errorCode: null, finishedAt: minutesAgo(10) }),
+        run({ runId: "cancel", status: "cancelled", errorCode: "issue_assignee_changed", finishedAt: minutesAgo(1) }),
+      ],
+      { now },
+    );
+    expect(gate).toBeNull();
+  });
+
   // --- fail-open cases: the gate can only ever suppress, never fabricate one ---
 
   it("does not gate on an empty history (fail-open)", () => {
