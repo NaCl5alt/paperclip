@@ -10,6 +10,7 @@ const mockBuildWorkspaceRealizationRequest = vi.hoisted(() => vi.fn());
 const mockUpdateLeaseMetadata = vi.hoisted(() => vi.fn());
 const mockUpdateExecutionWorkspace = vi.hoisted(() => vi.fn());
 const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockClaimSharedWorkspace = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/environment-execution-target.js", () => ({
   resolveEnvironmentExecutionTarget: mockResolveEnvironmentExecutionTarget,
@@ -31,6 +32,7 @@ vi.mock("../services/environments.js", () => ({
     acquireLease: vi.fn(),
     releaseLease: vi.fn(),
     updateLeaseMetadata: mockUpdateLeaseMetadata,
+    claimSharedWorkspaceForLease: mockClaimSharedWorkspace,
   })),
 }));
 
@@ -239,6 +241,11 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     mockUpdateLeaseMetadata.mockResolvedValue(null);
     mockUpdateExecutionWorkspace.mockResolvedValue(null);
     mockLogActivity.mockResolvedValue(undefined);
+    mockClaimSharedWorkspace.mockResolvedValue({
+      claimed: true,
+      ownerLeaseId: "lease-1",
+      cwd: "/workspace/project",
+    });
   });
 
   it("happy path: returns lease, executionTarget, and remoteExecution on successful realization", async () => {
@@ -262,6 +269,69 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
 
     expect(runtime.realizeWorkspace).toHaveBeenCalledOnce();
     expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledOnce();
+  });
+
+  // VANA-4049: shared-checkout single-writer claim wiring.
+  it("claims the realized cwd as single writer for local project_primary runs", async () => {
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({ kind: "local" });
+    const runtime = makeMockRuntime();
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    await orchestrator.realizeForRun(makeRealizeInput());
+
+    expect(mockClaimSharedWorkspace).toHaveBeenCalledOnce();
+    expect(mockClaimSharedWorkspace).toHaveBeenCalledWith({
+      companyId: "company-1",
+      leaseId: "lease-1",
+      cwd: "/workspace/project",
+    });
+    // Winner: no contention metadata recorded (the normal realization-metadata
+    // persist may still run, but never a sharedWorkspaceContention payload).
+    expect(mockUpdateLeaseMetadata).not.toHaveBeenCalledWith(
+      "lease-1",
+      expect.objectContaining({ sharedWorkspaceContention: expect.anything() }),
+    );
+  });
+
+  it("records contention metadata when another active lease already owns the cwd", async () => {
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({ kind: "local" });
+    mockClaimSharedWorkspace.mockResolvedValue({
+      claimed: false,
+      ownerLeaseId: "owner-lease-9",
+      cwd: "/workspace/project",
+    });
+    const runtime = makeMockRuntime();
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    await orchestrator.realizeForRun(makeRealizeInput());
+
+    expect(mockUpdateLeaseMetadata).toHaveBeenCalledWith(
+      "lease-1",
+      expect.objectContaining({
+        sharedWorkspaceContention: expect.objectContaining({
+          cwd: "/workspace/project",
+          ownerLeaseId: "owner-lease-9",
+        }),
+      }),
+    );
+  });
+
+  it("does not claim a shared writer for git_worktree runs (already per-branch isolated)", async () => {
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({ kind: "local" });
+    const runtime = makeMockRuntime();
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    const input = makeRealizeInput();
+    input.executionWorkspace = {
+      ...makeExecutionWorkspace("/workspace/.paperclip/worktrees/feat-x"),
+      strategy: "git_worktree",
+      branchName: "feat-x",
+      worktreePath: "/workspace/.paperclip/worktrees/feat-x",
+    };
+
+    await orchestrator.realizeForRun(input);
+
+    expect(mockClaimSharedWorkspace).not.toHaveBeenCalled();
   });
 
   it("realization failure: runtime.realizeWorkspace throws → EnvironmentRunError with code workspace_realization_failed", async () => {
