@@ -217,6 +217,23 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
     return await heartbeat.getRun(runId);
   }
 
+  // Claim release is async relative to run completion: the `finally` block in
+  // `executeRun` releases claims AFTER the run status is written to the DB.
+  // `waitForRun` returns as soon as the status is non-terminal, so there is a
+  // narrow window where the run is "succeeded" but the claim is still active.
+  // This helper waits for the DB to settle before asserting zero claims.
+  async function waitForNoActiveClaims(timeoutMs = 5_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const active = await db
+        .select()
+        .from(sharedWorkspaceClaims)
+        .where(eq(sharedWorkspaceClaims.status, "active"));
+      if (active.length === 0) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+
   it("gives two concurrent runs of one project different checkouts", async () => {
     const workspaceRoot = await makeGitCheckout();
     const { companyId, projectId } = await seedProject(workspaceRoot);
@@ -555,7 +572,9 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
     expect(contenderShared?.mode).toBe("shared");
 
     // Fail-open takes no claim of its own, so once both runs end nothing is left
-    // held.
+    // held. Wait for the holder's claim to be released (async after run
+    // completion) before asserting.
+    await waitForNoActiveClaims();
     const stillActive = await db
       .select()
       .from(sharedWorkspaceClaims)

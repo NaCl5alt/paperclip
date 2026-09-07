@@ -172,15 +172,18 @@ export type SharedWorkspaceWriterInput = {
    * failure mode to protect against, so on contention it is shared (fail-open)
    * rather than failed. Optional so existing call sites keep the fail-close
    * behaviour by default; absence is read as "assume git-managed", which never
-   * fails a run open by accident. Production wires this to `isGitCheckout`
-   * (a `git rev-parse --git-dir`), which resolves any directory that is not
-   * positively a git checkout — including one that cannot be read — as non-git,
-   * i.e. shared. That is deliberate: after the 2026-09-07 fail-close regression,
-   * the safe default for this fleet is to share rather than drop a run, and a
-   * directory that does not resolve as git has no git index to corrupt. If the
-   * callback itself throws (as opposed to returning false), the `.catch` below
-   * treats that as git-managed and fails closed; the wired `isGitCheckout` never
-   * throws, so the effective rule is "share unless positively git-managed".
+   * fails a run open by accident. Production wires this to `isGitCheckoutStrict`
+   * (a `git rev-parse --git-dir`), which returns false ONLY when git positively
+   * reports the directory is not a checkout (the fleet's dominant non-git
+   * workspace shape), returns true for a real checkout, and THROWS for any
+   * inconclusive outcome — git could not be executed, or failed for a reason
+   * other than "not a git repository". The `.catch(() => true)` below turns that
+   * throw into git-managed, i.e. fail-close. So the effective rule is "share
+   * only when git positively confirms non-git; otherwise isolate or fail". This
+   * keeps the 2026-09-07 regression fixed (routine non-git overlap shares
+   * instead of dropping) without ever sharing a real git checkout with a live
+   * writer on a transient `rev-parse` failure — the VANA-3258 double-write /
+   * NDA-mixing hazard.
    */
   isCheckoutGitManaged?: (cwd: string) => Promise<boolean>;
   logger?: { warn: (obj: unknown, msg: string) => void; info?: (obj: unknown, msg: string) => void };
@@ -391,7 +394,10 @@ export async function acquireSharedWorkspaceWriter(
     // must follow the directory actually being written.
     const realizedClaim = await claimFor(realized);
     if (!realizedClaim.claimed) {
-      return await isolate(realized.cwd, realizedClaim.owner);
+      // `realizeConfigured` already ran above, so pass the realized workspace to
+      // avoid realizing a second time should the (git-only) fail-open branch ever
+      // be reached here, matching the non-shared call site below.
+      return await isolate(realized.cwd, realizedClaim.owner, workspace);
     }
     return {
       workspace,

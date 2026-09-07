@@ -24,6 +24,7 @@ import {
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
+  isGitCheckoutStrict,
   listConfiguredRuntimeServiceEntries,
   normalizeAdapterManagedRuntimeServices,
   reconcilePersistedRuntimeServicesOnStartup,
@@ -81,6 +82,37 @@ async function createTempRepo(defaultBranch = "main") {
   await runGit(repoRoot, ["checkout", "-B", defaultBranch]);
   return repoRoot;
 }
+
+// VANA-4072: `isGitCheckoutStrict` must never conflate "positively not a git
+// checkout" with "could not tell" — the shared-workspace fail-open path shares a
+// directory with a live writer, and doing that to a real git checkout is the
+// VANA-3258 double-write hazard. So it shares (returns false) only on a positive
+// non-git result and fails closed (throws) on anything inconclusive.
+describe("isGitCheckoutStrict", () => {
+  const tempDirs: string[] = [];
+  afterAll(async () => {
+    await Promise.all(
+      tempDirs.map((dir) => fs.rm(dir, { recursive: true, force: true }).catch(() => {})),
+    );
+  });
+
+  it("returns true for a git checkout", async () => {
+    const repo = await createTempRepo();
+    tempDirs.push(repo);
+    expect(await isGitCheckoutStrict(repo)).toBe(true);
+  });
+
+  it("returns false when git positively reports the directory is not a checkout", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-nongit-strict-"));
+    tempDirs.push(dir);
+    expect(await isGitCheckoutStrict(dir)).toBe(false);
+  });
+
+  it("throws (fails closed) when the check is inconclusive — git cannot run in a missing cwd", async () => {
+    const missing = path.join(os.tmpdir(), `paperclip-missing-${randomUUID()}`);
+    await expect(isGitCheckoutStrict(missing)).rejects.toThrow();
+  });
+});
 
 function buildWorkspace(cwd: string): RealizedExecutionWorkspace {
   return {

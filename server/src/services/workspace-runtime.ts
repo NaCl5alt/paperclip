@@ -690,6 +690,40 @@ export async function isGitCheckout(cwd: string): Promise<boolean> {
   return Boolean(await runGit(["rev-parse", "--git-dir"], cwd).catch(() => null));
 }
 
+/**
+ * Like {@link isGitCheckout} but never conflates "positively not a git checkout"
+ * with "could not tell". Returns true for a git checkout, false only when git
+ * ran and reported the directory is not one, and THROWS for any inconclusive
+ * outcome — git could not be executed (spawn failure: ENOENT / EMFILE / fork
+ * failure under load) or exited non-zero for a reason other than "not a git
+ * repository".
+ *
+ * This distinction is load-bearing for shared-workspace write exclusion
+ * (VANA-4072). The contended-checkout fail-open path shares a directory with a
+ * live writer; doing that to a real git checkout is the VANA-3258 double-write /
+ * NDA-mixing hazard. `isGitCheckout` swallows every failure into `false`, so a
+ * real git checkout whose `rev-parse` transiently fails while contended would be
+ * misread as non-git and shared. By throwing on the inconclusive case, this
+ * function lets the caller fail closed (isolate or drop) rather than share a
+ * possibly-git checkout, while still failing OPEN for a directory git positively
+ * confirms is not a repository (the fleet's dominant non-git workspace shape).
+ *
+ * Note: the "not a git repository" match is on git's C-locale plumbing message,
+ * which is what this fleet emits; a git build/locale that translated that
+ * message would make a genuine non-git directory inconclusive and fail closed,
+ * which is the safe direction.
+ */
+export async function isGitCheckoutStrict(cwd: string): Promise<boolean> {
+  const proc = await executeProcess({ command: "git", args: ["rev-parse", "--git-dir"], cwd });
+  if (proc.code === 0) return true;
+  if (proc.stderr.toLowerCase().includes("not a git repository")) return false;
+  throw new Error(
+    `git rev-parse --git-dir in "${cwd}" was inconclusive (code ${proc.code ?? "null"}): ${
+      proc.stderr.trim() || proc.stdout.trim() || "no output"
+    }`,
+  );
+}
+
 async function detectDefaultBranch(repoRoot: string): Promise<string | null> {
   const originMasterRef = "origin/master";
   await refreshRemoteTrackingBaseRef(repoRoot, originMasterRef);
