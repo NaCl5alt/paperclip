@@ -1,4 +1,5 @@
-import { index, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { index, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { environments } from "./environments.js";
 import { executionWorkspaces } from "./execution_workspaces.js";
@@ -24,11 +25,18 @@ export const environmentLeases = pgTable(
     releasedAt: timestamp("released_at", { withTimezone: true }),
     failureReason: text("failure_reason"),
     cleanupStatus: text("cleanup_status"),
+    // Normalized absolute path of the on-disk checkout this lease is the single
+    // writer of. Enforced by a partial unique index so at most one active lease
+    // may hold a given shared checkout directory (see acquireLease/claim).
+    sharedWorkspaceCwd: text("shared_workspace_cwd"),
     metadata: jsonb("metadata").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    activeSharedCwdUq: uniqueIndex("environment_leases_active_shared_cwd_uq")
+      .on(table.companyId, table.sharedWorkspaceCwd)
+      .where(sql`${table.status} = 'active' AND ${table.sharedWorkspaceCwd} IS NOT NULL`),
     companyEnvironmentStatusIdx: index("environment_leases_company_environment_status_idx").on(
       table.companyId,
       table.environmentId,

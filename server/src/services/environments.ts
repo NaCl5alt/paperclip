@@ -1,3 +1,4 @@
+import { resolve as resolvePath } from "node:path";
 import { and, desc, eq, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { environmentLeases, environments } from "@paperclipai/db";
@@ -25,6 +26,20 @@ const DEFAULT_LOCAL_ENVIRONMENT_DESCRIPTION =
 function cloneRecord(value: unknown, fallback: Record<string, unknown> | null = null): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return fallback;
   return { ...(value as Record<string, unknown>) };
+}
+
+// Normalize an on-disk checkout path so that "/a/b" and "/a/b/" resolve to the
+// same single-writer key regardless of how the caller spelled it.
+function normalizeSharedWorkspaceCwd(cwd: string): string {
+  return resolvePath(cwd);
+}
+
+// Postgres unique_violation (SQLSTATE 23505). Drivers surface the code either on
+// the error itself or on its `cause`, so check both.
+function isUniqueViolation(error: unknown): boolean {
+  const direct = (error as { code?: unknown } | null)?.code;
+  const nested = (error as { cause?: { code?: unknown } } | null)?.cause?.code;
+  return direct === "23505" || nested === "23505";
 }
 
 function readEnum<T extends string>(value: string | null, allowed: readonly T[], fieldName: string): T | null {
@@ -256,6 +271,63 @@ export function environmentService(db: Db) {
         throw new Error("Failed to acquire environment lease");
       }
       return toEnvironmentLease(row);
+    },
+
+    /**
+     * Claim the on-disk checkout directory `cwd` as the single writer for this
+     * lease. Backed by the partial unique index
+     * `environment_leases_active_shared_cwd_uq`, so at most one *active* lease per
+     * (company, normalized cwd) may hold a shared checkout at a time.
+     *
+     * The winner gets `{ claimed: true }`. When another active lease already owns
+     * the directory, returns `{ claimed: false, ownerLeaseId }` so the caller can
+     * isolate the run into its own workspace (preferred) or fail-close — it never
+     * silently shares the checkout. This is the write-exclusion mechanism and is
+     * deliberately separate from the issue-level checkout/liveness lock
+     * (`issues.checkoutRunId`), which is released on run end and does not guard
+     * concurrent writes to the same directory.
+     */
+    claimSharedWorkspaceForLease: async (input: {
+      companyId: string;
+      leaseId: string;
+      cwd: string;
+    }): Promise<{ claimed: boolean; ownerLeaseId: string | null; cwd: string }> => {
+      const normalizedCwd = normalizeSharedWorkspaceCwd(input.cwd);
+      try {
+        const row = await db
+          .update(environmentLeases)
+          .set({ sharedWorkspaceCwd: normalizedCwd, lastUsedAt: new Date(), updatedAt: new Date() })
+          .where(
+            and(
+              eq(environmentLeases.id, input.leaseId),
+              eq(environmentLeases.companyId, input.companyId),
+              eq(environmentLeases.status, "active"),
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!row) {
+          // Lease is gone or no longer active; there is nothing to claim.
+          return { claimed: false, ownerLeaseId: null, cwd: normalizedCwd };
+        }
+        return { claimed: true, ownerLeaseId: row.id, cwd: normalizedCwd };
+      } catch (error) {
+        if (!isUniqueViolation(error)) throw error;
+        // Another active lease already owns this checkout directory. Report the
+        // owner so the caller can isolate or fail-close instead of double-writing.
+        const owner = await db
+          .select({ id: environmentLeases.id })
+          .from(environmentLeases)
+          .where(
+            and(
+              eq(environmentLeases.companyId, input.companyId),
+              eq(environmentLeases.sharedWorkspaceCwd, normalizedCwd),
+              eq(environmentLeases.status, "active"),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        return { claimed: false, ownerLeaseId: owner?.id ?? null, cwd: normalizedCwd };
+      }
     },
 
     releaseLease: async (

@@ -1094,6 +1094,44 @@ async function resolveGitRepoRootForWorkspaceCleanup(
   return path.dirname(resolvedGitDir);
 }
 
+/**
+ * Where a `git_worktree` realization for this config would land.
+ *
+ * Extracted so callers can know the target directory **before** realizing it.
+ * That matters for the single-writer path (VANA-4055): a worktree must be
+ * claimed before `realizeExecutionWorkspace` touches it, because realization is
+ * not read-only — an existing worktree at the same path is *reused*, which runs
+ * the configured `provisionCommand` inside it. Predicting the path with a
+ * separate copy of this arithmetic would be worse than not predicting it at all:
+ * any drift would claim one directory and write to another.
+ *
+ * Note this is the path realization *targets*. It can still land elsewhere when
+ * the branch is already registered to a different worktree, so callers must
+ * re-check the realized cwd rather than assume it matches.
+ */
+export async function resolveExecutionWorktreeTarget(input: {
+  base: ExecutionWorkspaceInput;
+  config: Record<string, unknown>;
+  issue: ExecutionWorkspaceIssueRef | null;
+  agent: ExecutionWorkspaceAgentRef;
+}): Promise<{ repoRoot: string; branchName: string; worktreeParentDir: string; worktreePath: string }> {
+  const rawStrategy = parseObject(input.config.workspaceStrategy);
+  const repoRoot = await resolveGitOwnerRepoRoot(input.base.baseCwd);
+  const branchTemplate = asString(rawStrategy.branchTemplate, "{{issue.identifier}}-{{slug}}");
+  const renderedBranch = renderWorkspaceTemplate(branchTemplate, {
+    issue: input.issue,
+    agent: input.agent,
+    projectId: input.base.projectId,
+    repoRef: input.base.repoRef,
+  });
+  const branchName = sanitizeBranchName(renderedBranch);
+  const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
+  const worktreeParentDir = configuredParentDir
+    ? resolveConfiguredPath(configuredParentDir, repoRoot)
+    : path.join(repoRoot, ".paperclip", "worktrees");
+  return { repoRoot, branchName, worktreeParentDir, worktreePath: path.join(worktreeParentDir, branchName) };
+}
+
 export async function realizeExecutionWorkspace(input: {
   base: ExecutionWorkspaceInput;
   config: Record<string, unknown>;
@@ -1116,20 +1154,12 @@ export async function realizeExecutionWorkspace(input: {
     };
   }
 
-  const repoRoot = await resolveGitOwnerRepoRoot(input.base.baseCwd);
-  const branchTemplate = asString(rawStrategy.branchTemplate, "{{issue.identifier}}-{{slug}}");
-  const renderedBranch = renderWorkspaceTemplate(branchTemplate, {
+  const { repoRoot, branchName, worktreeParentDir, worktreePath } = await resolveExecutionWorktreeTarget({
+    base: input.base,
+    config: input.config,
     issue: input.issue,
     agent: input.agent,
-    projectId: input.base.projectId,
-    repoRef: input.base.repoRef,
   });
-  const branchName = sanitizeBranchName(renderedBranch);
-  const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
-  const worktreeParentDir = configuredParentDir
-    ? resolveConfiguredPath(configuredParentDir, repoRoot)
-    : path.join(repoRoot, ".paperclip", "worktrees");
-  const worktreePath = path.join(worktreeParentDir, branchName);
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
     ? rawStrategy.baseRef
     : input.base.repoRef ?? null;

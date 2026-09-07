@@ -98,10 +98,19 @@ import {
   persistAdapterManagedRuntimeServices,
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
+  resolveExecutionWorktreeTarget,
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
   sanitizeRuntimeServiceBaseEnv,
 } from "./workspace-runtime.js";
+import {
+  sharedWorkspaceClaimService,
+} from "./shared-workspace-claims.js";
+import {
+  acquireSharedWorkspaceWriter,
+  buildIsolationBranchNames,
+  SharedWorkspaceIsolationError,
+} from "./shared-workspace-writer.js";
 import { issueService } from "./issues.js";
 import {
   buildIssueMonitorClearedPatch,
@@ -3028,6 +3037,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const treeControlSvc = issueTreeControlService(db);
   const executionWorkspacesSvc = executionWorkspaceService(db);
   const environmentsSvc = environmentService(db);
+  const sharedWorkspaceClaimsSvc = sharedWorkspaceClaimService(db);
   const environmentRuntime = options.environmentRuntime ?? environmentRuntimeService(db, {
     pluginWorkerManager: options.pluginWorkerManager,
   });
@@ -3052,6 +3062,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string | null | undefined;
     failureReason?: string | null;
   }) {
+    // VANA-4055: the run is done writing, so hand the checkout back before the
+    // next contender has to decide whether this claim is stale.
+    await sharedWorkspaceClaimsSvc.releaseForRun(input.runId).catch((err) => {
+      logger.warn({ err, runId: input.runId }, "failed to release shared workspace claims for heartbeat run");
+      return 0;
+    });
     const releaseResult = await envOrchestrator.releaseForRun({
       heartbeatRunId: input.runId,
       companyId: input.companyId,
@@ -7750,6 +7766,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (reaped.length > 0) {
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }
+    // VANA-4055: backstop for shared-checkout claims whose owning run died
+    // without reaching the run-end release path. Without this a hard crash would
+    // leave a directory claimed until its TTL expires, needlessly isolating
+    // every later run into a fresh worktree.
+    const releasedClaims = await sharedWorkspaceClaimsSvc.reapStaleClaims().catch((err) => {
+      logger.warn({ err }, "failed to reap stale shared workspace claims");
+      return 0;
+    });
+    if (releasedClaims > 0) {
+      logger.warn({ releasedClaims }, "released stale shared workspace claims");
+    }
     return { reaped: reaped.length, runIds: reaped };
   }
 
@@ -8453,50 +8480,151 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       repoUrl: resolvedWorkspace.repoUrl,
       repoRef: resolvedWorkspace.repoRef,
     } satisfies ExecutionWorkspaceInput;
-    const reusedExecutionWorkspace = shouldReuseExisting && existingExecutionWorkspace
-      ? await ensurePersistedExecutionWorkspaceAvailable({
-          base: executionWorkspaceBase,
-          workspace: {
-            mode: existingExecutionWorkspace.mode,
-            strategyType: existingExecutionWorkspace.strategyType,
-            cwd: existingExecutionWorkspace.cwd,
-            providerRef: existingExecutionWorkspace.providerRef,
-            projectId: existingExecutionWorkspace.projectId,
-            projectWorkspaceId: existingExecutionWorkspace.projectWorkspaceId,
-            repoUrl: existingExecutionWorkspace.repoUrl,
-            baseRef: existingExecutionWorkspace.baseRef,
-            branchName: existingExecutionWorkspace.branchName,
-            metadata: existingExecutionWorkspace.metadata as Record<string, unknown> | null,
-            config: {
-              provisionCommand:
-                existingExecutionWorkspace.config?.provisionCommand
-                ?? projectExecutionWorkspacePolicy?.workspaceStrategy?.provisionCommand
-                ?? null,
+    // VANA-4055: single-writer enforcement for on-disk checkouts.
+    //
+    // The claim below is taken on the directory this run is about to write to,
+    // *before* `ensurePersistedExecutionWorkspaceAvailable` / `realizeExecutionWorkspace`
+    // mutate git. VANA-4049 claimed after realization, which could record a race
+    // but never win it. On contention the run is moved into its own worktree
+    // rather than failed, because shared-checkout collisions are routine across
+    // the fleet; fail-close is reserved for isolation being impossible.
+    const configuredWorkspaceStrategy = parseObject(hostExecutionWorkspaceConfig.workspaceStrategy);
+    const expectSharedCheckout = configuredWorkspaceStrategy.type !== "git_worktree";
+    const predictedCheckoutCwd = shouldReuseExisting && existingExecutionWorkspace?.cwd
+      ? existingExecutionWorkspace.cwd
+      : resolvedWorkspace.cwd;
+    // Isolation candidates, tried in order and each claimed before use.
+    const isolationBranchNames = buildIsolationBranchNames({
+      label: issueRef?.identifier ?? agent.name,
+      runId: run.id,
+    });
+    const realizeConfiguredExecutionWorkspace = async (): Promise<RealizedExecutionWorkspace> => {
+      const reusedExecutionWorkspace = shouldReuseExisting && existingExecutionWorkspace
+        ? await ensurePersistedExecutionWorkspaceAvailable({
+            base: executionWorkspaceBase,
+            workspace: {
+              mode: existingExecutionWorkspace.mode,
+              strategyType: existingExecutionWorkspace.strategyType,
+              cwd: existingExecutionWorkspace.cwd,
+              providerRef: existingExecutionWorkspace.providerRef,
+              projectId: existingExecutionWorkspace.projectId,
+              projectWorkspaceId: existingExecutionWorkspace.projectWorkspaceId,
+              repoUrl: existingExecutionWorkspace.repoUrl,
+              baseRef: existingExecutionWorkspace.baseRef,
+              branchName: existingExecutionWorkspace.branchName,
+              metadata: existingExecutionWorkspace.metadata as Record<string, unknown> | null,
+              config: {
+                provisionCommand:
+                  existingExecutionWorkspace.config?.provisionCommand
+                  ?? projectExecutionWorkspacePolicy?.workspaceStrategy?.provisionCommand
+                  ?? null,
+              },
             },
+            issue: issueRef,
+            agent: {
+              id: agent.id,
+              name: agent.name,
+              companyId: agent.companyId,
+            },
+            recorder: workspaceOperationRecorder,
+          }) ?? buildRealizedExecutionWorkspaceFromPersisted({
+            base: executionWorkspaceBase,
+            workspace: existingExecutionWorkspace,
+          })
+        : null;
+      return reusedExecutionWorkspace ?? await realizeExecutionWorkspace({
+        base: executionWorkspaceBase,
+        config: hostExecutionWorkspaceConfig,
+        issue: issueRef,
+        agent: {
+          id: agent.id,
+          name: agent.name,
+          companyId: agent.companyId,
+        },
+        recorder: workspaceOperationRecorder,
+      });
+    };
+    const isolationConfigFor = (attempt: number) => ({
+      ...hostExecutionWorkspaceConfig,
+      workspaceStrategy: {
+        ...configuredWorkspaceStrategy,
+        type: "git_worktree",
+        branchTemplate: isolationBranchNames[Math.min(attempt, isolationBranchNames.length - 1)],
+      },
+    });
+    // Resolved through the same helper realization uses, so the directory we
+    // claim and the directory we write cannot drift apart.
+    const resolveIsolationCandidateCwd = async (attempt: number): Promise<string | null> => {
+      const target = await resolveExecutionWorktreeTarget({
+        base: executionWorkspaceBase,
+        config: isolationConfigFor(attempt),
+        issue: issueRef,
+        agent: {
+          id: agent.id,
+          name: agent.name,
+          companyId: agent.companyId,
+        },
+      });
+      return target.worktreePath;
+    };
+    const realizeIsolatedExecutionWorkspace = async (attempt: number): Promise<RealizedExecutionWorkspace> =>
+      await realizeExecutionWorkspace({
+        base: executionWorkspaceBase,
+        config: isolationConfigFor(attempt),
+        issue: issueRef,
+        agent: {
+          id: agent.id,
+          name: agent.name,
+          companyId: agent.companyId,
+        },
+        recorder: workspaceOperationRecorder,
+      });
+    const sharedWorkspaceWriter = await acquireSharedWorkspaceWriter({
+      claims: sharedWorkspaceClaimsSvc,
+      companyId: agent.companyId,
+      agentId: agent.id,
+      heartbeatRunId: run.id,
+      issueId: issueId ?? null,
+      expectSharedCheckout,
+      predictedCwd: predictedCheckoutCwd,
+      realizeConfigured: realizeConfiguredExecutionWorkspace,
+      resolveIsolationCandidateCwd,
+      realizeIsolated: realizeIsolatedExecutionWorkspace,
+      isolationAttempts: isolationBranchNames.length,
+      logger,
+    }).catch((error: unknown) => {
+      if (error instanceof SharedWorkspaceIsolationError) {
+        // Fail-close. Surfaced explicitly because the alternative — sharing the
+        // checkout with a live writer — silently corrupts the other run's work.
+        logger.error(
+          {
+            runId: run.id,
+            issueId,
+            code: error.code,
+            contendedCwd: error.contendedCwd,
+            ownerRunId: error.owner?.heartbeatRunId ?? null,
+            cause: error.cause instanceof Error ? error.cause.message : undefined,
           },
-          issue: issueRef,
-          agent: {
-            id: agent.id,
-            name: agent.name,
-            companyId: agent.companyId,
-          },
-          recorder: workspaceOperationRecorder,
-        }) ?? buildRealizedExecutionWorkspaceFromPersisted({
-          base: executionWorkspaceBase,
-          workspace: existingExecutionWorkspace,
-        })
-      : null;
-    const executionWorkspace = reusedExecutionWorkspace ?? await realizeExecutionWorkspace({
-          base: executionWorkspaceBase,
-          config: hostExecutionWorkspaceConfig,
-          issue: issueRef,
-          agent: {
-            id: agent.id,
-            name: agent.name,
-            companyId: agent.companyId,
-          },
-          recorder: workspaceOperationRecorder,
-        });
+          "Failing run: shared checkout is held by another live writer and isolation was not possible",
+        );
+      }
+      throw error;
+    });
+    const executionWorkspace: RealizedExecutionWorkspace = sharedWorkspaceWriter.warnings.length > 0
+      ? {
+          ...sharedWorkspaceWriter.workspace,
+          warnings: [...sharedWorkspaceWriter.workspace.warnings, ...sharedWorkspaceWriter.warnings],
+        }
+      : sharedWorkspaceWriter.workspace;
+    // An isolated run writes to its own worktree, so it must not overwrite the
+    // shared execution_workspace row it was originally pointed at.
+    const effectiveShouldReuseExisting = shouldReuseExisting && sharedWorkspaceWriter.mode !== "isolated";
+    context.paperclipSharedWorkspace = {
+      mode: sharedWorkspaceWriter.mode,
+      claimedBeforeCheckout: sharedWorkspaceWriter.claimedBeforeCheckout,
+      claimedCwd: sharedWorkspaceWriter.claimedCwd,
+      ...(sharedWorkspaceWriter.contention ? { contention: sharedWorkspaceWriter.contention } : {}),
+    };
     const resolvedProjectId = executionWorkspace.projectId ?? issueRef?.projectId ?? executionProjectId ?? null;
     const resolvedProjectWorkspaceId = issueRef?.projectWorkspaceId ?? resolvedWorkspace.workspaceId ?? null;
     let persistedExecutionWorkspace = null;
@@ -8505,12 +8633,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       source: executionWorkspace.source,
       createdByRuntime: executionWorkspace.created,
       configSnapshot,
-      shouldReuseExisting,
+      shouldReuseExisting: effectiveShouldReuseExisting,
       baseRef: executionWorkspace.repoRef,
       baseRefSha: executionWorkspace.baseRefSha ?? null,
     });
+    if (sharedWorkspaceWriter.contention && nextExecutionWorkspaceMetadata) {
+      // VANA-4055: a worktree created only to dodge a collision has nothing
+      // pointing at it once the run ends. Mark it so operators can find and
+      // close these rather than discovering them as unexplained directories.
+      nextExecutionWorkspaceMetadata.sharedWorkspaceIsolation = {
+        ...sharedWorkspaceWriter.contention,
+        heartbeatRunId: run.id,
+      };
+    }
     try {
-      persistedExecutionWorkspace = shouldReuseExisting && existingExecutionWorkspace
+      persistedExecutionWorkspace = effectiveShouldReuseExisting && existingExecutionWorkspace
         ? await executionWorkspacesSvc.update(existingExecutionWorkspace.id, {
             cwd: executionWorkspace.cwd,
             repoUrl: executionWorkspace.repoUrl,
@@ -8597,14 +8734,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       existingExecutionWorkspace &&
       persistedExecutionWorkspace &&
       existingExecutionWorkspace.id !== persistedExecutionWorkspace.id &&
-      existingExecutionWorkspace.status === "active"
+      existingExecutionWorkspace.status === "active" &&
+      // VANA-4055: an isolated run moved aside from a workspace another live run
+      // is still writing. Idling that row here would retire a workspace that is
+      // in active use by its rightful owner.
+      sharedWorkspaceWriter.mode !== "isolated"
     ) {
       await executionWorkspacesSvc.update(existingExecutionWorkspace.id, {
         status: "idle",
         cleanupReason: null,
       });
     }
-    if (issueId && persistedExecutionWorkspace) {
+    // VANA-4055: isolation is a per-run detour around a transient collision, not
+    // a reconfiguration of the issue. Repointing the issue at a run-scoped
+    // worktree here would make one race permanently change where the issue works.
+    if (issueId && persistedExecutionWorkspace && sharedWorkspaceWriter.mode !== "isolated") {
       const nextIssueWorkspaceMode = issueExecutionWorkspaceModeForPersistedWorkspace(persistedExecutionWorkspace.mode);
       const shouldSwitchIssueToExistingWorkspace =
         issueRef?.executionWorkspacePreference === "reuse_existing" ||
@@ -8854,6 +8998,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, run.id));
       lastOutputFlushAt = pendingOutputProgress.at;
       outputProgressState.pending = null;
+      // VANA-4055: keep an observable "this writer was alive at" stamp on the
+      // checkout claim. Steal decisions are made on run status, not on this
+      // timestamp, so a stale stamp can never hand the directory away — it is
+      // here so operators reading `shared_workspace_claims` can tell a working
+      // writer from a wedged one.
+      await sharedWorkspaceClaimsSvc.touch(run.id).catch(() => 0);
     };
     try {
       const startedAt = run.startedAt ?? new Date();
