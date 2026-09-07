@@ -49,6 +49,14 @@ export const sharedWorkspaceClaims = pgTable(
     activeKeyUq: uniqueIndex("shared_workspace_claims_active_key_uq")
       .on(table.claimKey)
       .where(sql`${table.status} = 'active'`),
+    // Second key on the normalized path. The two indexes cover each other's blind
+    // spot: an inode changes when a checkout is deleted and re-cloned mid-claim
+    // (same path, new inode), and a path string differs between case-aliased or
+    // not-yet-created spellings of one directory (same inode, new path). A writer
+    // must win both to be admitted.
+    activeCwdUq: uniqueIndex("shared_workspace_claims_active_cwd_uq")
+      .on(table.cwd)
+      .where(sql`${table.status} = 'active'`),
     runIdx: index("shared_workspace_claims_run_idx").on(table.heartbeatRunId, table.status),
     statusHeartbeatIdx: index("shared_workspace_claims_status_heartbeat_idx").on(table.status, table.heartbeatAt),
   }),

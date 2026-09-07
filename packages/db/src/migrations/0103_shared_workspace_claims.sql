@@ -34,5 +34,6 @@ EXCEPTION
 END $$;
 --> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS "shared_workspace_claims_active_key_uq" ON "shared_workspace_claims" USING btree ("claim_key") WHERE "status" = 'active';--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "shared_workspace_claims_active_cwd_uq" ON "shared_workspace_claims" USING btree ("cwd") WHERE "status" = 'active';--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "shared_workspace_claims_run_idx" ON "shared_workspace_claims" USING btree ("heartbeat_run_id","status");--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "shared_workspace_claims_status_heartbeat_idx" ON "shared_workspace_claims" USING btree ("status","heartbeat_at");

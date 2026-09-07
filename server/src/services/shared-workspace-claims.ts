@@ -1,6 +1,6 @@
 import { stat, realpath } from "node:fs/promises";
 import { resolve as resolvePath } from "node:path";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, sharedWorkspaceClaims } from "@paperclipai/db";
 
@@ -14,12 +14,6 @@ import { heartbeatRuns, sharedWorkspaceClaims } from "@paperclipai/db";
  * a partial unique index rather than by an in-process lock (which cannot span
  * the multiple server processes / concurrent runs that actually collide).
  */
-
-// A claim whose owning run is terminal, missing, or has shown no liveness signal
-// for this long is stealable. Deliberately much larger than the 5 minute orphan
-// reaper interval: the reaper is the primary release path for crashed runs, and
-// this TTL is only the backstop for when it, too, failed to run.
-export const DEFAULT_CLAIM_STALE_AFTER_MS = 30 * 60 * 1000;
 
 const LIVE_RUN_STATUSES = ["queued", "scheduled_retry", "running"] as const;
 
@@ -81,42 +75,58 @@ function isUniqueViolation(error: unknown): boolean {
 
 export function sharedWorkspaceClaimService(
   db: Db,
-  options?: { staleAfterMs?: number; now?: () => Date },
+  options?: { now?: () => Date },
 ) {
-  const staleAfterMs = options?.staleAfterMs ?? DEFAULT_CLAIM_STALE_AFTER_MS;
   const now = options?.now ?? (() => new Date());
 
-  async function loadActiveClaim(claimKey: string): Promise<SharedWorkspaceClaimRow | null> {
+  /**
+   * Find the active claim blocking `identity`. Either unique index can reject the
+   * insert, so both keys are consulted — looking up only `claim_key` would return
+   * nothing when it was the path index that rejected us, and the caller would
+   * then see contention with no owner to report.
+   */
+  async function loadActiveClaim(identity: SharedWorkspaceIdentity): Promise<SharedWorkspaceClaimRow | null> {
     return await db
       .select()
       .from(sharedWorkspaceClaims)
-      .where(and(eq(sharedWorkspaceClaims.claimKey, claimKey), eq(sharedWorkspaceClaims.status, "active")))
+      .where(
+        and(
+          eq(sharedWorkspaceClaims.status, "active"),
+          or(
+            eq(sharedWorkspaceClaims.claimKey, identity.key),
+            eq(sharedWorkspaceClaims.cwd, identity.cwd),
+          ),
+        ),
+      )
       .then((rows) => rows[0] ?? null);
   }
 
   /**
    * Is the run that owns `claim` still plausibly writing to the directory?
    *
-   * Terminal or vanished runs are dead outright. A run that still looks live is
-   * treated as live until the TTL expires — deliberately conservative, because
-   * wrongly declaring a live owner dead is the one failure mode that reintroduces
-   * the double writer this service exists to prevent. Wrongly declaring a dead
-   * owner live only costs the caller an isolated worktree.
+   * The answer is the owning run's status and nothing else. There is deliberately
+   * **no elapsed-time TTL**: `heartbeat_runs.updated_at` only advances when the
+   * adapter emits output, so a run sitting in one long silent tool call (a long
+   * build, a long test suite) is indistinguishable from a dead one by mtime. A
+   * TTL would hand its checkout to a second writer mid-write — precisely the
+   * corruption this service exists to prevent.
+   *
+   * Crashed runs are released by status instead: `reapOrphanedRuns` checks real
+   * process liveness every 5 minutes and moves dead runs to a terminal status,
+   * after which the claim is stealable (and `reapStaleClaims` sweeps it in the
+   * same pass). The failure mode of that layering is asymmetric and correct: a
+   * dead owner briefly believed live costs the next run one extra worktree,
+   * whereas a live owner believed dead costs a concurrent overwrite.
    */
   async function isClaimOwnerLive(claim: SharedWorkspaceClaimRow): Promise<boolean> {
     if (!claim.heartbeatRunId) return false;
     const run = await db
-      .select({ status: heartbeatRuns.status, updatedAt: heartbeatRuns.updatedAt })
+      .select({ status: heartbeatRuns.status })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, claim.heartbeatRunId))
       .then((rows) => rows[0] ?? null);
     if (!run) return false;
-    if (!(LIVE_RUN_STATUSES as readonly string[]).includes(run.status)) return false;
-    const signals = [claim.heartbeatAt, run.updatedAt]
-      .map((value) => (value ? new Date(value).getTime() : 0))
-      .filter((value) => Number.isFinite(value));
-    const lastSignal = signals.length > 0 ? Math.max(...signals) : 0;
-    return now().getTime() - lastSignal <= staleAfterMs;
+    return (LIVE_RUN_STATUSES as readonly string[]).includes(run.status);
   }
 
   async function releaseClaimRow(
@@ -181,8 +191,8 @@ export function sharedWorkspaceClaimService(
               claimedAt: now(),
               heartbeatAt: now(),
               metadata: {
-                identitySource: identity.source,
                 ...(input.metadata ?? {}),
+                identitySource: identity.source,
               },
             })
             .returning();
@@ -192,18 +202,24 @@ export function sharedWorkspaceClaimService(
           if (!isUniqueViolation(error)) throw error;
         }
 
-        const existing = await loadActiveClaim(identity.key);
+        const existing = await loadActiveClaim(identity);
         if (!existing) continue; // released underneath us; retry the insert.
 
         if (existing.heartbeatRunId === input.heartbeatRunId) {
           // Same run re-claiming (e.g. predicted cwd == realized cwd). Refresh
-          // rather than reporting contention against ourselves.
+          // rather than reporting contention against ourselves. Re-keying can
+          // itself collide with a third row; we already hold the directory, so
+          // keep the claim we have instead of failing the run over bookkeeping.
           const refreshed = await db
             .update(sharedWorkspaceClaims)
-            .set({ cwd: identity.cwd, heartbeatAt: now(), updatedAt: now() })
+            .set({ claimKey: identity.key, cwd: identity.cwd, heartbeatAt: now(), updatedAt: now() })
             .where(eq(sharedWorkspaceClaims.id, existing.id))
             .returning()
-            .then((rows) => rows[0] ?? existing);
+            .then((rows) => rows[0] ?? existing)
+            .catch((error: unknown) => {
+              if (!isUniqueViolation(error)) throw error;
+              return existing;
+            });
           return { claimed: true, claim: refreshed, owner: null };
         }
 
@@ -214,11 +230,16 @@ export function sharedWorkspaceClaimService(
         const stolen = await releaseClaimRow(existing.id, "owner_run_not_live");
         if (!stolen) continue; // Someone else released/replaced it; retry.
       }
-      const finalOwner = await loadActiveClaim(identity.key);
+      const finalOwner = await loadActiveClaim(identity);
+      if (finalOwner?.heartbeatRunId === input.heartbeatRunId) {
+        // We already hold it; reporting contention against ourselves would send
+        // the caller off to isolate from its own claim.
+        return { claimed: true, claim: finalOwner, owner: null };
+      }
       return {
         claimed: false,
         claim: null,
-        owner: finalOwner && finalOwner.heartbeatRunId !== input.heartbeatRunId ? toOwner(finalOwner) : null,
+        owner: finalOwner ? toOwner(finalOwner) : null,
       };
     },
 

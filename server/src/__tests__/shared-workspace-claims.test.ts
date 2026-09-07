@@ -230,22 +230,89 @@ describeEmbeddedPostgres("sharedWorkspaceClaimService", () => {
     expect(stolen.claim?.heartbeatRunId).toBe(runIds[1]);
   });
 
-  it("keeps a live but silent owner's claim until the TTL expires", async () => {
+  it("never steals from a live owner, however long it has been silent", async () => {
     const { companyId, agentId, runIds } = await seed(2);
     const identity = await resolveSharedWorkspaceIdentity(await makeTempCheckout());
 
     await svc.claim({ identity, companyId, agentId, heartbeatRunId: runIds[0]! });
 
-    // A long-running run that has not updated any row recently is still a live
-    // writer. Declaring it dead is the one error that re-creates a double writer.
-    const stillBlocked = await svc.claim({ identity, companyId, agentId, heartbeatRunId: runIds[1]! });
-    expect(stillBlocked.claimed).toBe(false);
+    // `heartbeat_runs.updated_at` only advances when the adapter emits output, so
+    // a run inside one long silent tool call looks identical to a dead one by
+    // timestamp. Ageing the clock must not hand its checkout to a second writer:
+    // that is the exact overwrite this service exists to prevent.
+    await db
+      .update(heartbeatRuns)
+      .set({ updatedAt: new Date(Date.now() - 24 * 60 * 60 * 1000) })
+      .where(eq(heartbeatRuns.id, runIds[0]!));
+    await db
+      .update(sharedWorkspaceClaims)
+      .set({ heartbeatAt: new Date(Date.now() - 24 * 60 * 60 * 1000) })
+      .where(eq(sharedWorkspaceClaims.heartbeatRunId, runIds[0]!));
 
-    const pastTtl = sharedWorkspaceClaimService(db, {
-      now: () => new Date(Date.now() + 31 * 60 * 1000),
+    const aDayLater = sharedWorkspaceClaimService(db, {
+      now: () => new Date(Date.now() + 24 * 60 * 60 * 1000),
     });
-    const afterTtl = await pastTtl.claim({ identity, companyId, agentId, heartbeatRunId: runIds[1]! });
-    expect(afterTtl.claimed).toBe(true);
+    const blocked = await aDayLater.claim({ identity, companyId, agentId, heartbeatRunId: runIds[1]! });
+    expect(blocked.claimed).toBe(false);
+    expect(blocked.owner?.heartbeatRunId).toBe(runIds[0]);
+
+    // And the backstop sweep must agree: a live run's claim is not stale.
+    expect(await aDayLater.reapStaleClaims()).toBe(0);
+  });
+
+  it("contends on the path when the directory is recreated under a new inode", async () => {
+    const { companyId, agentId, runIds } = await seed(2);
+    const cwd = await makeTempCheckout();
+    const first = await resolveSharedWorkspaceIdentity(cwd);
+    await svc.claim({ identity: first, companyId, agentId, heartbeatRunId: runIds[0]! });
+
+    // A checkout repaired by delete-and-reclone keeps its path but gets a new
+    // inode. Keying on the inode alone would let the next run walk straight in
+    // while the first is still writing.
+    await rm(cwd, { recursive: true, force: true });
+    await mkdir(cwd, { recursive: true });
+    const recreated = await resolveSharedWorkspaceIdentity(cwd);
+    expect(recreated.key).not.toBe(first.key);
+    expect(recreated.cwd).toBe(first.cwd);
+
+    const blocked = await svc.claim({ identity: recreated, companyId, agentId, heartbeatRunId: runIds[1]! });
+    expect(blocked.claimed).toBe(false);
+    expect(blocked.owner?.heartbeatRunId).toBe(runIds[0]);
+  });
+
+  it("normalizes the path fallback for a directory that does not exist yet", async () => {
+    const { companyId, agentId, runIds } = await seed(2);
+    const parent = await makeTempCheckout();
+    const missing = path.join(parent, "not-created-yet");
+
+    // Before realization the directory has no inode, so the key falls back to the
+    // path — which must still be canonical, or two spellings of one future
+    // checkout would each claim it.
+    const direct = await resolveSharedWorkspaceIdentity(missing);
+    const viaDotHop = await resolveSharedWorkspaceIdentity(path.join(parent, ".", "not-created-yet"));
+    expect(direct.source).toBe("path");
+    expect(direct.key).toBe(`path:${direct.cwd}`);
+    expect(viaDotHop.key).toBe(direct.key);
+
+    const first = await svc.claim({ identity: direct, companyId, agentId, heartbeatRunId: runIds[0]! });
+    const second = await svc.claim({ identity: viaDotHop, companyId, agentId, heartbeatRunId: runIds[1]! });
+    expect(first.claimed).toBe(true);
+    expect(second.claimed).toBe(false);
+  });
+
+  it("treats queued and scheduled_retry owners as live", async () => {
+    const { companyId, agentId, runIds } = await seed(2);
+    const identity = await resolveSharedWorkspaceIdentity(await makeTempCheckout());
+    await svc.claim({ identity, companyId, agentId, heartbeatRunId: runIds[0]! });
+
+    for (const status of ["queued", "scheduled_retry"]) {
+      await db
+        .update(heartbeatRuns)
+        .set({ status })
+        .where(eq(heartbeatRuns.id, runIds[0]!));
+      const blocked = await svc.claim({ identity, companyId, agentId, heartbeatRunId: runIds[1]! });
+      expect(blocked.claimed, `status ${status} must not be stealable`).toBe(false);
+    }
   });
 
   it("reaps claims left behind by runs that are no longer live", async () => {

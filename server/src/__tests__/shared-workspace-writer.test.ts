@@ -12,7 +12,9 @@ import {
 import { sharedWorkspaceClaimService } from "../services/shared-workspace-claims.ts";
 import {
   acquireSharedWorkspaceWriter,
+  buildIsolationBranchNames,
   SharedWorkspaceIsolationError,
+  STABLE_ISOLATION_SLOTS,
 } from "../services/shared-workspace-writer.ts";
 import type { RealizedExecutionWorkspace } from "../services/workspace-runtime.ts";
 
@@ -108,6 +110,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       predictedCwd: shared,
       realizeConfigured: async () => workspaceAt(shared, "project_primary"),
       realizeIsolated: async () => { throw new Error("must not isolate"); },
+      isolationAttempts: 1,
     });
 
     expect(result.mode).toBe("exclusive");
@@ -136,6 +139,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
         return workspaceAt(shared, "project_primary");
       },
       realizeIsolated: async () => workspaceAt(isolated, "git_worktree"),
+      isolationAttempts: 1,
     });
 
     // The ordering guarantee: realization of the shared checkout is never
@@ -164,6 +168,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       predictedCwd: shared,
       realizeConfigured: async () => workspaceAt(shared, "project_primary"),
       realizeIsolated: async () => workspaceAt(isolated, "git_worktree"),
+      isolationAttempts: 1,
     });
 
     const active = await db
@@ -192,6 +197,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       predictedCwd: shared,
       realizeConfigured: async () => workspaceAt(shared, "project_primary"),
       realizeIsolated: async () => { throw new Error("not a git checkout"); },
+      isolationAttempts: 1,
     })).rejects.toBeInstanceOf(SharedWorkspaceIsolationError);
 
     const active = await db
@@ -220,6 +226,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       predictedCwd: worktree,
       realizeConfigured: async () => workspaceAt(worktree, "git_worktree"),
       realizeIsolated: async () => workspaceAt(isolated, "git_worktree"),
+      isolationAttempts: 1,
     });
 
     expect(result.mode).toBe("isolated");
@@ -237,6 +244,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       predictedCwd: repoRoot,
       realizeConfigured: async () => workspaceAt(worktree, "git_worktree"),
       realizeIsolated: async () => { throw new Error("must not isolate"); },
+      isolationAttempts: 1,
     });
 
     // Claiming the repo root here would wrongly lock out every other run that
@@ -261,6 +269,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
       predictedCwd: predicted,
       realizeConfigured: async () => workspaceAt(actual, "git_worktree"),
       realizeIsolated: async () => { throw new Error("must not isolate"); },
+      isolationAttempts: 1,
     });
 
     expect(result.mode).toBe("exclusive");
@@ -283,6 +292,7 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
         predictedCwd: shared,
         realizeConfigured: async () => workspaceAt(shared, "project_primary"),
         realizeIsolated: async () => workspaceAt(isolatedFor[runId]!, "git_worktree"),
+        isolationAttempts: 1,
       }),
     ));
 
@@ -292,5 +302,130 @@ describeEmbeddedPostgres("acquireSharedWorkspaceWriter (isolate-on-contention)",
     expect(new Set(cwds).size).toBe(2);
     expect(results.filter((r) => r.mode === "exclusive")).toHaveLength(1);
     expect(results.filter((r) => r.mode === "isolated")).toHaveLength(1);
+  });
+
+  it("reuses the first isolation slot when nobody else holds it", async () => {
+    // The reason slots are stable rather than run-scoped: routine contention must
+    // not leave a fresh worktree behind on every single collision.
+    const { companyId, agentId, runIds } = await seed(3);
+    const shared = await makeDir("shared");
+    const slot0 = await makeDir("slot-0");
+    const slot1 = await makeDir("slot-1");
+    const slots = [slot0, slot1];
+
+    await claims.claim({
+      identity: await claims.resolveIdentity(shared),
+      companyId, agentId, heartbeatRunId: runIds[0]!,
+    });
+
+    const first = await acquireSharedWorkspaceWriter({
+      claims, companyId, agentId, heartbeatRunId: runIds[1]!, issueId: null,
+      expectSharedCheckout: true,
+      predictedCwd: shared,
+      realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      realizeIsolated: async (attempt) => workspaceAt(slots[attempt]!, "git_worktree"),
+      isolationAttempts: slots.length,
+    });
+    expect(first.workspace.cwd).toBe(slot0);
+
+    // Once that run ends, the next contender takes the same slot back rather than
+    // creating another directory.
+    await claims.releaseForRun(runIds[1]!);
+    const second = await acquireSharedWorkspaceWriter({
+      claims, companyId, agentId, heartbeatRunId: runIds[2]!, issueId: null,
+      expectSharedCheckout: true,
+      predictedCwd: shared,
+      realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      realizeIsolated: async (attempt) => workspaceAt(slots[attempt]!, "git_worktree"),
+      isolationAttempts: slots.length,
+    });
+    expect(second.workspace.cwd).toBe(slot0);
+  });
+
+  it("moves to the next slot when the first is held by another live run", async () => {
+    const { companyId, agentId, runIds } = await seed(3);
+    const shared = await makeDir("shared");
+    const slot0 = await makeDir("slot-0");
+    const slot1 = await makeDir("slot-1");
+    const slots = [slot0, slot1];
+
+    await claims.claim({
+      identity: await claims.resolveIdentity(shared),
+      companyId, agentId, heartbeatRunId: runIds[0]!,
+    });
+    await claims.claim({
+      identity: await claims.resolveIdentity(slot0),
+      companyId, agentId, heartbeatRunId: runIds[1]!,
+    });
+
+    const result = await acquireSharedWorkspaceWriter({
+      claims, companyId, agentId, heartbeatRunId: runIds[2]!, issueId: null,
+      expectSharedCheckout: true,
+      predictedCwd: shared,
+      realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      realizeIsolated: async (attempt) => workspaceAt(slots[attempt]!, "git_worktree"),
+      isolationAttempts: slots.length,
+    });
+
+    expect(result.mode).toBe("isolated");
+    expect(result.workspace.cwd).toBe(slot1);
+  });
+
+  it("fails closed when every isolation slot is held by a live run", async () => {
+    const { companyId, agentId, runIds } = await seed(3);
+    const shared = await makeDir("shared");
+    const slot0 = await makeDir("slot-0");
+
+    for (const [index, dir] of [shared, slot0].entries()) {
+      await claims.claim({
+        identity: await claims.resolveIdentity(dir),
+        companyId, agentId, heartbeatRunId: runIds[index]!,
+      });
+    }
+
+    await expect(acquireSharedWorkspaceWriter({
+      claims, companyId, agentId, heartbeatRunId: runIds[2]!, issueId: null,
+      expectSharedCheckout: true,
+      predictedCwd: shared,
+      realizeConfigured: async () => workspaceAt(shared, "project_primary"),
+      realizeIsolated: async () => workspaceAt(slot0, "git_worktree"),
+      isolationAttempts: 1,
+    })).rejects.toBeInstanceOf(SharedWorkspaceIsolationError);
+  });
+});
+
+describe("buildIsolationBranchNames", () => {
+  // Mirrors sanitizeBranchName in workspace-runtime.ts, whose 120-character
+  // truncation is the hazard these names are shaped around.
+  function sanitizeBranchName(value: string): string {
+    return value
+      .trim()
+      .replace(/[^A-Za-z0-9._/-]+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^[-/.]+|[-/.]+$/g, "")
+      .slice(0, 120) || "paperclip-work";
+  }
+
+  it("produces distinct candidates ending in a run-scoped one", () => {
+    const names = buildIsolationBranchNames({ label: "PAP-4055", runId: "abcdef12-3456-7890-abcd-ef1234567890" });
+    expect(names).toHaveLength(STABLE_ISOLATION_SLOTS + 1);
+    expect(new Set(names).size).toBe(names.length);
+    // The last candidate must always be free, or a fully occupied set of stable
+    // slots would fail the run instead of isolating it.
+    expect(names.at(-1)).toContain("abcdef12");
+  });
+
+  it("keeps two runs distinct after branch-name truncation", () => {
+    // A label long enough to push a trailing suffix past 120 characters. If the
+    // run id were appended rather than prefixed, both runs would sanitize to the
+    // same branch and land in the same worktree.
+    const label = "X".repeat(200);
+    const a = buildIsolationBranchNames({ label, runId: "aaaaaaaa-0000-0000-0000-000000000000" });
+    const b = buildIsolationBranchNames({ label, runId: "bbbbbbbb-0000-0000-0000-000000000000" });
+    expect(sanitizeBranchName(a.at(-1)!)).not.toBe(sanitizeBranchName(b.at(-1)!));
+
+    // The same must hold between the stable slots of a single run.
+    const sanitized = a.map(sanitizeBranchName);
+    expect(new Set(sanitized).size).toBe(sanitized.length);
   });
 });

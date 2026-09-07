@@ -107,6 +107,7 @@ import {
 } from "./shared-workspace-claims.js";
 import {
   acquireSharedWorkspaceWriter,
+  buildIsolationBranchNames,
   SharedWorkspaceIsolationError,
 } from "./shared-workspace-writer.js";
 import { issueService } from "./issues.js";
@@ -8443,9 +8444,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const predictedCheckoutCwd = shouldReuseExisting && existingExecutionWorkspace?.cwd
       ? existingExecutionWorkspace.cwd
       : resolvedWorkspace.cwd;
-    // Run-scoped so that two concurrent runs of the same issue (which render the
-    // same configured branch template) cannot land in one worktree.
-    const isolationBranchName = `${issueRef?.identifier ?? agent.name}-isolated-${run.id.slice(0, 8)}`;
+    // Isolation candidates, tried in order and each claimed before use.
+    const isolationBranchNames = buildIsolationBranchNames({
+      label: issueRef?.identifier ?? agent.name,
+      runId: run.id,
+    });
     const realizeConfiguredExecutionWorkspace = async (): Promise<RealizedExecutionWorkspace> => {
       const reusedExecutionWorkspace = shouldReuseExisting && existingExecutionWorkspace
         ? await ensurePersistedExecutionWorkspaceAvailable({
@@ -8492,7 +8495,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         recorder: workspaceOperationRecorder,
       });
     };
-    const realizeIsolatedExecutionWorkspace = async (): Promise<RealizedExecutionWorkspace> =>
+    const realizeIsolatedExecutionWorkspace = async (attempt: number): Promise<RealizedExecutionWorkspace> =>
       await realizeExecutionWorkspace({
         base: executionWorkspaceBase,
         config: {
@@ -8500,7 +8503,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           workspaceStrategy: {
             ...configuredWorkspaceStrategy,
             type: "git_worktree",
-            branchTemplate: isolationBranchName,
+            branchTemplate: isolationBranchNames[Math.min(attempt, isolationBranchNames.length - 1)],
           },
         },
         issue: issueRef,
@@ -8521,6 +8524,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       predictedCwd: predictedCheckoutCwd,
       realizeConfigured: realizeConfiguredExecutionWorkspace,
       realizeIsolated: realizeIsolatedExecutionWorkspace,
+      isolationAttempts: isolationBranchNames.length,
       logger,
     }).catch((error: unknown) => {
       if (error instanceof SharedWorkspaceIsolationError) {
@@ -8551,6 +8555,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const effectiveShouldReuseExisting = shouldReuseExisting && sharedWorkspaceWriter.mode !== "isolated";
     context.paperclipSharedWorkspace = {
       mode: sharedWorkspaceWriter.mode,
+      claimedBeforeCheckout: sharedWorkspaceWriter.claimedBeforeCheckout,
       claimedCwd: sharedWorkspaceWriter.claimedCwd,
       ...(sharedWorkspaceWriter.contention ? { contention: sharedWorkspaceWriter.contention } : {}),
     };
@@ -8566,6 +8571,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       baseRef: executionWorkspace.repoRef,
       baseRefSha: executionWorkspace.baseRefSha ?? null,
     });
+    if (sharedWorkspaceWriter.contention && nextExecutionWorkspaceMetadata) {
+      // VANA-4055: a worktree created only to dodge a collision has nothing
+      // pointing at it once the run ends. Mark it so operators can find and
+      // close these rather than discovering them as unexplained directories.
+      nextExecutionWorkspaceMetadata.sharedWorkspaceIsolation = {
+        ...sharedWorkspaceWriter.contention,
+        heartbeatRunId: run.id,
+      };
+    }
     try {
       persistedExecutionWorkspace = effectiveShouldReuseExisting && existingExecutionWorkspace
         ? await executionWorkspacesSvc.update(existingExecutionWorkspace.id, {
@@ -8918,6 +8932,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, run.id));
       lastOutputFlushAt = pendingOutputProgress.at;
       outputProgressState.pending = null;
+      // VANA-4055: keep an observable "this writer was alive at" stamp on the
+      // checkout claim. Steal decisions are made on run status, not on this
+      // timestamp, so a stale stamp can never hand the directory away — it is
+      // here so operators reading `shared_workspace_claims` can tell a working
+      // writer from a wedged one.
+      await sharedWorkspaceClaimsSvc.touch(run.id).catch(() => 0);
     };
     try {
       const startedAt = run.startedAt ?? new Date();

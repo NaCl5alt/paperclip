@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -152,6 +152,19 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
       | null;
   }
 
+  async function waitForClaim(runId: string, timeoutMs = 20_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const active = await db
+        .select()
+        .from(sharedWorkspaceClaims)
+        .where(eq(sharedWorkspaceClaims.status, "active"));
+      if (active.some((row) => row.heartbeatRunId === runId)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return false;
+  }
+
   async function waitForRun(
     heartbeat: ReturnType<typeof heartbeatService>,
     runId: string,
@@ -183,17 +196,7 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
 
     // Wait until the holder actually owns the checkout, so the second run is a
     // genuine contender rather than a lucky sequential reuse.
-    const deadline = Date.now() + 20_000;
-    let held = false;
-    while (Date.now() < deadline && !held) {
-      const active = await db
-        .select()
-        .from(sharedWorkspaceClaims)
-        .where(eq(sharedWorkspaceClaims.status, "active"));
-      held = active.some((row) => row.heartbeatRunId === holderRun!.id);
-      if (!held) await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    expect(held).toBe(true);
+    expect(await waitForClaim(holderRun!.id)).toBe(true);
 
     const contenderRun = await heartbeat.wakeup(contenderId, {
       source: "on_demand",
@@ -210,6 +213,10 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
 
     expect(holderShared?.mode).toBe("exclusive");
     expect(contenderShared?.mode).toBe("isolated");
+    // A shared checkout is claimed before any checkout work runs for it. If this
+    // ever flips false, git touched the directory before the writer was decided.
+    expect(holderShared?.claimedBeforeCheckout).toBe(true);
+    expect(contenderShared?.claimedBeforeCheckout).toBe(true);
     // The actual invariant: no two live runs write the same directory.
     expect(contenderShared?.claimedCwd).not.toBe(holderShared?.claimedCwd);
     expect(contenderShared?.contention?.ownerLeaseRunId).toBe(holderRun!.id);
@@ -217,6 +224,17 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
     // The isolated run got a real, separate git worktree off the same repo.
     const { stdout } = await run("git", ["-C", workspaceRoot, "worktree", "list", "--porcelain"]);
     expect(stdout).toContain(String(contenderShared?.claimedCwd));
+
+    // The detour worktree is self-describing, so an operator sweeping stray
+    // directories can tell why it exists and which collision produced it.
+    const isolatedRow = await db
+      .select()
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.cwd, String(contenderShared?.claimedCwd)))
+      .then((rows) => rows[0] ?? null);
+    const isolationMeta = (isolatedRow?.metadata ?? {}) as Record<string, unknown>;
+    expect((isolationMeta.sharedWorkspaceIsolation as Record<string, unknown> | undefined)?.ownerLeaseRunId)
+      .toBe(holderRun!.id);
 
     // Both claims are handed back once the runs end.
     const stillActive = await db
@@ -282,17 +300,7 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
     });
     expect(holderRun).not.toBeNull();
 
-    const deadline = Date.now() + 20_000;
-    let held = false;
-    while (Date.now() < deadline && !held) {
-      const active = await db
-        .select()
-        .from(sharedWorkspaceClaims)
-        .where(eq(sharedWorkspaceClaims.status, "active"));
-      held = active.some((row) => row.heartbeatRunId === holderRun!.id);
-      if (!held) await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    expect(held).toBe(true);
+    expect(await waitForClaim(holderRun!.id)).toBe(true);
 
     const contenderRun = await heartbeat.wakeup(contenderId, {
       source: "on_demand",
@@ -312,6 +320,9 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
       .where(eq(executionWorkspaces.id, sharedExecutionWorkspaceId))
       .then((rows) => rows[0] ?? null);
     expect(sharedRow?.status).toBe("active");
+    // Reusing the shared row for an isolated run would silently repoint the
+    // shared checkout at the detour worktree.
+    expect(sharedRow?.cwd).toBe(workspaceRoot);
 
     // A transient collision must not permanently re-home the issue onto a
     // run-scoped worktree.
@@ -322,4 +333,130 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
       .then((rows) => rows[0] ?? null);
     expect(issueRow?.executionWorkspaceId).toBe(sharedExecutionWorkspaceId);
   }, 60_000);
+
+  it("claims the workspace the run will actually reuse, not the project default", async () => {
+    // The issue reuses a checkout that is *not* the project primary. Predicting
+    // the project primary instead would make this run contend with the holder
+    // over a directory it never touches, and isolate for no reason.
+    const projectRoot = await makeGitCheckout();
+    const reusedRoot = await makeGitCheckout();
+    const { companyId, projectId, projectWorkspaceId } = await seedProject(projectRoot);
+    const holderId = await seedAgent(companyId, "Holder", 4_000);
+    const contenderId = await seedAgent(companyId, "Contender", 0);
+
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+
+    const reusedExecutionWorkspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({
+      id: reusedExecutionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Reused checkout",
+      status: "active",
+      cwd: reusedRoot,
+      providerType: "local_fs",
+      providerRef: reusedRoot,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      projectWorkspaceId,
+      title: "Reuses a non-default checkout",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: contenderId,
+      identifier: "PAP-4055B",
+      executionWorkspaceId: reusedExecutionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const holderRun = await heartbeat.wakeup(holderId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      contextSnapshot: { projectId },
+    });
+    await waitForClaim(holderRun!.id);
+
+    const contenderRun = await heartbeat.wakeup(contenderId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      contextSnapshot: { projectId, issueId },
+    });
+    const finished = await waitForRun(heartbeat, contenderRun!.id);
+    await waitForRun(heartbeat, holderRun!.id);
+
+    const shared = sharedWorkspaceContext(finished?.contextSnapshot);
+    expect(shared?.mode).toBe("exclusive");
+    expect(shared?.claimedCwd).toBe(await realpath(reusedRoot));
+  }, 60_000);
+
+  it("gives three simultaneous runs three different checkouts", async () => {
+    // Two contenders at once: if every isolation candidate rendered the same
+    // branch, the second contender would land in the first one's worktree (or
+    // fail closed). The run-scoped final candidate is what prevents both.
+    const workspaceRoot = await makeGitCheckout();
+    const { companyId, projectId } = await seedProject(workspaceRoot);
+    const holderId = await seedAgent(companyId, "Holder", 6_000);
+    const firstContenderId = await seedAgent(companyId, "ContenderOne", 3_000);
+    const secondContenderId = await seedAgent(companyId, "ContenderTwo", 3_000);
+
+    const heartbeat = heartbeatService(db);
+    const holderRun = await heartbeat.wakeup(holderId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      contextSnapshot: { projectId },
+    });
+    await waitForClaim(holderRun!.id);
+
+    const [first, second] = await Promise.all([
+      heartbeat.wakeup(firstContenderId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        contextSnapshot: { projectId },
+      }),
+      heartbeat.wakeup(secondContenderId, {
+        source: "on_demand",
+        triggerDetail: "manual",
+        contextSnapshot: { projectId },
+      }),
+    ]);
+
+    // Prove the three really were writing at the same time. Without this the
+    // test can silently degrade into three sequential runs, which any wiring
+    // passes — including one where every isolation candidate is the same branch.
+    const overlapDeadline = Date.now() + 30_000;
+    let peakConcurrentClaims = 0;
+    while (Date.now() < overlapDeadline && peakConcurrentClaims < 3) {
+      const active = await db
+        .select()
+        .from(sharedWorkspaceClaims)
+        .where(eq(sharedWorkspaceClaims.status, "active"));
+      peakConcurrentClaims = Math.max(peakConcurrentClaims, active.length);
+      if (peakConcurrentClaims < 3) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(peakConcurrentClaims).toBe(3);
+
+    const finished = await Promise.all([
+      waitForRun(heartbeat, holderRun!.id),
+      waitForRun(heartbeat, first!.id),
+      waitForRun(heartbeat, second!.id),
+    ]);
+
+    for (const finishedRun of finished) {
+      expect(finishedRun?.status).toBe("succeeded");
+    }
+    const cwds = finished.map((r) => sharedWorkspaceContext(r?.contextSnapshot)?.claimedCwd);
+    expect(cwds.every((cwd) => typeof cwd === "string" && cwd.length > 0)).toBe(true);
+    expect(new Set(cwds).size).toBe(3);
+  }, 90_000);
 });
