@@ -340,6 +340,24 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
 
     const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(source?.status).toBe("blocked");
+
+    // The positive half of the park contract. Its negative half lives in the next test; asserting
+    // only that half would let "always write the park" flip to "never write it", which loses the
+    // park from `readBlockedResumeHistory` just as surely as fabricating one corrupts it.
+    const [parkRow] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "heartbeat.output_stale_escalated"),
+        ),
+      );
+    expect(parkRow.details).toMatchObject({
+      status: "blocked",
+      previousStatus: "in_progress",
+      currentStatus: "blocked",
+    });
   });
 
   it("does not record a park when the source issue was already blocked", async () => {
