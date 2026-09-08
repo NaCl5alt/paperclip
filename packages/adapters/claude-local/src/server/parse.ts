@@ -12,9 +12,6 @@ import {
 // line, which includes the raw stdout and stderr. This scope is pre-existing.
 // It supersedes the fork's narrower CLAUDE_AUTH_REQUIRED_RE (every alternative
 // of that regex is present here).
-// The legacy login-prompt markers. The Claude CLI prints these words when it
-// asks the user to log in. The detector matches them against any probe output
-// line, which includes the raw stdout and stderr. This scope is pre-existing.
 const CLAUDE_LOGIN_PROMPT_RE =
   /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 
@@ -625,6 +622,12 @@ export function isClaudeTransientUpstreamError(input: {
 
   const haystack = buildClaudeTransientHaystack(input);
   if (!haystack) return false;
+  // Intentionally no `isClaudeProviderQuotaError` guard here: the two predicates
+  // overlap by design (session/spend limit text matches both). Callers must
+  // evaluate provider quota first and only fall back to the transient branch —
+  // see execute.ts (`!providerQuota` gates) and resolveTransientRetryNotBefore
+  // (`providerQuota || transientUpstream`). Re-adding the guard flips the
+  // classification of quota-shaped failures and breaks parse.test.ts.
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
 }
 
