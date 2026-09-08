@@ -319,11 +319,64 @@ describe("issue dependency wakeups in issue routes", () => {
             resolvedBlockerIssueId: "issue-1",
             // The dependent has to be told the premise died rather than completed.
             resolvedBlockerStatus: "cancelled",
+            resolvedByCancellation: true,
             cancelledBlockerIssueIds: ["issue-1"],
           }),
         }),
       );
     });
+  });
+
+  it("still reports a cancelled blocker when a different blocker is the one that completes", async () => {
+    // The ordinary shape for a dependent with two blockers: one was cancelled earlier, and the
+    // wake only fires when the LAST one reaches `done`. The owner must still be told that a
+    // premise died, so `cancelledBlockerIssueIds` cannot be gated on the resolving blocker.
+    const base = {
+      id: "issue-1",
+      companyId: "company-1",
+      identifier: "PAP-202",
+      title: "Second blocker",
+      description: null,
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    };
+    mockIssueService.getById.mockResolvedValue({ ...base, status: "in_progress" });
+    mockIssueService.update.mockResolvedValue({ ...base, status: "done" });
+    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([
+      {
+        id: "issue-2",
+        assigneeAgentId: "agent-2",
+        blockerIssueIds: ["issue-1", "issue-9"],
+        cancelledBlockerIssueIds: ["issue-9"],
+      },
+    ]);
+
+    const res = await request(await createApp()).patch("/api/issues/issue-1").send({ status: "done" });
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(mockWakeup).toHaveBeenCalledWith(
+        "agent-2",
+        expect.objectContaining({
+          payload: expect.objectContaining({
+            issueId: "issue-2",
+            resolvedBlockerStatus: "done",
+            cancelledBlockerIssueIds: ["issue-9"],
+          }),
+        }),
+      );
+    });
+    // ...but this resolution was not itself a cancellation.
+    const wake = mockWakeup.mock.calls.find(([agentId]) => agentId === "agent-2")?.[1] as
+      | { payload: Record<string, unknown> }
+      | undefined;
+    expect(wake?.payload).not.toHaveProperty("resolvedByCancellation");
   });
 
   it("does not touch blockers on an update that omits blockedByIssueIds", async () => {

@@ -5596,11 +5596,19 @@ export function issueRoutes(
       if (becameBlockerResolved) {
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
-          // Keyed off the blocker that actually just terminated, not off the dependent's whole
-          // cancelled set — an unrelated cancelled blocker must not make a `done` resolution
-          // read as "the premise died".
+          // Two different facts, and they must not be conflated:
+          //   `resolvedByCancellation` — the blocker that just terminated was cancelled;
+          //   `cancelledBlockerIssueIds` — every blocker of this dependent that was cancelled.
+          // Gating the list on the flag dropped it whenever the LAST blocker to terminate was
+          // `done` while an earlier one had been cancelled, which is the ordinary shape for a
+          // dependent with more than one blocker — the owner then never heard that a premise
+          // had died. Always send the list when it is non-empty.
           const resolvedByCancellation = issue.status === "cancelled";
           const cancelledBlockerIssueIds = dependent.cancelledBlockerIssueIds ?? [];
+          const cancellationFields = {
+            ...(resolvedByCancellation ? { resolvedByCancellation: true } : {}),
+            ...(cancelledBlockerIssueIds.length > 0 ? { cancelledBlockerIssueIds } : {}),
+          };
           addWakeup(dependent.assigneeAgentId, {
             source: "automation",
             triggerDetail: "system",
@@ -5610,7 +5618,7 @@ export function issueRoutes(
               resolvedBlockerIssueId: issue.id,
               resolvedBlockerStatus: issue.status,
               blockerIssueIds: dependent.blockerIssueIds,
-              ...(resolvedByCancellation ? { cancelledBlockerIssueIds } : {}),
+              ...cancellationFields,
             },
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
@@ -5622,7 +5630,7 @@ export function issueRoutes(
               resolvedBlockerIssueId: issue.id,
               resolvedBlockerStatus: issue.status,
               blockerIssueIds: dependent.blockerIssueIds,
-              ...(resolvedByCancellation ? { cancelledBlockerIssueIds } : {}),
+              ...cancellationFields,
             },
           });
         }
