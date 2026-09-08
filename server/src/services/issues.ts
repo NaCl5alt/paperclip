@@ -2361,7 +2361,7 @@ async function listSuccessfulRunHandoffMapForIssues(
   return states;
 }
 
-function externalWaitFromDescription(description: string | null): { owner: string; action: string } | null {
+export function externalWaitFromDescription(description: string | null): { owner: string; action: string } | null {
   if (!description) return null;
   const owner = description.match(/^\s*external owner\s*:\s*(.+)$/im)?.[1]?.trim();
   const action = description.match(/^\s*external action\s*:\s*(.+)$/im)?.[1]?.trim();
@@ -5235,7 +5235,7 @@ export function issueService(db: Db) {
         const [enriched] = await withIssueLabels(tx, [updated]);
         // When an issue transitions to a terminal status, expire every pending
         // thread interaction on it — all kinds, not only request_confirmation —
-        // so a closed issue never strands a pending prompt (VANA-2574 / VANA-2571).
+        // so a closed issue never strands a pending prompt.
         // Guarded on the status *transition* (existing.status !== next) and on
         // status = "pending", so re-PATCHing an already-terminal issue and
         // already-resolved interactions are both no-ops (idempotent). This runs

@@ -39,7 +39,7 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
-import { issueService } from "../issues.js";
+import { externalWaitFromDescription, issueService } from "../issues.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
@@ -58,8 +58,12 @@ import {
 } from "./origins.js";
 import {
   classifyIssueGraphLiveness,
+  findBlockedIssuesWithoutBlockerSink,
+  hasScheduledMonitor,
+  type IssueGraphLivenessInput,
   type IssueLivenessFinding,
 } from "./issue-graph-liveness.js";
+import { classifyBlockedWaitReason } from "./blocked-wait-reason.js";
 import {
   recoveryAssigneeAdapterOverrides,
   withRecoveryModelProfileHint,
@@ -172,7 +176,7 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "codex_transient_upstream",
   "claude_transient_upstream",
   "timeout",
-  // A shared checkout was contended and could not be isolated (VANA-4055).
+  // A shared checkout was contended and could not be isolated.
   // Contention is genuinely transient — the run holding the directory finishes
   // and the next attempt either takes the claim or isolates cleanly — so the
   // backed-off retry ladder is the right budget. What it must NOT be is a
@@ -217,7 +221,7 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "budget_exhausted",
   "issue_paused",
   "issue_dependencies_blocked",
-  // Deterministic credential failures (VANA-4048 / VANA-4041): an expired or
+  // Deterministic credential failures: an expired or
   // absent credential does not heal by retrying on the same account, so a
   // per-issue continuation retry only burns a run and re-emits the same code.
   // Treat them as non-retryable so the issue escalates straight to `blocked`;
@@ -3178,13 +3182,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
-  async function collectIssueGraphLivenessFindings() {
+  async function buildIssueGraphLivenessInput(): Promise<IssueGraphLivenessInput> {
     const issueRowsPromise = Promise.resolve(db
       .select({
         id: issues.id,
         companyId: issues.companyId,
         identifier: issues.identifier,
         title: issues.title,
+        description: issues.description,
         status: issues.status,
         projectId: issues.projectId,
         goalId: issues.goalId,
@@ -3355,8 +3360,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }];
     });
 
-    return classifyIssueGraphLiveness({
-      issues: issueRows,
+    return {
+      issues: issueRows.map((row) => ({
+        ...row,
+        hasExternalWaitMarker: externalWaitFromDescription(row.description) !== null,
+      })),
       relations: relationRows,
       agents: agentRows,
       activeRuns: activeRunRows.map((row) => ({
@@ -3380,7 +3388,233 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       pendingApprovals: approvalRows,
       openRecoveryIssues: openRecoveryIssues.concat(recoveryActionRows),
       now: new Date(),
-    });
+    };
+  }
+
+  async function collectIssueGraphLivenessFindings() {
+    return classifyIssueGraphLiveness(await buildIssueGraphLivenessInput());
+  }
+
+  // structure the "blocked silent sink" instead of flipping it to `todo`.
+  //
+  // A silent sink is a `blocked`, agent-assigned issue with no first-class blocker,
+  // no live monitor, no External-wait marker, and no other waiting path — so nothing
+  // ever wakes the assignee. The superseded design flipped these back to
+  // `todo`, which misfires on the only two real cases: a date-waiter (woken ~17 days
+  // early) and an external-resource-waiter (re-discovers the missing resource and
+  // re-blocks). Instead we read the wait reason from the description + latest comment
+  // and convert it into a structured, sanctioned blocked form:
+  //   - due_date        -> set monitorNextCheckAt to the date (queryable form 2).
+  //                        NOTE: while `blocked`, this does NOT auto-fire a run
+  //                        (tickDueIssueMonitors gates on in_progress/in_review), which
+  //                        is intended — "待機 run は焚かない". It structures the wait
+  //                        for dashboards/liveness; a human/board resumes on the date.
+  //   - external_wait   -> append `External owner:`/`External action:` markers
+  //                        non-destructively (form 3).
+  //   - unclassifiable  -> do NOT auto-start and do NOT flip to `todo`. Nudge the
+  //                        assignee once to structure the wait, then hold off via an
+  //                        executionState cooldown stamp so a subsequent reconcile does
+  //                        not re-wake even if the agent re-blocks in prose (R3: no
+  //                        cross-tick oscillation).
+  const SILENT_SINK_STATE_KEY = "silentSinkRecovery";
+  const UNCLASSIFIED_NUDGE_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
+
+  function readSilentSinkStamp(
+    executionState: Record<string, unknown> | null | undefined,
+  ): { count: number; lastAt: number } | null {
+    const raw = executionState?.[SILENT_SINK_STATE_KEY];
+    if (!raw || typeof raw !== "object") return null;
+    const obj = raw as Record<string, unknown>;
+    const lastAt = typeof obj.lastAt === "number" ? obj.lastAt : Date.parse(String(obj.lastAt ?? ""));
+    if (!Number.isFinite(lastAt)) return null;
+    const count = typeof obj.count === "number" ? obj.count : 0;
+    return { count, lastAt };
+  }
+
+  function withSilentSinkStamp(
+    executionState: Record<string, unknown> | null | undefined,
+    stamp: { count: number; lastAt: number },
+  ): Record<string, unknown> {
+    return {
+      ...(executionState ?? {}),
+      [SILENT_SINK_STATE_KEY]: { count: stamp.count, lastAt: stamp.lastAt },
+    };
+  }
+
+  function appendExternalWaitMarkers(
+    description: string | null,
+    owner: string,
+    action: string,
+  ): string {
+    const base = (description ?? "").replace(/\s+$/, "");
+    const markers = `External owner: ${owner}\nExternal action: ${action}`;
+    return base.length > 0 ? `${base}\n\n${markers}` : markers;
+  }
+
+  async function recoverBlockedSilentSinks(
+    input: IssueGraphLivenessInput,
+    opts?: { runId?: string | null },
+  ) {
+    const result = {
+      structuredDueDate: 0,
+      structuredExternal: 0,
+      nudgedUnclassifiable: 0,
+      skipped: 0,
+      issueIds: [] as string[],
+    };
+    const nowMs = Date.now();
+    const candidates = findBlockedIssuesWithoutBlockerSink(input);
+    for (const candidate of candidates) {
+      // Each candidate is isolated: a failure structuring one must not abort the rest
+      // of the sweep or the escalation loop that runs after it.
+      try {
+        // Re-verify against a fresh read to guard against a race between the input
+        // snapshot and this action (e.g. a blocker/monitor/marker added in the meantime).
+        const fresh = await db
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            identifier: issues.identifier,
+            title: issues.title,
+            status: issues.status,
+            description: issues.description,
+            assigneeAgentId: issues.assigneeAgentId,
+            assigneeUserId: issues.assigneeUserId,
+            monitorNextCheckAt: issues.monitorNextCheckAt,
+            monitorAttemptCount: issues.monitorAttemptCount,
+            executionPolicy: issues.executionPolicy,
+            executionState: issues.executionState,
+          })
+          .from(issues)
+          .where(and(eq(issues.id, candidate.issueId), isNull(issues.hiddenAt)))
+          .then((rows) => rows[0] ?? null);
+        if (
+          !fresh ||
+          fresh.status !== "blocked" ||
+          !fresh.assigneeAgentId ||
+          fresh.assigneeUserId ||
+          hasScheduledMonitor(fresh, nowMs) ||
+          externalWaitFromDescription(fresh.description) !== null
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+        const blockerCount = await db
+          .select({ id: issueRelations.id })
+          .from(issueRelations)
+          .where(
+            and(
+              eq(issueRelations.companyId, fresh.companyId),
+              eq(issueRelations.type, "blocks"),
+              eq(issueRelations.relatedIssueId, fresh.id),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows.length);
+        if (blockerCount > 0) {
+          result.skipped += 1;
+          continue;
+        }
+
+        const latestComment = await db
+          .select({ body: issueComments.body })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, fresh.id))
+          .orderBy(desc(issueComments.createdAt))
+          .limit(1)
+          .then((rows) => rows[0]?.body ?? null);
+
+        const reason = classifyBlockedWaitReason({
+          description: fresh.description,
+          latestComment,
+          nowMs,
+        });
+
+        if (reason.kind === "due_date") {
+          await issuesSvc.update(fresh.id, { monitorNextCheckAt: reason.at });
+          await issuesSvc.addComment(
+            fresh.id,
+            [
+              "Structured this blocked wait by liveness recovery: detected a due-date reference",
+              `(\`${reason.matchedText}\` → ${reason.at.toISOString().slice(0, 10)}) and set`,
+              "`monitorNextCheckAt` so the wait is queryable and stays visible to the liveness",
+              "classifier. This does not auto-start a run while blocked; resume the work on or",
+              "after that date, or set a first-class blocker / `External owner:` marker if the",
+              "real wait is different.",
+            ].join(" "),
+            {},
+          );
+          result.structuredDueDate += 1;
+          result.issueIds.push(fresh.id);
+        } else if (reason.kind === "external_wait") {
+          await issuesSvc.update(fresh.id, {
+            description: appendExternalWaitMarkers(fresh.description, reason.owner, reason.action),
+          });
+          await issuesSvc.addComment(
+            fresh.id,
+            [
+              "Structured this blocked wait by liveness recovery: detected an external/resource",
+              `wait (owner \`${reason.owner}\`) and appended \`External owner:\`/\`External action:\``,
+              "markers so it is recognised as a legitimately blocked issue owned by an external",
+              "actor. Edit the markers if the owner/action is wrong.",
+            ].join(" "),
+            {},
+          );
+          result.structuredExternal += 1;
+          result.issueIds.push(fresh.id);
+        } else {
+          // Unclassifiable: do NOT auto-start and do NOT flip to `todo`. Nudge the
+          // assignee once, then hold off via a cooldown stamp so a later reconcile does
+          // not re-wake if the agent simply re-blocks in prose (R3 anti-oscillation).
+          const stamp = readSilentSinkStamp(fresh.executionState);
+          if (stamp && nowMs - stamp.lastAt < UNCLASSIFIED_NUDGE_COOLDOWN_MS) {
+            result.skipped += 1;
+            continue;
+          }
+          await issuesSvc.update(fresh.id, {
+            executionState: withSilentSinkStamp(fresh.executionState, {
+              count: (stamp?.count ?? 0) + 1,
+              lastAt: nowMs,
+            }),
+          });
+          await issuesSvc.addComment(
+            fresh.id,
+            [
+              "This issue is `blocked` with no first-class blocker, no live monitor, and no",
+              "`External owner:`/`External action:` wait marker, so nothing would ever wake the",
+              "assignee, yet the wait reason could not be classified automatically. Structure the",
+              "wait: add a real blocker, set a due-date (the recovery will detect it next pass),",
+              "or add `External owner:`/`External action:` markers — otherwise close the issue.",
+              "This nudge will not repeat for 7 days.",
+            ].join(" "),
+            {},
+          );
+          await deps.enqueueWakeup(fresh.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_blocked_wait_unclassified",
+            payload: { issueId: fresh.id },
+            requestedByActorType: "system",
+            requestedByActorId: null,
+            contextSnapshot: {
+              issueId: fresh.id,
+              taskId: fresh.id,
+              wakeReason: "issue_blocked_wait_unclassified",
+              source: "issue.blocked_wait_unclassified",
+            },
+          });
+          result.nudgedUnclassifiable += 1;
+          result.issueIds.push(fresh.id);
+        }
+      } catch (err) {
+        result.skipped += 1;
+        logger.warn(
+          { err, issueId: candidate.issueId },
+          "failed to structure blocked silent sink",
+        );
+      }
+    }
+    return result;
   }
 
   async function findOpenLivenessEscalation(companyId: string, incidentKey: string) {
@@ -3959,7 +4193,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     force?: boolean;
     lookbackHours?: number;
   }) {
-    const findings = await collectIssueGraphLivenessFindings();
+    const input = await buildIssueGraphLivenessInput();
+    const findings = classifyIssueGraphLiveness(input);
     const experimentalSettings = await instanceSettings.getExperimental();
     const autoRecoveryEnabled = asBoolean(
       experimentalSettings.enableIssueGraphLivenessAutoRecovery,
@@ -3990,12 +4225,31 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       issueIds: [] as string[],
       escalationIssueIds: [] as string[],
       retiredRecoveryIssueIds: obsoleteRecoveryCleanup.retiredIssueIds,
+      silentSinkDueDateStructured: 0,
+      silentSinkExternalStructured: 0,
+      silentSinkUnclassifiableNudged: 0,
+      silentSinkSkipped: 0,
+      silentSinkIssueIds: [] as string[],
     };
 
     if (!autoRecoveryEnabled) {
       result.skippedAutoRecoveryDisabled = findings.length;
       return result;
     }
+
+    // Silent-sink structuring is not gated by the escalation lookback window: the
+    // whole point is to rescue issues that have been quietly stuck for a long time,
+    // which the lookback would exclude. Each action moves the issue out of the
+    // silent-sink predicate (monitor/marker set) or holds off via a cooldown stamp,
+    // so a subsequent reconcile does not re-act.
+    const sinkRecovery = await recoverBlockedSilentSinks(input, {
+      runId: opts?.runId ?? null,
+    });
+    result.silentSinkDueDateStructured = sinkRecovery.structuredDueDate;
+    result.silentSinkExternalStructured = sinkRecovery.structuredExternal;
+    result.silentSinkUnclassifiableNudged = sinkRecovery.nudgedUnclassifiable;
+    result.silentSinkSkipped = sinkRecovery.skipped;
+    result.silentSinkIssueIds = sinkRecovery.issueIds;
 
     for (const finding of findings) {
       if (!isLivenessFindingInsideAutoRecoveryLookback(finding, cutoff, updatedAtByIssueKey)) {

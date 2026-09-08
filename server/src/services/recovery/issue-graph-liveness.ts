@@ -28,6 +28,10 @@ export interface IssueLivenessIssueInput {
   executionState?: Record<string, unknown> | null;
   monitorNextCheckAt?: Date | string | null;
   monitorAttemptCount?: number | null;
+  // True when the issue's description carries both an `External owner:` and an
+  // `External action:` marker (services/issues.ts `externalWaitFromDescription`).
+  // Callers compute this so the classifier stays free of description parsing.
+  hasExternalWaitMarker?: boolean | null;
 }
 
 export interface IssueLivenessRelationInput {
@@ -169,7 +173,7 @@ function monitorFromIssue(issue: IssueLivenessIssueInput) {
   return { policyMonitor, stateMonitor };
 }
 
-function hasScheduledMonitor(issue: IssueLivenessIssueInput, nowMs: number) {
+export function hasScheduledMonitor(issue: IssueLivenessIssueInput, nowMs: number) {
   const nextCheckAtMs = readDateMs(issue.monitorNextCheckAt);
   if (nextCheckAtMs === null || nextCheckAtMs <= nowMs) return false;
 
@@ -603,4 +607,56 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   }
 
   return findings;
+}
+
+export interface BlockedWithoutBlockerCandidate {
+  issueId: string;
+  companyId: string;
+  identifier: string | null;
+  assigneeAgentId: string;
+}
+
+// Detects the "silent sink": issues parked in `blocked` that satisfy none of the
+// three legitimate forms of a blocked issue — (1) a first-class blocker relation,
+// (2) a live monitor, (3) an `External owner:`/`External action:` wait marker — and
+// therefore have no path that ever wakes their assignee again. Unlike
+// classifyIssueGraphLiveness, this is driven by `status='blocked'` rather than by
+// walking blocker relations, so issues with zero blocker rows are still inspected.
+// Issues with any other explicit waiting path (active run, queued wake, pending
+// interaction/approval, open recovery issue, or a human owner) are left alone.
+export function findBlockedIssuesWithoutBlockerSink(
+  input: IssueGraphLivenessInput,
+): BlockedWithoutBlockerCandidate[] {
+  const nowMs = readDateMs(input.now ?? new Date()) ?? Date.now();
+  const activeRuns = input.activeRuns ?? [];
+  const queuedWakeRequests = input.queuedWakeRequests ?? [];
+  const pendingInteractions = input.pendingInteractions ?? [];
+  const pendingApprovals = input.pendingApprovals ?? [];
+  const openRecoveryIssues = input.openRecoveryIssues ?? [];
+
+  const hasBlockerRelation = new Set<string>();
+  for (const relation of input.relations) {
+    hasBlockerRelation.add(relation.blockedIssueId);
+  }
+
+  const candidates: BlockedWithoutBlockerCandidate[] = [];
+  for (const issue of input.issues) {
+    if (issue.status !== "blocked") continue;
+    // Needs an agent assignee to wake; a human owner is itself an explicit path.
+    if (!issue.assigneeAgentId || issue.assigneeUserId) continue;
+    if (hasBlockerRelation.has(issue.id)) continue; // form 1
+    if (hasScheduledMonitor(issue, nowMs)) continue; // form 2
+    if (issue.hasExternalWaitMarker) continue; // form 3
+    if (hasActiveExecutionPath(issue.companyId, issue.id, activeRuns, queuedWakeRequests)) continue;
+    if (hasWaitingPath(issue.companyId, issue.id, pendingInteractions)) continue;
+    if (hasWaitingPath(issue.companyId, issue.id, pendingApprovals)) continue;
+    if (hasWaitingPath(issue.companyId, issue.id, openRecoveryIssues)) continue;
+    candidates.push({
+      issueId: issue.id,
+      companyId: issue.companyId,
+      identifier: issue.identifier,
+      assigneeAgentId: issue.assigneeAgentId,
+    });
+  }
+  return candidates;
 }

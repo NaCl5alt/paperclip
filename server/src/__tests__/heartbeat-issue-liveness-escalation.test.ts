@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agents,
+  agentWakeupRequests,
   budgetPolicies,
   companies,
   costEvents,
@@ -838,5 +839,153 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .from(issueRelations)
       .where(eq(issueRelations.relatedIssueId, blockedIssueId));
     expect(blockers.some((row) => row.blockerIssueId === escalations[0]!.id)).toBe(false);
+  });
+
+  // silent-sink structuring (blocked, agent-assigned, no blocker relation,
+  // no monitor, no External marker). The superseded flipped these to `todo`;
+  // the new design structures the wait instead and never auto-flips to `todo`.
+  async function seedSilentSink(opts: { description: string; latestComment?: string }) {
+    const companyId = randomUUID();
+    const coderId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const issuePrefix = `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: coderId,
+      companyId,
+      name: "Coder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: false } },
+      permissions: {},
+    });
+    const ts = new Date(Date.now() - 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: blockedIssueId,
+      companyId,
+      title: "Silent sink",
+      description: opts.description,
+      status: "blocked",
+      priority: "medium",
+      assigneeAgentId: coderId,
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+      createdAt: ts,
+      updatedAt: ts,
+    });
+    if (opts.latestComment) {
+      await db.insert(issueComments).values({
+        companyId,
+        issueId: blockedIssueId,
+        body: opts.latestComment,
+        authorType: "agent",
+        authorAgentId: coderId,
+      });
+    }
+    return { companyId, coderId, blockedIssueId };
+  }
+
+  async function wakeRowCountForIssue(issueId: string) {
+    const rows = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`);
+    return rows.length;
+  }
+
+  it("structures a due-date silent sink into a monitor without flipping to todo or waking (R2)", async () => {
+    await enableAutoRecovery();
+    // A future M/D reference in the description.
+    const nextMonth = new Date(Date.now() + 20 * 24 * 60 * 60 * 1000);
+    const md = `${nextMonth.getUTCMonth() + 1}/${nextMonth.getUTCDate()}`;
+    const { blockedIssueId } = await seedSilentSink({
+      description: `## 申し送り\n${md} Step2 でやること。日付待ち。`,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+    expect(result.silentSinkDueDateStructured).toBe(1);
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(issue!.status).toBe("blocked"); // never auto-flipped to todo
+    expect(issue!.monitorNextCheckAt).not.toBeNull();
+    expect(issue!.monitorNextCheckAt!.getTime()).toBeGreaterThan(Date.now());
+    // "待機 run は焚かない": structuring the due date must not enqueue any wake.
+    expect(await wakeRowCountForIssue(blockedIssueId)).toBe(0);
+
+    // Idempotent across ticks: the monitor now excludes it from the predicate.
+    const second = await heartbeat.reconcileIssueGraphLiveness();
+    expect(second.silentSinkDueDateStructured).toBe(0);
+    expect(await wakeRowCountForIssue(blockedIssueId)).toBe(0);
+  });
+
+  it("structures an external-wait silent sink with External markers without waking (R2)", async () => {
+    await enableAutoRecovery();
+    const { blockedIssueId } = await seedSilentSink({
+      description: "停止中。unblock owner=orch-comm / action=(1)KiCad導入 (2)再実行",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+    expect(result.silentSinkExternalStructured).toBe(1);
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(issue!.status).toBe("blocked");
+    expect(issue!.description).toContain("External owner:");
+    expect(issue!.description).toContain("External action:");
+    // Original prose preserved (non-destructive append).
+    expect(issue!.description).toContain("KiCad導入");
+    expect(await wakeRowCountForIssue(blockedIssueId)).toBe(0);
+
+    const second = await heartbeat.reconcileIssueGraphLiveness();
+    expect(second.silentSinkExternalStructured).toBe(0);
+    expect(await wakeRowCountForIssue(blockedIssueId)).toBe(0);
+  });
+
+  it("nudges an unclassifiable silent sink once and does NOT re-wake across ticks (R3 oscillation)", async () => {
+    await enableAutoRecovery();
+    // No date, no unblock marker -> unclassifiable.
+    const { blockedIssueId } = await seedSilentSink({
+      description: "作業が詰まったので一旦 blocked にした。",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileIssueGraphLiveness();
+    expect(first.silentSinkUnclassifiableNudged).toBe(1);
+    expect(await wakeRowCountForIssue(blockedIssueId)).toBe(1);
+
+    const [afterFirst] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(afterFirst!.status).toBe("blocked"); // never flipped to todo
+    // Cooldown stamp recorded in executionState.
+    expect((afterFirst!.executionState as Record<string, unknown>)?.silentSinkRecovery).toBeTruthy();
+
+    // Second tick: the agent has "re-blocked in prose" (issue is unchanged and still an
+    // unclassifiable silent sink). The predicate re-matches, but the cooldown stamp must
+    // suppress a second wake — this is the cross-tick oscillation could not
+    // prevent.
+    const second = await heartbeat.reconcileIssueGraphLiveness();
+    expect(second.silentSinkUnclassifiableNudged).toBe(0);
+    expect(second.silentSinkSkipped).toBeGreaterThanOrEqual(1);
+    expect(await wakeRowCountForIssue(blockedIssueId)).toBe(1); // still 1, no oscillation
+  });
+
+  it("leaves a blocked issue with a live blocker relation untouched (not a silent sink)", async () => {
+    await enableAutoRecovery();
+    const { blockedIssueId } = await seedBlockedChain();
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+    expect(result.silentSinkDueDateStructured).toBe(0);
+    expect(result.silentSinkExternalStructured).toBe(0);
+    expect(result.silentSinkUnclassifiableNudged).toBe(0);
+    expect(await wakeRowCountForIssue(blockedIssueId)).toBe(0);
   });
 });
