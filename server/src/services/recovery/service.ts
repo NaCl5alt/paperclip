@@ -1793,6 +1793,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         source: "recovery.scan_silent_active_runs",
         evaluationIssueId: input.evaluationIssue.id,
         blockerIssueIds: nextBlockerIds,
+        // This row records a park, so it has to say so: `readBlockedResumeHistory` decides the
+        // settling window from `details.status`, not from the action name.
+        status: "blocked",
+        previousStatus: input.sourceIssue.status,
       },
     });
     return true;
@@ -4059,8 +4063,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         findingState: input.finding.state,
         blockerIssueIds: nextBlockerIds,
         escalationIssueId: input.escalationIssueId,
-        status: update.status ?? input.issue.status,
-        previousStatus: input.issue.status,
+        // Only report `status` when this write actually changed it. Echoing the unchanged status
+        // made every blocker addition on an already-`blocked` issue look like a fresh park, which
+        // both restarts the settling window and re-opens the per-park resume allowance.
+        ...(update.status !== undefined ? { status: update.status, previousStatus: input.issue.status } : {}),
+        currentStatus: update.status ?? input.issue.status,
       },
     });
 

@@ -717,6 +717,47 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
     expect(await statusOf(issueId)).toBe("blocked");
   });
 
+  it("counts every past resume, not just the most recent rows", async () => {
+    const { companyId, issueId } = await seedParkedIssue();
+    // Three resumes already spent, each followed by unrelated chatter. The lifetime budget is
+    // only correct if the history read reaches past that chatter to all three; a window that
+    // stops early undercounts and hands out a fourth resume.
+    for (let index = 0; index < 3; index += 1) {
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issueId,
+        details: { status: "todo", source: "recovery.reconcile_resumable_blocked_issue" },
+      });
+      await db.insert(activityLog).values({
+        companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issueId,
+        details: { status: "blocked" },
+      });
+    }
+    // Re-park older than the settling window so only the budget can be what stops the resume.
+    await db
+      .update(issues)
+      .set({ updatedAt: new Date(Date.now() - MIN_BLOCKED_PARK_AGE_MS - 60_000) })
+      .where(eq(issues.id, issueId));
+    await db
+      .update(activityLog)
+      .set({ createdAt: new Date(Date.now() - MIN_BLOCKED_PARK_AGE_MS - 30_000) })
+      .where(eq(activityLog.entityId, issueId));
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result.resumableBlockedResumed).toBe(0);
+    expect(await statusOf(issueId)).toBe("blocked");
+  });
+
   it("sees a park recorded under any activity action, not just issue.updated", async () => {
     const { companyId, issueId } = await seedParkedIssue();
     // Some escalations record the park under their own action name (e.g.
