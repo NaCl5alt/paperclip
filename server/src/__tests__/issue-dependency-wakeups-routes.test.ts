@@ -13,8 +13,22 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
+  getDependencyReadiness: vi.fn(),
   findMentionedAgents: vi.fn(async () => []),
 }));
+
+function readiness(overrides: Record<string, unknown> = {}) {
+  return {
+    issueId: "issue-2",
+    blockerIssueIds: [],
+    unresolvedBlockerIssueIds: [],
+    unresolvedBlockerCount: 0,
+    pendingFinalizeBlockerIssueIds: [],
+    allBlockersDone: true,
+    isDependencyReady: true,
+    ...overrides,
+  };
+}
 
 vi.mock("../services/index.js", () => ({
   companyService: () => ({
@@ -124,6 +138,7 @@ describe("issue dependency wakeups in issue routes", () => {
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+    mockIssueService.getDependencyReadiness.mockResolvedValue(readiness());
   });
 
   it("wakes dependents when the final blocker transitions to done", async () => {
@@ -273,5 +288,121 @@ describe("issue dependency wakeups in issue routes", () => {
         }),
       );
     });
+  });
+
+  function blockedTransitionIssue(status: "in_progress" | "blocked") {
+    return {
+      id: "issue-2",
+      companyId: "company-1",
+      identifier: "PAP-200",
+      title: "Dependent",
+      description: null,
+      status,
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-2",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    };
+  }
+
+  it("re-arms the blockers-resolved wake when a dependent is set to blocked while its blocker is already done", async () => {
+    mockIssueService.getById.mockResolvedValue(blockedTransitionIssue("in_progress"));
+    mockIssueService.update.mockResolvedValue(blockedTransitionIssue("blocked"));
+    mockIssueService.getDependencyReadiness.mockResolvedValue(
+      readiness({ blockerIssueIds: ["issue-1"], isDependencyReady: true, allBlockersDone: true }),
+    );
+
+    const res = await request(await createApp()).patch("/api/issues/issue-2").send({ status: "blocked" });
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(mockWakeup).toHaveBeenCalledWith(
+        "agent-2",
+        expect.objectContaining({
+          reason: "issue_blockers_resolved",
+          payload: expect.objectContaining({
+            issueId: "issue-2",
+            resolvedBlockerIssueId: "issue-1",
+            backstop: "blocked_transition",
+          }),
+        }),
+      );
+    });
+  });
+
+  it("does not re-arm when a blocker is still unresolved", async () => {
+    mockIssueService.getById.mockResolvedValue(blockedTransitionIssue("in_progress"));
+    mockIssueService.update.mockResolvedValue(blockedTransitionIssue("blocked"));
+    mockIssueService.getDependencyReadiness.mockResolvedValue(
+      readiness({
+        blockerIssueIds: ["issue-1"],
+        unresolvedBlockerIssueIds: ["issue-1"],
+        unresolvedBlockerCount: 1,
+        allBlockersDone: false,
+        isDependencyReady: false,
+      }),
+    );
+
+    const res = await request(await createApp()).patch("/api/issues/issue-2").send({ status: "blocked" });
+    expect(res.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockWakeup).not.toHaveBeenCalledWith(
+      "agent-2",
+      expect.objectContaining({ reason: "issue_blockers_resolved" }),
+    );
+  });
+
+  it("does not re-arm when the blocked issue has no blocker relations", async () => {
+    mockIssueService.getById.mockResolvedValue(blockedTransitionIssue("in_progress"));
+    mockIssueService.update.mockResolvedValue(blockedTransitionIssue("blocked"));
+    mockIssueService.getDependencyReadiness.mockResolvedValue(readiness({ blockerIssueIds: [] }));
+
+    const res = await request(await createApp()).patch("/api/issues/issue-2").send({ status: "blocked" });
+    expect(res.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockWakeup).not.toHaveBeenCalledWith(
+      "agent-2",
+      expect.objectContaining({ reason: "issue_blockers_resolved" }),
+    );
+  });
+
+  it("does not re-arm when the issue was already blocked (no into-blocked transition)", async () => {
+    mockIssueService.getById.mockResolvedValue(blockedTransitionIssue("blocked"));
+    mockIssueService.update.mockResolvedValue(blockedTransitionIssue("blocked"));
+    mockIssueService.getDependencyReadiness.mockResolvedValue(
+      readiness({ blockerIssueIds: ["issue-1"], isDependencyReady: true, allBlockersDone: true }),
+    );
+
+    const res = await request(await createApp()).patch("/api/issues/issue-2").send({ status: "blocked" });
+    expect(res.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockWakeup).not.toHaveBeenCalledWith(
+      "agent-2",
+      expect.objectContaining({ reason: "issue_blockers_resolved" }),
+    );
+  });
+
+  it("does not re-arm when the blocked issue has no assignee", async () => {
+    const unassigned = { ...blockedTransitionIssue("in_progress"), assigneeAgentId: null };
+    const unassignedBlocked = { ...blockedTransitionIssue("blocked"), assigneeAgentId: null };
+    mockIssueService.getById.mockResolvedValue(unassigned);
+    mockIssueService.update.mockResolvedValue(unassignedBlocked);
+    mockIssueService.getDependencyReadiness.mockResolvedValue(
+      readiness({ blockerIssueIds: ["issue-1"], isDependencyReady: true, allBlockersDone: true }),
+    );
+
+    const res = await request(await createApp()).patch("/api/issues/issue-2").send({ status: "blocked" });
+    expect(res.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Assert across every call (including a null-agent call) so dropping the
+    // assignee guard — which would wake a null agent — is caught.
+    const firedBlockersResolved = mockWakeup.mock.calls.some(
+      ([, wakeup]) => (wakeup as { reason?: string } | undefined)?.reason === "issue_blockers_resolved",
+    );
+    expect(firedBlockersResolved).toBe(false);
   });
 });
