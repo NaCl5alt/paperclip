@@ -128,7 +128,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     ageMs: number;
     withOutput?: boolean;
     logChunk?: string;
-    sourceStatus?: "in_progress" | "done" | "cancelled";
+    sourceStatus?: "in_progress" | "blocked" | "done" | "cancelled";
     sourceOriginKind?: string;
     sameRunTerminalEvidence?: "activity" | "comment";
   }) {
@@ -340,6 +340,37 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
 
     const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(source?.status).toBe("blocked");
+  });
+
+  it("does not record a park when the source issue was already blocked", async () => {
+    // `readBlockedResumeHistory` selects parks by `details.status === "blocked"`, regardless of
+    // which action wrote the row. An escalation that only adds a blocker to an already-blocked
+    // issue must therefore not claim a park: doing so restarts the settling window and hands
+    // back that park's automatic-resume allowance.
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, issueId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      sourceStatus: "blocked",
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    const rows = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "heartbeat.output_stale_escalated"),
+        ),
+      );
+    expect(rows).toHaveLength(1);
+    const details = rows[0].details as Record<string, unknown>;
+    expect(details).not.toHaveProperty("status");
+    expect(details).not.toHaveProperty("previousStatus");
+    expect(details.currentStatus).toBe("blocked");
   });
 
   it("folds terminal source issues with same-run durable evidence instead of creating watchdog work", async () => {
