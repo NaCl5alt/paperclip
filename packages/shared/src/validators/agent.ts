@@ -84,9 +84,36 @@ export const createAgentSchema = z.object({
   budgetMonthlyCents: z.number().int().nonnegative().optional().default(0),
   permissions: agentPermissionsSchema.optional(),
   metadata: z.record(z.string(), z.unknown()).optional().nullable(),
+  // The optional stored-session claim from a completed Claude login session. It
+  // is the non-secret `storedSessionId`; it carries no token. The agent-create
+  // transaction consumes it as the one-time stored-session claim.
+  storedSessionId: z.string().min(1).max(256).optional(),
+  // The optional apply-existing flag. When true, the caller binds the fixed
+  // Claude OAuth token reference to the owner stored value with no new login
+  // round trip. The server permits the no-claim bind only for a user actor and
+  // only when that owner already has a stored value. It carries no token.
+  applyStoredClaudeLogin: z.boolean().optional(),
 });
 
 export type CreateAgent = z.infer<typeof createAgentSchema>;
+
+export const builtInAgentProvisionSchema = z.object({
+  adapterType: agentAdapterTypeSchema.optional(),
+  adapterConfig: adapterConfigSchema.optional(),
+  budgetMonthlyCents: z.number().int().nonnegative().optional(),
+}).strict();
+
+export type BuiltInAgentProvision = z.infer<typeof builtInAgentProvisionSchema>;
+
+export const builtInAgentEmptyMutationSchema = z.object({}).strict().default({});
+
+export type BuiltInAgentEmptyMutation = z.infer<typeof builtInAgentEmptyMutationSchema>;
+
+export const builtInAgentResetSchema = z.object({
+  resources: z.array(z.enum(["agent", "instructions", "skill", "routine"])).optional(),
+}).strict().default({});
+
+export type BuiltInAgentReset = z.infer<typeof builtInAgentResetSchema>;
 
 export const createAgentHireSchema = createAgentSchema.extend({
   sourceIssueId: z.string().uuid().optional().nullable(),
@@ -137,13 +164,20 @@ export const standardAgentKeyScopeSchema = z.object({
   kind: z.literal("standard"),
 }).strict();
 
+export const skillTestAgentKeyScopeSchema = z.object({
+  kind: z.literal("skill_test"),
+  issueId: z.string().uuid(),
+}).strict();
+
 export const agentApiKeyScopeSchema = z.union([
   standardAgentKeyScopeSchema,
   taskBridgeAgentKeyScopeSchema,
+  skillTestAgentKeyScopeSchema,
 ]);
 
 export type AgentApiKeyScope = z.infer<typeof agentApiKeyScopeSchema>;
 export type TaskBridgeAgentKeyScope = z.infer<typeof taskBridgeAgentKeyScopeSchema>;
+export type SkillTestAgentKeyScope = z.infer<typeof skillTestAgentKeyScopeSchema>;
 
 export function normalizeAgentApiKeyScope(value: unknown): AgentApiKeyScope {
   const parsed = agentApiKeyScopeSchema.safeParse(value);

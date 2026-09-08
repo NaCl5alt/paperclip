@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { buildIssueReferenceHref, buildProjectMentionHref, buildRoutineMentionHref, buildSkillMentionHref } from "@paperclipai/shared";
@@ -15,11 +15,13 @@ import {
   placeCaretAfterMentionAnchor,
   shouldAcceptAutocompleteKey,
 } from "./MarkdownEditor";
+import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 
 const mdxEditorMockState = vi.hoisted(() => ({
   emitMountEmptyReset: false,
   emitMountParseError: false,
   emitMountSilentEmptyState: false,
+  throwOnRender: false,
   markdownValues: [] as string[],
   suppressHtmlProcessingValues: [] as boolean[],
 }));
@@ -59,6 +61,9 @@ vi.mock("@mdxeditor/editor", async () => {
     },
     forwardedRef: React.ForwardedRef<{ setMarkdown: (value: string) => void; focus: () => void } | null>,
   ) {
+    if (mdxEditorMockState.throwOnRender) {
+      throw new Error("Rich editor render crashed");
+    }
     mdxEditorMockState.markdownValues.push(markdown);
     mdxEditorMockState.suppressHtmlProcessingValues.push(Boolean(suppressHtmlProcessing));
     const [content, setContent] = React.useState(markdown);
@@ -148,6 +153,14 @@ vi.mock("../lib/paste-normalization", () => ({
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
+async function act(callback: () => void | Promise<void>) {
+  let result: void | Promise<void> = undefined;
+  flushSync(() => {
+    result = callback();
+  });
+  await result;
+}
+
 async function flush() {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -155,13 +168,20 @@ async function flush() {
 }
 
 function createFileDragEvent(type: string) {
-  const event = new Event(type, { bubbles: true, cancelable: true }) as Event & {
+  const event = (
+    typeof DragEvent === "function"
+      ? new DragEvent(type, { bubbles: true, cancelable: true })
+      : new Event(type, { bubbles: true, cancelable: true })
+  ) as Event & {
     dataTransfer: { types: string[]; files: File[]; dropEffect?: string };
   };
-  event.dataTransfer = {
-    types: ["Files"],
-    files: [],
-  };
+  Object.defineProperty(event, "dataTransfer", {
+    configurable: true,
+    value: {
+      types: ["Files"],
+      files: [],
+    },
+  });
   return event;
 }
 
@@ -223,6 +243,7 @@ describe("MarkdownEditor", () => {
     mdxEditorMockState.emitMountEmptyReset = false;
     mdxEditorMockState.emitMountParseError = false;
     mdxEditorMockState.emitMountSilentEmptyState = false;
+    mdxEditorMockState.throwOnRender = false;
     mdxEditorMockState.markdownValues = [];
     mdxEditorMockState.suppressHtmlProcessingValues = [];
   });
@@ -280,6 +301,70 @@ describe("MarkdownEditor", () => {
     await act(async () => {
       root.unmount();
     });
+  });
+
+  it("does not recreate the mention decoration observer when the external value changes", async () => {
+    const originalMutationObserver = globalThis.MutationObserver;
+
+    class MockMutationObserver implements MutationObserver {
+      static instances: MockMutationObserver[] = [];
+
+      readonly observe = vi.fn();
+      readonly disconnect = vi.fn();
+      readonly takeRecords = vi.fn<() => MutationRecord[]>(() => []);
+
+      constructor(readonly callback: MutationCallback) {
+        MockMutationObserver.instances.push(this);
+      }
+    }
+
+    vi.stubGlobal("MutationObserver", MockMutationObserver);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => {
+        root.render(
+          <MarkdownEditor
+            value="First value"
+            onChange={() => {}}
+            placeholder="Markdown body"
+          />,
+        );
+      });
+
+      await flush();
+      const editable = container.querySelector('[contenteditable="true"]');
+      expect(editable).not.toBeNull();
+      const mentionObserverCountAfterInitialRender = MockMutationObserver.instances.filter(
+        (observer) => observer.observe.mock.calls.some(([target]) => target === editable),
+      ).length;
+
+      await act(async () => {
+        root.render(
+          <MarkdownEditor
+            value="Updated value"
+            onChange={() => {}}
+            placeholder="Markdown body"
+          />,
+        );
+      });
+
+      await flush();
+
+      // A separate rich-editor health observer is expected to recreate when the
+      // controlled value changes. This assertion only covers the mention
+      // decoration observer that attaches to the editable element itself.
+      expect(
+        MockMutationObserver.instances.filter(
+          (observer) => observer.observe.mock.calls.some(([target]) => target === editable),
+        ),
+      ).toHaveLength(mentionObserverCountAfterInitialRender);
+    } finally {
+      await act(async () => {
+        root.unmount();
+      });
+      vi.stubGlobal("MutationObserver", originalMutationObserver);
+    }
   });
 
   it("converts advisory-style html image tags to markdown image syntax before mounting the editor", async () => {
@@ -386,6 +471,44 @@ describe("MarkdownEditor", () => {
     });
   });
 
+  it("falls back to a raw textarea when the rich editor crashes during render", async () => {
+    mdxEditorMockState.throwOnRender = true;
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const handleChange = vi.fn();
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <MarkdownEditor
+          value="5. python3 circleback/sync_insights.py --input <tmp> -- writes insights/<group>/*.md"
+          onChange={handleChange}
+          placeholder="Markdown body"
+        />,
+      );
+    });
+
+    await vi.waitFor(() => {
+      expect(container.querySelector("textarea")).not.toBeNull();
+    });
+    const textarea = container.querySelector("textarea");
+    expect(textarea).not.toBeNull();
+    expect(textarea?.value).toBe("5. python3 circleback/sync_insights.py --input <tmp> -- writes insights/<group>/*.md");
+    expect(container.textContent).toContain("Rich editor unavailable for this markdown");
+    expect(consoleError).toHaveBeenCalledWith(
+      "Markdown rich editor failed; falling back to raw textarea",
+      expect.objectContaining({
+        error: expect.any(Error),
+        componentStack: expect.any(String),
+      }),
+    );
+    consoleError.mockRestore();
+    expect(handleChange).not.toHaveBeenCalled();
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
   it("falls back to a raw textarea when the rich editor mounts into the placeholder without callbacks", async () => {
     mdxEditorMockState.emitMountSilentEmptyState = true;
     const handleChange = vi.fn();
@@ -435,16 +558,18 @@ describe("MarkdownEditor", () => {
     const scope = container.querySelector('[data-testid="mdx-editor"]')?.parentElement as HTMLDivElement | null;
     expect(scope).not.toBeNull();
 
-    act(() => {
+    await act(async () => {
       scope?.dispatchEvent(createFileDragEvent("dragenter"));
     });
+    await flush();
 
     expect(scope?.className).toContain("ring-1");
     expect(container.textContent).toContain("Drop image to upload");
 
-    act(() => {
+    await act(async () => {
       scope?.dispatchEvent(createFileDragEvent("dragleave"));
     });
+    await flush();
 
     expect(scope?.className).not.toContain("ring-1");
 
@@ -890,7 +1015,7 @@ describe("MarkdownEditor", () => {
 
     const options = Array.from(menu.querySelectorAll('button[type="button"]'));
     expect(options).toHaveLength(12);
-    expect(menu.className).toContain("max-h-[208px]");
+    expect(menu.className).toContain("max-h-(--sz-208px)");
     expect(menu.className).toContain("overflow-y-auto");
     expect(menu.style.touchAction).toBe("pan-y");
 
@@ -899,6 +1024,64 @@ describe("MarkdownEditor", () => {
       menu.dispatchEvent(wheel);
     });
     expect(wheel.defaultPrevented).toBe(false);
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("lets wheel and touch scrolling reach the autocomplete menu inside a modal", async () => {
+    const root = createRoot(container);
+    const mentions = Array.from({ length: 12 }, (_, index) => ({
+      id: `project:project-${index}`,
+      kind: "project" as const,
+      name: `Paperclip App ${index}`,
+      projectId: `project-${index}`,
+      projectColor: "#336699",
+    }));
+
+    await act(async () => {
+      root.render(
+        <Dialog open>
+          <DialogContent>
+            <DialogTitle>Create task</DialogTitle>
+            <MarkdownEditor value="@Pap" onChange={() => {}} mentions={mentions} />
+          </DialogContent>
+        </Dialog>,
+      );
+    });
+    await flush();
+
+    const editable = document.body.querySelector('[data-testid="mdx-editor"]');
+    const textNode = editable?.firstChild;
+    expect(textNode?.nodeType).toBe(Node.TEXT_NODE);
+
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.setStart(textNode!, "@Pap".length);
+    range.collapse(true);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+
+    act(() => {
+      document.dispatchEvent(new Event("selectionchange"));
+    });
+    await flush();
+
+    const menu = document.body.querySelector('[data-testid="mention-autocomplete-menu"]');
+    expect(menu).toBeTruthy();
+
+    const wheel = new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: 80 });
+    act(() => {
+      menu?.dispatchEvent(wheel);
+    });
+    expect(wheel.defaultPrevented).toBe(false);
+
+    const touchMove = createTouchEvent("touchmove", [{ clientX: 100, clientY: 90 }]);
+    act(() => {
+      menu?.firstElementChild?.dispatchEvent(touchMove);
+    });
+    expect(touchMove.defaultPrevented).toBe(false);
 
     await act(async () => {
       root.unmount();

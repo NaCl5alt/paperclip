@@ -15,6 +15,15 @@ import {
 import { ThemeProvider } from "../context/ThemeContext";
 import { MarkdownBody } from "./MarkdownBody";
 import { queryKeys } from "../lib/queryKeys";
+import type { WorkspaceFileAvailabilityTarget } from "../lib/workspace-file-availability";
+
+/** Stands in for a server-confirmed openable reference in the issue's workspace. */
+const OPENABLE_AUTO_TARGET: WorkspaceFileAvailabilityTarget = {
+  workspace: "auto",
+  projectId: null,
+  workspaceId: null,
+  projectName: null,
+};
 
 const mockIssuesApi = vi.hoisted(() => ({
   get: vi.fn(),
@@ -158,6 +167,46 @@ describe("MarkdownBody", () => {
     expect(html).toContain("Plain text");
   });
 
+  it("hides markdown HTML comments instead of rendering placeholder text", () => {
+    const html = renderMarkdown("Before\n\n<!-- -->\n\nAfter");
+
+    expect(html).toContain("Before");
+    expect(html).toContain("After");
+    expect(html).not.toContain("&lt;!--");
+    expect(html).not.toContain("--&gt;");
+  });
+
+  it("hides escaped HTML comment placeholders before attachment images", () => {
+    const html = renderMarkdown("\\<!-- --> ![](/api/attachments/57d0805a-1b95-4fa5-abb4-d0c33e2e649c/content)");
+
+    expect(html).toContain('<img src="/api/attachments/57d0805a-1b95-4fa5-abb4-d0c33e2e649c/content" alt=""/>');
+    expect(html).not.toContain("&lt;!--");
+    expect(html).not.toContain("--&gt;");
+  });
+
+  it("hides incomplete streamed HTML comment placeholders before attachment images", () => {
+    const html = renderMarkdown("\\<!-- ![](/api/attachments/57d0805a-1b95-4fa5-abb4-d0c33e2e649c/content)");
+
+    expect(html).toContain('<img src="/api/attachments/57d0805a-1b95-4fa5-abb4-d0c33e2e649c/content" alt=""/>');
+    expect(html).not.toContain("&lt;!--");
+  });
+
+  it("hides incomplete encoded HTML comment placeholders", () => {
+    const html = renderMarkdown("&lt;!-- -- ![](/api/attachments/57d0805a-1b95-4fa5-abb4-d0c33e2e649c/content)");
+
+    expect(html).toContain('<img src="/api/attachments/57d0805a-1b95-4fa5-abb4-d0c33e2e649c/content" alt=""/>');
+    expect(html).not.toContain("&lt;!--");
+    expect(html).not.toContain("&amp;lt;!--");
+  });
+
+  it("keeps HTML comment markers when they are literal code content", () => {
+    const inlineHtml = renderMarkdown("Use `<!-- -->` as a literal.");
+    const blockHtml = renderMarkdown("```html\n<!-- keep this example -->\n```");
+
+    expect(inlineHtml).toContain("&lt;!-- --&gt;");
+    expect(blockHtml).toContain("&lt;!-- keep this example --&gt;");
+  });
+
   it("uses soft-break styling by default", () => {
     const html = renderMarkdown("First line\nSecond line");
 
@@ -277,15 +326,58 @@ describe("MarkdownBody", () => {
     const html = renderMarkdown(
       "- **MP4**: [`videos/90-days-paperclip/out/90-days-paperclip-1x1.mp4`](/PAP/issues/PAP-10306 \"Publish handoff\")",
       [{ identifier: "PAP-10306", status: "in_review", title: "Publish handoff" }],
-      { linkWorkspaceFileRefs: true },
+      { resolveWorkspaceFileRef: () => OPENABLE_AUTO_TARGET },
     );
 
     expect(html).toContain('data-workspace-file-link="true"');
     expect(html).toContain('data-workspace-file-path="videos/90-days-paperclip/out/90-days-paperclip-1x1.mp4"');
     expect(html).toContain("videos/90-days-paperclip/out/90-days-paperclip-1x1.mp4");
-    expect(html).not.toContain("max-w-[38ch]");
+    expect(html).not.toContain("max-w-(--sz-38ch)");
     expect(html).not.toContain("paperclip-markdown-issue-ref");
     expect(html).not.toContain('href="/issues/PAP-10306"');
+  });
+
+  it("renders auto-detected workspace paths as plain code without an availability resolver", () => {
+    const html = renderMarkdown("Check `ui/src/pages/IssueDetail.tsx:42` please.");
+
+    expect(html).not.toContain("data-workspace-file-link");
+    expect(html).not.toContain("paperclip-workspace-file-link");
+    expect(html).toContain("ui/src/pages/IssueDetail.tsx:42");
+  });
+
+  it("keeps a non-openable auto-detected path as plain code with no chip affordances", () => {
+    const html = renderMarkdown(
+      "Check `ui/src/pages/IssueDetail.tsx:42` please.",
+      [],
+      { resolveWorkspaceFileRef: () => null },
+    );
+
+    expect(html).not.toContain("data-workspace-file-link");
+    expect(html).not.toContain('role="button"');
+    expect(html).not.toContain("paperclip-workspace-file-link");
+    expect(html).toContain("<code");
+  });
+
+  it("keeps an explicit markdown link ordinary when its path is not openable", () => {
+    const html = renderMarkdown(
+      "See [`ui/src/a.ts:1`](/PAP/issues/PAP-10306)",
+      [{ identifier: "PAP-10306", status: "todo" }],
+      { resolveWorkspaceFileRef: () => null },
+    );
+
+    expect(html).not.toContain("data-workspace-file-link");
+    expect(html).toContain('href="/issues/PAP-10306"');
+  });
+
+  it("promotes an openable auto-detected path to a workspace file chip", () => {
+    const html = renderMarkdown(
+      "Check `ui/src/pages/IssueDetail.tsx:42` please.",
+      [],
+      { resolveWorkspaceFileRef: () => OPENABLE_AUTO_TARGET },
+    );
+
+    expect(html).toContain('data-workspace-file-link="true"');
+    expect(html).toContain('data-workspace-file-path="ui/src/pages/IssueDetail.tsx"');
   });
 
   it("keeps trailing punctuation outside auto-linked issue references", () => {
@@ -433,7 +525,7 @@ describe("MarkdownBody", () => {
     const html = renderMarkdown("[https://github.com/paperclipai/paperclip/pull/4099](https://github.com/paperclipai/paperclip/pull/4099)");
 
     expect(html).toContain('<a href="https://github.com/paperclipai/paperclip/pull/4099"');
-    expect(html).toContain('class="lucide lucide-github mr-1 inline h-3.5 w-3.5 align-[-0.125em]"');
+    expect(html).toContain('class="lucide lucide-github mr-1 inline h-3.5 w-3.5 align-(--va-0_125em)"');
     // The icon and first character "h" must sit in a no-wrap span so the
     // icon can never be orphaned on the previous line from the URL text.
     expect(html).toMatch(/<span style="white-space:nowrap">.*lucide-github.*?<\/svg>h<\/span>/);
@@ -445,7 +537,7 @@ describe("MarkdownBody", () => {
     const html = renderMarkdown("See https://github.com/paperclipai/paperclip/issues/1778");
 
     expect(html).toContain('<a href="https://github.com/paperclipai/paperclip/issues/1778"');
-    expect(html).toContain('class="lucide lucide-github mr-1 inline h-3.5 w-3.5 align-[-0.125em]"');
+    expect(html).toContain('class="lucide lucide-github mr-1 inline h-3.5 w-3.5 align-(--va-0_125em)"');
   });
 
   it("does not prefix non-GitHub markdown links with the GitHub icon", () => {
@@ -544,22 +636,23 @@ describe("MarkdownBody", () => {
     expect(html).toContain('href="/issues/JIRA-2"');
   });
 
-  it("renders the inline mention status glyph at lg (20px / h-5 w-5)", () => {
+  it("renders the inline mention status glyph at md (16px / h-4 w-4)", () => {
     const html = renderMarkdown("See PAP-1271 for context.", [
       { identifier: "PAP-1271", status: "in_progress" },
     ]);
 
-    // Unified glyph at 20px, with the h-5 w-5 class override so the Tailwind
-    // sizing matches the intrinsic SVG size.
+    // Unified glyph at 16px (PAP-349 round 4: stepped down from lg), with the
+    // h-4 w-4 class override so the Tailwind sizing matches the intrinsic SVG
+    // size.
     expect(html).toContain('viewBox="0 0 24 24"');
-    expect(html).toContain('width="20"');
-    expect(html).toContain('height="20"');
-    expect(html).toContain("h-5");
-    expect(html).toContain("w-5");
-    // PAP-243b: the lg glyph is optically centered to the body text
+    expect(html).toContain('width="16"');
+    expect(html).toContain('height="16"');
+    expect(html).toContain("h-4");
+    expect(html).toContain("w-4");
+    // PAP-243b: the glyph is optically centered to the body text
     // (vertical-align: middle + a 1px lift), not floating off the baseline.
     expect(html).toContain("align-middle");
-    expect(html).not.toContain("align-[-0.125em]");
+    expect(html).not.toContain("align-(--va-0_125em)");
     // Legacy h-3 w-3 sizing is gone.
     expect(html).not.toContain("mr-1 h-3 w-3");
   });

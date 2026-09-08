@@ -1,9 +1,10 @@
 import { SHARED_WORKSPACE_ISOLATION_FAILURE_CODE } from "./shared-workspace-writer.js";
 
-export type HeartbeatRunOutcome = "succeeded" | "failed" | "cancelled" | "timed_out";
+export type HeartbeatRunOutcome = "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
 
 export type HeartbeatRunStopReason =
   | "completed"
+  | "interrupted"
   | "timeout"
   | "cancelled"
   | "budget_paused"
@@ -11,6 +12,7 @@ export type HeartbeatRunStopReason =
   | "max_turns_exhausted"
   | "process_lost"
   | "shared_workspace_isolation_failed"
+  | "unmanaged_background_task_stopped"
   | "adapter_failed";
 
 export interface HeartbeatRunTimeoutPolicy {
@@ -86,9 +88,11 @@ export function inferHeartbeatRunStopReason(input: {
   errorMessage?: string | null;
 }): HeartbeatRunStopReason {
   if (input.outcome === "succeeded") return "completed";
+  if (input.outcome === "interrupted") return "interrupted";
   const maxTurnStopReason = normalizeMaxTurnStopReason(input.errorCode);
   if (maxTurnStopReason) return maxTurnStopReason;
   if (input.outcome === "timed_out") return "timeout";
+  if (input.outcome === "failed" && input.errorCode === "unmanaged_background_task_stopped") return "unmanaged_background_task_stopped";
   if (input.outcome === "failed" && input.errorCode === "process_lost") return "process_lost";
   // A shared checkout was contended and could not be isolated. Distinguished
   // from the `adapter_failed` catch-all below because nothing is wrong with the

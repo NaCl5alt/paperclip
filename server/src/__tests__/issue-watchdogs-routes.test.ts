@@ -2,13 +2,15 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentRuntimeState,
   agentWakeupRequests,
   agents,
   companies,
   companyMemberships,
+  companySkills,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -23,9 +25,35 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { runningProcesses } from "../adapters/index.ts";
 import { issueRoutes } from "../routes/issues.js";
+import { heartbeatService } from "../services/heartbeat.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { taskWatchdogService } from "../services/task-watchdogs.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
+
+const mockAdapterExecute = vi.hoisted(() =>
+  vi.fn(async () => ({
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    errorMessage: null,
+    summary: "Issue watchdog route test run.",
+    provider: "test",
+    model: "test-model",
+  })),
+);
+
+vi.mock("../adapters/index.ts", async () => {
+  const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
+  return {
+    ...actual,
+    getServerAdapter: vi.fn(() => ({
+      supportsLocalAgentJwt: false,
+      execute: mockAdapterExecute,
+    })),
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -46,15 +74,20 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
   }, 20_000);
 
   afterEach(async () => {
+    mockAdapterExecute.mockClear();
+    runningProcesses.clear();
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     await db.delete(activityLog);
     await db.delete(issueComments);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(agentRuntimeState);
     await db.delete(issueRelations);
     await db.delete(issueWatchdogs);
     await db.delete(issues);
     await db.delete(agents);
+    await db.delete(companySkills);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
     await db.delete(companies);
@@ -605,7 +638,9 @@ describeEmbeddedPostgres("issue watchdog routes", () => {
     const foreignIssue = await request(app)
       .put(`/api/issues/${otherIssueId}/watchdog`)
       .send({ agentId: otherAgentId });
-    expect(foreignIssue.status, JSON.stringify(foreignIssue.body)).toBe(403);
+    // Uniform 404 so cross-tenant ids are indistinguishable from missing ones.
+    expect(foreignIssue.status, JSON.stringify(foreignIssue.body)).toBe(404);
+    expect(foreignIssue.body.error).toBe("Issue not found");
 
     const foreignAgent = await request(app)
       .put(`/api/issues/${issueId}/watchdog`)

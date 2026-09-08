@@ -1,48 +1,107 @@
-// @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { copyToClipboard } from "./clipboard";
+import { copyTextToClipboard, copyToClipboard } from "./clipboard";
 
-describe("copyToClipboard", () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
-    document.body.innerHTML = "";
+function installDocumentStub(execCommand: () => boolean) {
+  const textarea = {
+    value: "",
+    style: {} as Record<string, string>,
+    setAttribute: vi.fn(),
+    focus: vi.fn(),
+    select: vi.fn(),
+    setSelectionRange: vi.fn(),
+  };
+  const doc = {
+    createElement: vi.fn(() => textarea),
+    body: { appendChild: vi.fn(), removeChild: vi.fn() },
+    activeElement: null,
+    getSelection: vi.fn(() => null),
+    execCommand: vi.fn(execCommand),
+  };
+  vi.stubGlobal("document", doc);
+  return { doc, textarea };
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe("copyTextToClipboard", () => {
+  it("uses the async Clipboard API in a secure context", async () => {
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal("window", { isSecureContext: true });
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    const { doc } = installDocumentStub(() => true);
+
+    await copyTextToClipboard("ssh agent@host");
+
+    expect(writeText).toHaveBeenCalledWith("ssh agent@host");
+    expect(doc.execCommand).not.toHaveBeenCalled();
   });
 
-  it("uses navigator.clipboard in a secure context", async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
+  it("falls back to execCommand on a non-secure context even when clipboard exists", async () => {
+    // Over plain HTTP the Clipboard API can be present but silently no-op, so we
+    // must not trust it and should write via the execCommand path instead.
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal("window", { isSecureContext: false });
     vi.stubGlobal("navigator", { clipboard: { writeText } });
-    vi.stubGlobal("isSecureContext", true);
+    const { doc, textarea } = installDocumentStub(() => true);
 
-    const ok = await copyToClipboard("hello");
+    await copyTextToClipboard("ssh agent@host");
 
-    expect(ok).toBe(true);
+    expect(writeText).not.toHaveBeenCalled();
+    expect(textarea.value).toBe("ssh agent@host");
+    expect(textarea.focus).toHaveBeenCalledWith({ preventScroll: true });
+    expect(textarea.select).toHaveBeenCalled();
+    expect(textarea.setSelectionRange).toHaveBeenCalledWith(0, "ssh agent@host".length);
+    expect(doc.execCommand).toHaveBeenCalledWith("copy");
+    // Regression guard: Safari silently no-ops execCommand copy from a
+    // `readonly` or `opacity: 0` textarea, so the fallback must use neither.
+    expect(textarea.setAttribute).not.toHaveBeenCalledWith("readonly", expect.anything());
+    expect(textarea.style.opacity).toBeUndefined();
+  });
+
+  it("falls back when the secure-context Clipboard API rejects the write", async () => {
+    const writeText = vi.fn(async () => {
+      throw new Error("permission denied");
+    });
+    vi.stubGlobal("window", { isSecureContext: true });
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    const { doc } = installDocumentStub(() => true);
+
+    await copyTextToClipboard("retry through fallback");
+
+    expect(writeText).toHaveBeenCalledWith("retry through fallback");
+    expect(doc.execCommand).toHaveBeenCalledWith("copy");
+  });
+
+  it("throws when the execCommand fallback reports failure", async () => {
+    vi.stubGlobal("window", { isSecureContext: false });
+    vi.stubGlobal("navigator", {});
+    installDocumentStub(() => false);
+
+    await expect(copyTextToClipboard("x")).rejects.toThrow();
+  });
+});
+
+// The fork's non-throwing wrapper. `copyToClipboard` is what CommentThread and
+// the other boolean-result call sites use, so keep its contract covered here
+// rather than in a second jsdom-only spec file.
+describe("copyToClipboard", () => {
+  it("returns true when the write succeeds", async () => {
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal("window", { isSecureContext: true });
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    installDocumentStub(() => true);
+
+    await expect(copyToClipboard("hello")).resolves.toBe(true);
     expect(writeText).toHaveBeenCalledWith("hello");
   });
 
-  it("falls back to execCommand in a non-secure context (no clipboard API)", async () => {
-    // Simulate plain HTTP on a non-localhost host: clipboard API is undefined.
+  it("returns false instead of throwing when every path fails", async () => {
+    vi.stubGlobal("window", { isSecureContext: false });
     vi.stubGlobal("navigator", {});
-    vi.stubGlobal("isSecureContext", false);
-    const execCommand = vi.fn().mockReturnValue(true);
-    // jsdom does not implement execCommand; install a stub.
-    (document as unknown as { execCommand: typeof execCommand }).execCommand = execCommand;
+    installDocumentStub(() => false);
 
-    const ok = await copyToClipboard("fallback-text");
-
-    expect(ok).toBe(true);
-    expect(execCommand).toHaveBeenCalledWith("copy");
-  });
-
-  it("returns false when both paths fail", async () => {
-    const writeText = vi.fn().mockRejectedValue(new Error("denied"));
-    vi.stubGlobal("navigator", { clipboard: { writeText } });
-    vi.stubGlobal("isSecureContext", true);
-    const execCommand = vi.fn().mockReturnValue(false);
-    (document as unknown as { execCommand: typeof execCommand }).execCommand = execCommand;
-
-    const ok = await copyToClipboard("nope");
-
-    expect(ok).toBe(false);
+    await expect(copyToClipboard("nope")).resolves.toBe(false);
   });
 });

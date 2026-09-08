@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { copyToClipboard } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
+import { copyTextToClipboard } from "@/lib/clipboard";
 
 interface CopyTextProps {
   text: string;
@@ -31,8 +31,12 @@ export function CopyText({
   useEffect(() => () => clearTimeout(timerRef.current), []);
 
   const handleClick = useCallback(async () => {
-    const success = await copyToClipboard(text);
-    setLabel(success ? copiedLabel : "Copy failed");
+    try {
+      await copyTextToClipboard(text);
+      setLabel(copiedLabel);
+    } catch {
+      setLabel("Copy failed");
+    }
     clearTimeout(timerRef.current);
     setVisible(true);
     timerRef.current = setTimeout(() => setVisible(false), 1500);

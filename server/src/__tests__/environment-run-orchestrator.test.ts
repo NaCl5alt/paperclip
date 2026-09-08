@@ -188,6 +188,10 @@ function makeMockRuntime(overrides: Partial<EnvironmentRuntimeService> = {}): En
       metadata: {
         workspaceRealization: {
           version: 1,
+          mode: "copy",
+          authoritativeRoot: "/workspace/project",
+          pathAliases: [],
+          outboundRestorePaths: [],
           driver: "local",
           cwd: "/workspace/project",
         },
@@ -261,7 +265,15 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     const result = await orchestrator.realizeForRun(makeRealizeInput());
 
     expect(result.lease).toBeDefined();
-    expect(result.executionTarget).toEqual(executionTarget);
+    expect(result.executionTarget).toEqual({
+      ...executionTarget,
+      workspaceRealization: {
+        mode: "copy",
+        authoritativeRoot: "/workspace/project",
+        pathAliases: [],
+        outboundRestorePaths: [],
+      },
+    });
     expect(result.remoteExecution).toEqual(remoteExecution);
     expect(result.workspaceRealization).toEqual(
       expect.objectContaining({ version: 1, driver: "local" }),
@@ -271,7 +283,7 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     expect(mockResolveEnvironmentExecutionTarget).toHaveBeenCalledOnce();
   });
 
-  // VANA-4049: shared-checkout single-writer claim wiring.
+  // shared-checkout single-writer claim wiring.
   it("claims the realized cwd as single writer for local project_primary runs", async () => {
     mockResolveEnvironmentExecutionTarget.mockResolvedValue({ kind: "local" });
     const runtime = makeMockRuntime();
@@ -332,6 +344,45 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
     await orchestrator.realizeForRun(input);
 
     expect(mockClaimSharedWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("uses an in-place authoritative root on the adapter execution target", async () => {
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue({
+      kind: "remote",
+      transport: "sandbox",
+      remoteCwd: "/copied/workspace",
+    });
+    const runtime = makeMockRuntime({
+      realizeWorkspace: vi.fn().mockResolvedValue({
+        cwd: "/app",
+        metadata: {
+          workspaceRealization: {
+            version: 1,
+            mode: "in_place",
+            authoritativeRoot: "/app",
+            pathAliases: [],
+            outboundRestorePaths: [],
+          },
+        },
+      }),
+    });
+    const orchestrator = environmentRunOrchestrator(mockDb, { environmentRuntime: runtime });
+
+    const result = await orchestrator.realizeForRun(
+      makeRealizeInput({ environment: makeEnvironment("sandbox") }),
+    );
+
+    expect(result.executionTarget).toEqual(expect.objectContaining({
+      kind: "remote",
+      transport: "sandbox",
+      remoteCwd: "/app",
+      workspaceRealization: {
+        mode: "in_place",
+        authoritativeRoot: "/app",
+        pathAliases: [],
+        outboundRestorePaths: [],
+      },
+    }));
   });
 
   it("realization failure: runtime.realizeWorkspace throws → EnvironmentRunError with code workspace_realization_failed", async () => {

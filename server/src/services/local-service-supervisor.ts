@@ -207,6 +207,10 @@ export async function findLocalServiceRegistryRecordByRuntimeServiceId(input: {
     await removeLocalServiceRegistryRecord(record.serviceKey);
     return null;
   }
+  if (!(await doesLocalServiceRecordMatchCwd(candidate))) {
+    await removeLocalServiceRegistryRecord(record.serviceKey);
+    return null;
+  }
 
   return candidate;
 }
@@ -270,6 +274,10 @@ export async function findAdoptableLocalService(input: {
     await removeLocalServiceRegistryRecord(input.serviceKey);
     return null;
   }
+  if (!(await doesLocalServiceRecordMatchCwd(record))) {
+    await removeLocalServiceRegistryRecord(input.serviceKey);
+    return null;
+  }
   if (input.command && record.command !== input.command) return null;
   if (input.cwd && path.resolve(record.cwd) !== path.resolve(input.cwd)) return null;
   if (input.envFingerprint && record.envFingerprint !== input.envFingerprint) return null;
@@ -277,7 +285,7 @@ export async function findAdoptableLocalService(input: {
   return record;
 }
 
-async function readProcessGroupId(pid: number) {
+export async function readLocalServiceProcessGroupId(pid: number) {
   if (process.platform === "win32") return null;
   try {
     const { stdout } = await execFileAsync("ps", ["-o", "pgid=", "-p", String(pid)]);
@@ -285,6 +293,39 @@ async function readProcessGroupId(pid: number) {
     return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
   } catch {
     return null;
+  }
+}
+
+export async function isLocalServiceProcessOwnedBy(pid: number, ownerProcessId: number) {
+  if (pid === ownerProcessId) return true;
+  if (process.platform !== "win32") {
+    return (await readLocalServiceProcessGroupId(pid)) === ownerProcessId;
+  }
+
+  try {
+    const script = [
+      `$currentProcessId = ${pid}`,
+      "while ($currentProcessId -gt 0) {",
+      "  $process = Get-CimInstance Win32_Process -Filter \"ProcessId = $currentProcessId\" -ErrorAction SilentlyContinue",
+      "  if ($null -eq $process) { break }",
+      "  $parentProcessId = [int]$process.ParentProcessId",
+      "  Write-Output $parentProcessId",
+      "  if ($parentProcessId -eq $currentProcessId) { break }",
+      "  $currentProcessId = $parentProcessId",
+      "}",
+    ].join("\n");
+    const { stdout } = await execFileAsync("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      script,
+    ]);
+    return stdout
+      .split(/\r?\n/)
+      .map((line) => Number.parseInt(line.trim(), 10))
+      .some((ancestorPid) => ancestorPid === ownerProcessId);
+  } catch {
+    return false;
   }
 }
 
@@ -302,7 +343,14 @@ async function adoptLocalServiceFromPortOwner(input: {
   const ownerPid = await readLocalServicePortOwner(input.port);
   if (!ownerPid) return null;
 
-  const processGroupId = await readProcessGroupId(ownerPid);
+  if (input.cwd) {
+    const ownerCwd = await readLocalServiceProcessCwd(ownerPid);
+    if (!ownerCwd || !(await isLocalServiceProcessInWorkspace(ownerCwd, input.cwd))) {
+      return null;
+    }
+  }
+
+  const processGroupId = await readLocalServiceProcessGroupId(ownerPid);
   const pid = processGroupId && isPidAlive(processGroupId) ? processGroupId : ownerPid;
   const now = new Date().toISOString();
   const record: LocalServiceRegistryRecord = {
@@ -390,8 +438,24 @@ export async function terminateLocalService(
 }
 
 export async function readLocalServicePortOwner(port: number) {
-  if (!Number.isInteger(port) || port <= 0 || process.platform === "win32") return null;
+  if (!Number.isInteger(port) || port <= 0) return null;
   try {
+    if (process.platform === "win32") {
+      const { stdout } = await execFileAsync("netstat", ["-ano", "-p", "tcp"]);
+      for (const line of stdout.split(/\r?\n/)) {
+        const columns = line.trim().split(/\s+/);
+        if (columns.length < 5 || columns[0]?.toUpperCase() !== "TCP") continue;
+        const localAddress = columns[1] ?? "";
+        const separatorIndex = localAddress.lastIndexOf(":");
+        const localPort = Number.parseInt(localAddress.slice(separatorIndex + 1), 10);
+        const state = columns.at(-2)?.toUpperCase();
+        const pid = Number.parseInt(columns.at(-1) ?? "", 10);
+        if (localPort === port && state === "LISTENING" && Number.isInteger(pid) && pid > 0) {
+          return pid;
+        }
+      }
+      return null;
+    }
     const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
     const firstPid = stdout
       .split("\n")
@@ -401,4 +465,39 @@ export async function readLocalServicePortOwner(port: number) {
   } catch {
     return null;
   }
+}
+
+export async function readLocalServiceProcessCwd(pid: number) {
+  if (!Number.isInteger(pid) || pid <= 0 || process.platform !== "linux") return null;
+  try {
+    return await fs.readlink(`/proc/${pid}/cwd`);
+  } catch {
+    return null;
+  }
+}
+
+export async function isLocalServiceProcessInWorkspace(processCwd: string, workspaceCwd: string) {
+  try {
+    const [resolvedProcessCwd, resolvedWorkspaceCwd] = await Promise.all([
+      fs.realpath(processCwd),
+      fs.realpath(workspaceCwd),
+    ]);
+    const relativePath = path.relative(resolvedWorkspaceCwd, resolvedProcessCwd);
+    return relativePath === "" || (!relativePath.startsWith(`..${path.sep}`) && relativePath !== "..");
+  } catch {
+    return false;
+  }
+}
+
+export async function isLocalServiceRegistryCwdCompatible(processCwd: string | null, workspaceCwd: string) {
+  if (!processCwd) return process.platform !== "linux";
+  return isLocalServiceProcessInWorkspace(processCwd, workspaceCwd);
+}
+
+async function doesLocalServiceRecordMatchCwd(record: LocalServiceRegistryRecord) {
+  if (!record.port) return true;
+  const ownerPid = await readLocalServicePortOwner(record.port);
+  if (!ownerPid) return false;
+  const ownerCwd = await readLocalServiceProcessCwd(ownerPid);
+  return isLocalServiceRegistryCwdCompatible(ownerCwd, record.cwd);
 }

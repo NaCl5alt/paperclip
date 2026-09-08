@@ -64,6 +64,18 @@ describe("redaction", () => {
     });
   });
 
+  it("preserves authorization decision reasons in audit payloads", () => {
+    expect(redactEventPayload({
+      authorizationReason: "allow_scoped_agent_write",
+      authorization: "Bearer secret",
+      surface: "issue.comment.create",
+    })).toEqual({
+      authorizationReason: "allow_scoped_agent_write",
+      authorization: REDACTED_EVENT_VALUE,
+      surface: "issue.comment.create",
+    });
+  });
+
   it("redacts common secret shapes from unstructured text", () => {
     const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
     const githubToken = "ghp_1234567890abcdefghijklmnopqrstuvwxyz";
@@ -136,7 +148,7 @@ describe("redaction", () => {
     expect(result?.argv).toEqual(["--api-key", REDACTED_EVENT_VALUE]);
   });
 
-  it("keeps escaped JSON parseable after redacting an Authorization: Bearer header (VANA-648)", () => {
+  it("keeps escaped JSON parseable after redacting an Authorization: Bearer header", () => {
     // A run-log ndjson line where the command value contains an escaped inner
     // quote right after the bearer token: `...Bearer eyJ...\""`. Redaction must
     // not swallow the `\` of the closing `\"`, which would corrupt the JSON.
@@ -154,7 +166,7 @@ describe("redaction", () => {
     expect(parsed.command).toContain(REDACTED_EVENT_VALUE);
   });
 
-  it("keeps escaped JSON parseable after redacting secret fields and CLI flags (VANA-648)", () => {
+  it("keeps escaped JSON parseable after redacting secret fields and CLI flags", () => {
     const line = JSON.stringify({
       command: `acp --api-key "sk-inline-secret-value" --safe ok`,
       env: { TOKEN: "live-token-value" },

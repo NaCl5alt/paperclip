@@ -1,7 +1,10 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 const PLUGIN_ID = "paperclip.daytona-sandbox-provider";
-const PLUGIN_VERSION = "0.1.0";
+// 0.1.2 adds `supportsSetupTokenLogin` to the driver. The version bump makes
+// the bundled-plugin boot reconcile refresh the persisted manifest for an
+// existing install, so the Claude setup-token login capability propagates.
+const PLUGIN_VERSION = "0.1.2";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
@@ -24,6 +27,27 @@ const manifest: PaperclipPluginManifestV1 = {
       description:
         "Provisions Daytona sandboxes with configurable image or snapshot selection, startup timeouts, and lease reuse.",
       supportsReusableLeases: true,
+      // Daytona keeps a persistent session and tails its callback log form, so it
+      // emits incremental session output while the command runs. Declare the
+      // opt-in capability so the host selects the session-output streaming path.
+      // A generic one-shot provider that omits this key keeps the poll path.
+      sandboxCapabilities: {
+        incrementalSessionOutput: true,
+      },
+      supportsInteractiveSetup: true,
+      interactiveSetupConnectionTypes: ["ssh"],
+      supportsTemplateCapture: true,
+      templateRefKind: "snapshot",
+      templateConfigBinding: {
+        field: "snapshot",
+        unsetFields: ["image"],
+      },
+      templateIdentityPaths: ["apiUrl"],
+      supportsTemplateDelete: true,
+      // Daytona hosts the Claude setup-token login on a real pseudo-terminal.
+      // It is the only bundled provider that implements the setup-token
+      // pseudo-terminal methods, so it advertises the capability.
+      supportsSetupTokenLogin: true,
       configSchema: {
         type: "object",
         properties: {
@@ -50,6 +74,7 @@ const manifest: PaperclipPluginManifestV1 = {
             type: "string",
             description:
               "Optional base image or Daytona Image reference. If set, the sandbox is created from this image instead of a snapshot.",
+            default: "daytonaio/sandbox:0.8.0",
           },
           language: {
             type: "string",
@@ -60,17 +85,20 @@ const manifest: PaperclipPluginManifestV1 = {
             type: "integer",
             description: "Optional CPU allocation in cores.",
             minimum: 1,
+            default: 4,
           },
           memory: {
             type: "integer",
             description:
-              "Optional memory allocation in GiB. Leave unset to use Daytona defaults; supported sandbox sizes are 1, 2, 4, and 8 GiB.",
+              "Optional memory allocation in GiB. Supported sandbox sizes are 1, 2, 4, and 8 GiB.",
             enum: [1, 2, 4, 8],
+            default: 4,
           },
           disk: {
             type: "integer",
             description: "Optional disk allocation in GiB.",
             minimum: 1,
+            default: 10,
           },
           gpu: {
             type: "integer",
@@ -81,6 +109,12 @@ const manifest: PaperclipPluginManifestV1 = {
             type: "number",
             description: "Timeout for Daytona create/start/stop/execute operations in milliseconds.",
             default: 300000,
+          },
+          livenessTimeoutMs: {
+            type: "number",
+            description:
+              "Per-call timeout in milliseconds for the sandbox liveness read (refreshData). A silently unresponsive sandbox connection surfaces as a fast error instead of stalling until the outer RPC ceiling. The start and recovery calls derive their own deadline from timeoutMs, not this bound. `0` or less disables the bound. Defaults to 30000 when unset.",
+            default: 30000,
           },
           autoStopInterval: {
             type: "number",
