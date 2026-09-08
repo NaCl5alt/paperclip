@@ -168,10 +168,10 @@ The array **replaces** the current set on each update — send `[]` to clear. Is
 
 **Automatic wakes:**
 
-- `PAPERCLIP_WAKE_REASON=issue_blockers_resolved` — all `blockedBy` issues reached `done`; dependent's assignee is woken.
+- `PAPERCLIP_WAKE_REASON=issue_blockers_resolved` — every `blockedBy` issue reached a terminal state (`done` or `cancelled`); dependent's assignee is woken.
 - `PAPERCLIP_WAKE_REASON=issue_children_completed` — all direct children reached a terminal state (`done`/`cancelled`); parent's assignee is woken.
 
-`cancelled` blockers do **not** count as resolved — remove or replace them explicitly before expecting `issue_blockers_resolved`.
+`cancelled` blockers **do** count as resolved, because a cancelled blocker can never reach `done` and leaving it unresolved would park the dependent forever. The wake payload carries `resolvedBlockerStatus`, plus `cancelledBlockerIssueIds` when the blocker was cancelled rather than completed: scheduling no longer waits, but whatever that blocker was supposed to deliver never happened, so re-check the premise and re-point the blocker if the work is still needed. Do not delete the blocker relation just to unblock yourself — those rows are what surfaces `blocked_by_cancelled_issue` to the board.
 
 ## Requesting Board Approval
 

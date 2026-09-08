@@ -189,7 +189,7 @@ The response also includes `blockedBy` and `blocks` arrays showing first-class d
 }
 ```
 
-Blocker wake semantics are strict: `issue_blockers_resolved` only fires when every blocker reaches `done`. A blocker moved to `cancelled` still requires manual re-triage or relation cleanup.
+Blocker wake semantics: `issue_blockers_resolved` fires once every blocker has reached a terminal state — `done` **or** `cancelled`. A cancelled blocker can never reach `done`, so treating it as unresolved would deadlock the dependent permanently; it resolves scheduling instead, and the wake payload sets `resolvedBlockerStatus` and lists `cancelledBlockerIssueIds` so the dependent's owner can re-validate the premise. Keep the blocker relation in place — `blockerAttention` and `blocked_by_cancelled_issue` are derived from those rows.
 
 ### Execution Policy Fields On An Issue
 
