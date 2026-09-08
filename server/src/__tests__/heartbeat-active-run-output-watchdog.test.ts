@@ -344,7 +344,7 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     // The positive half of the park contract. Its negative half lives in the next test; asserting
     // only that half would let "always write the park" flip to "never write it", which loses the
     // park from `readBlockedResumeHistory` just as surely as fabricating one corrupts it.
-    const [parkRow] = await db
+    const parkRows = await db
       .select({ details: activityLog.details })
       .from(activityLog)
       .where(
@@ -353,7 +353,8 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
           eq(activityLog.action, "heartbeat.output_stale_escalated"),
         ),
       );
-    expect(parkRow.details).toMatchObject({
+    expect(parkRows).toHaveLength(1);
+    expect(parkRows[0].details).toMatchObject({
       status: "blocked",
       previousStatus: "in_progress",
       currentStatus: "blocked",
