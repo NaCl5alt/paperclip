@@ -738,7 +738,7 @@ const INTERACTION_WAKE_REASON_MAX_LENGTH = 2000;
 
 // Summarize a resolved interaction so the continuation wake can surface the
 // board's decision (accept/reject + reason) instead of just "an interaction
-// resolved" (VANA-589). `outcome` falls back to the interaction status for
+// resolved". `outcome` falls back to the interaction status for
 // kinds without an explicit result.outcome; `reason` collapses the per-kind
 // reason fields and is truncated to keep the wake payload small.
 function summarizeResolvedInteractionResult(interaction: {
@@ -5612,6 +5612,50 @@ export function issueRoutes(
               blockerIssueIds: dependent.blockerIssueIds,
             },
           });
+        }
+      }
+
+      // State-driven backstop for coalesced blocker-resolved wakes.
+      // The event-driven wake (becameDone above) fires when a *blocker* transitions
+      // to done, but that wake can be coalesced into an absorbing run that ends
+      // before it is observed, leaving the dependent silently stuck in `blocked`.
+      // When the *dependent itself* transitions into `blocked` while every blocker
+      // is already resolved, re-derive readiness from current state and re-arm the
+      // same wake. We keep the `blocked` status rather than refusing the transition
+      // so the caller's explicit intent is preserved and the workspace-finalize
+      // barrier still gates premature resumes — `readiness.isDependencyReady`
+      // already encodes that barrier, exactly as listWakeableBlockedDependents does.
+      const becameBlocked = existing.status !== "blocked" && issue.status === "blocked";
+      if (becameBlocked && issue.assigneeAgentId) {
+        try {
+          const readiness = await svc.getDependencyReadiness(issue.id);
+          if (readiness.isDependencyReady && readiness.blockerIssueIds.length > 0) {
+            const resolvedBlockerIssueId = readiness.blockerIssueIds[0];
+            addWakeup(issue.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_blockers_resolved",
+              payload: {
+                issueId: issue.id,
+                resolvedBlockerIssueId,
+                blockerIssueIds: readiness.blockerIssueIds,
+                backstop: "blocked_transition",
+              },
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                wakeReason: "issue_blockers_resolved",
+                source: "issue.blocked_transition_backstop",
+                resolvedBlockerIssueId,
+                blockerIssueIds: readiness.blockerIssueIds,
+                backstop: "blocked_transition",
+              },
+            });
+          }
+        } catch (err) {
+          logger.warn({ err, issueId: issue.id }, "failed to evaluate blocked-transition readiness backstop");
         }
       }
 
