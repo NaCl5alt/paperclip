@@ -37,7 +37,7 @@ import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
-import { issueRecoveryActionService } from "../issue-recovery-actions.js";
+import { ACTIVE_RECOVERY_ACTION_STATUSES, issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { issueService } from "../issues.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
@@ -84,7 +84,6 @@ const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const BLOCKED_RESUME_ACTIVITY_SOURCE = "recovery.reconcile_resumable_blocked_issue";
 const PENDING_INTERACTION_STATUSES = ["pending"] as const;
 const PENDING_APPROVAL_STATUSES = ["pending", "revision_requested"] as const;
-const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -967,8 +966,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
    * see `classifyBlockedWait`. Resumes are capped per park and per issue by
    * `decideBlockedResume`, so duplicate events and repeated sweeps cannot re-queue an issue and
    * an agent that re-parks cannot be bounced forever.
+   *
+   * The same-sweep case — an earlier stage of this very sweep escalating an issue into `blocked`
+   * — is covered by the settling window alone: this function re-reads `issues` after those
+   * escalations, and every escalation goes through `issuesSvc.update`, which stamps `updatedAt`,
+   * so the park always reads as brand new. An extra "skip ids this sweep touched" set was tried
+   * and removed: it could never decide a case the window did not already decide, and by masking
+   * the window it made any future shortening of `MIN_BLOCKED_PARK_AGE_MS` invisible to the
+   * escalation tests in heartbeat-process-recovery.test.ts.
    */
-  async function reconcileResumableBlockedIssues(touchedInThisSweep: ReadonlySet<string>) {
+  async function reconcileResumableBlockedIssues() {
     const now = new Date();
     const candidates = await db
       .select()
@@ -989,12 +996,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     for (const issue of candidates) {
       const agentId = issue.assigneeAgentId;
       if (!agentId) {
-        skipped += 1;
-        continue;
-      }
-      // An earlier stage of this same sweep may have just escalated this issue into `blocked`.
-      // Undoing that in the same pass would be a pure ping-pong.
-      if (touchedInThisSweep.has(issue.id)) {
         skipped += 1;
         continue;
       }
@@ -1025,12 +1026,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
-      // Re-assert the (empty) blocker set explicitly rather than omitting it, so this write
-      // cannot be read as "leave the relations alone" by a future change to the update path.
-      const updated = await issuesSvc.update(issue.id, {
-        status: "todo",
-        blockedByIssueIds: [],
-      });
+      // A cancelled blocker resolves scheduling but not the premise it was supposed to establish,
+      // so it has to be named in the resume comment — it is the reason the owner may need to
+      // re-point the work rather than just pick it back up.
+      const cancelledBlockers = await issuesSvc
+        .getRelationSummaries(issue.id)
+        .then((relations) => relations.blockedBy.filter((relation) => relation.status === "cancelled"))
+        .catch(() => []);
+
+      // `blockedByIssueIds` is deliberately OMITTED: passing it would REPLACE the blocker set, and
+      // passing `[]` would delete every `blocks` row pointing at this issue. Those rows are what
+      // `blockerAttention` and `blocked_by_cancelled_issue` read to tell the owner a premise died,
+      // so deleting them would erase the very signal this resume is supposed to hand over.
+      const updated = await issuesSvc.update(issue.id, { status: "todo" });
       if (!updated) {
         skipped += 1;
         continue;
@@ -1044,6 +1052,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           "Paperclip found this issue parked in `blocked` with nothing that could ever bring it back:",
           "no unresolved blocker, no pending approval or interaction, no scheduled monitor check,",
           "no recovery action and no live run. It has been returned to `todo` with the same assignee.",
+          ...(cancelledBlockers.length > 0
+            ? [
+              "",
+              `- **A blocker was cancelled rather than completed: ${formatIssueLinksForComment(cancelledBlockers)}.** ` +
+                "Scheduling no longer waits on it, but whatever it was supposed to deliver never happened — " +
+                "re-check the premise before continuing, and re-point the blocker if the work is still needed.",
+            ]
+            : []),
           "",
           "- If it is still genuinely waiting, record the wait as a first-class blocker, an interaction/approval, or a monitor check — otherwise it will be parked invisibly again.",
           "- If it is finished or obsolete, close it explicitly as `done` or `cancelled`.",
@@ -3423,7 +3439,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.skipped += orphanBlockerRecovery.skipped;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
 
-    const blockedResume = await reconcileResumableBlockedIssues(new Set(result.issueIds));
+    const blockedResume = await reconcileResumableBlockedIssues();
     result.resumableBlockedResumed = blockedResume.resumed;
     result.skipped += blockedResume.skipped;
     result.issueIds.push(...blockedResume.issueIds);

@@ -5596,8 +5596,11 @@ export function issueRoutes(
       if (becameBlockerResolved) {
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
+          // Keyed off the blocker that actually just terminated, not off the dependent's whole
+          // cancelled set — an unrelated cancelled blocker must not make a `done` resolution
+          // read as "the premise died".
+          const resolvedByCancellation = issue.status === "cancelled";
           const cancelledBlockerIssueIds = dependent.cancelledBlockerIssueIds ?? [];
-          const resolvedByCancellation = cancelledBlockerIssueIds.length > 0;
           addWakeup(dependent.assigneeAgentId, {
             source: "automation",
             triggerDetail: "system",

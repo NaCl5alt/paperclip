@@ -6,16 +6,19 @@ import {
   agents,
   agentRuntimeState,
   agentWakeupRequests,
+  approvals,
   companies,
   createDb,
   environmentLeases,
   environments,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueApprovals,
   issueComments,
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
+  issueTreeHolds,
   issues,
 } from "@paperclipai/db";
 import {
@@ -155,16 +158,24 @@ describe("decideBlockedResume", () => {
     ).toEqual({ resume: true });
   });
 
-  it("stops the ping-pong once the per-issue budget is spent", () => {
-    const resumeAts = Array.from(
-      { length: MAX_BLOCKED_RESUMES_PER_ISSUE },
-      (_unused, index) => new Date(parkedAt.getTime() - (index + 1) * 1_000),
-    );
+  it("stops the ping-pong after exactly three lifetime resumes", () => {
+    // Literal counts on purpose: deriving them from MAX_BLOCKED_RESUMES_PER_ISSUE would make this
+    // test follow the constant anywhere, pinning the branch but never the value.
+    expect(MAX_BLOCKED_RESUMES_PER_ISSUE).toBe(3);
+    const resumeAt = (index: number) => new Date(parkedAt.getTime() - (index + 1) * 1_000);
     const reparkedAt = new Date(parkedAt.getTime() + 5_000);
-    expect(decideBlockedResume(history({ resumeAts, lastBlockedEntryAt: reparkedAt }))).toEqual({
-      resume: false,
-      reason: "resume_budget_exhausted",
-    });
+
+    expect(
+      decideBlockedResume(
+        history({ resumeAts: [resumeAt(0), resumeAt(1)], lastBlockedEntryAt: reparkedAt }),
+      ),
+    ).toEqual({ resume: true });
+
+    expect(
+      decideBlockedResume(
+        history({ resumeAts: [resumeAt(0), resumeAt(1), resumeAt(2)], lastBlockedEntryAt: reparkedAt }),
+      ),
+    ).toEqual({ resume: false, reason: "resume_budget_exhausted" });
   });
 
   it("fails safe when the park time is unknown but a resume already happened", () => {
@@ -543,11 +554,32 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
 
   it("repairs a lost blocker-resolved wake once every blocker is terminal", async () => {
     const { companyId, issueId } = await seedParkedIssue();
+    const issuePrefix = await db
+      .select({ issuePrefix: companies.issuePrefix })
+      .from(companies)
+      .where(eq(companies.id, companyId))
+      .then((rows) => rows[0]!.issuePrefix);
     const doneBlockerId = randomUUID();
     const cancelledBlockerId = randomUUID();
     await db.insert(issues).values([
-      { id: doneBlockerId, companyId, title: "Done blocker", status: "done", priority: "medium" },
-      { id: cancelledBlockerId, companyId, title: "Cancelled blocker", status: "cancelled", priority: "medium" },
+      {
+        id: doneBlockerId,
+        companyId,
+        title: "Done blocker",
+        status: "done",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+      {
+        id: cancelledBlockerId,
+        companyId,
+        title: "Cancelled blocker",
+        status: "cancelled",
+        priority: "medium",
+        issueNumber: 3,
+        identifier: `${issuePrefix}-3`,
+      },
     ]);
     await db.insert(issueRelations).values([
       { companyId, issueId: doneBlockerId, relatedIssueId: issueId, type: "blocks" },
@@ -558,6 +590,25 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
 
     expect(result.resumableBlockedResumed).toBe(1);
     expect(await statusOf(issueId)).toBe("todo");
+
+    // The resume must not clear the blocker relations: `blockerAttention` and
+    // `blocked_by_cancelled_issue` are derived from these rows, so deleting them would erase the
+    // "a premise died, re-check it" signal the resume is handing over.
+    const survivingBlockers = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, issueId));
+    expect(survivingBlockers.map((row) => row.blockerIssueId).sort()).toEqual(
+      [doneBlockerId, cancelledBlockerId].sort(),
+    );
+
+    // ...and the comment has to name the cancelled blocker, since scheduling silently stopped
+    // waiting on work that never actually happened.
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments.some((comment) => (comment.body ?? "").includes(`${issuePrefix}-3`))).toBe(true);
   });
 
   it("leaves an unanswered interaction waiting", async () => {
@@ -576,6 +627,66 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
 
     expect(result.resumableBlockedResumed).toBe(0);
     expect(await statusOf(issueId)).toBe("blocked");
+  });
+
+  it("leaves an unanswered approval waiting", async () => {
+    const { companyId, issueId } = await seedParkedIssue();
+    const approvalId = randomUUID();
+    await db.insert(approvals).values({
+      id: approvalId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: { prompt: "Ship the migration?" },
+    });
+    await db.insert(issueApprovals).values({ companyId, issueId, approvalId });
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result.resumableBlockedResumed).toBe(0);
+    expect(await statusOf(issueId)).toBe("blocked");
+    expect(await resumeActivityCount(issueId)).toBe(0);
+  });
+
+  it("leaves an issue under a pause hold alone", async () => {
+    const { companyId, issueId } = await seedParkedIssue();
+    await db.insert(issueTreeHolds).values({
+      id: randomUUID(),
+      companyId,
+      rootIssueId: issueId,
+      mode: "pause",
+      status: "active",
+      reason: "board paused this subtree by hand",
+      releasePolicy: { strategy: "manual" },
+    });
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result.resumableBlockedResumed).toBe(0);
+    expect(await statusOf(issueId)).toBe("blocked");
+    expect(await resumeActivityCount(issueId)).toBe(0);
+  });
+
+  it("leaves an issue owned by an active recovery action alone", async () => {
+    const { companyId, agentId, issueId } = await seedParkedIssue();
+    await db.insert(issueRecoveryActions).values({
+      id: randomUUID(),
+      companyId,
+      sourceIssueId: issueId,
+      kind: "stranded_issue_recovery",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `stranded_assigned_issue:${issueId}`,
+      nextAction: "restore a live execution path",
+    });
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result.resumableBlockedResumed).toBe(0);
+    expect(await statusOf(issueId)).toBe("blocked");
+    expect(await resumeActivityCount(issueId)).toBe(0);
   });
 
   it("leaves a scheduled observation waiting", async () => {
