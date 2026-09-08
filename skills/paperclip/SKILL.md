@@ -171,7 +171,12 @@ The array **replaces** the current set on each update — send `[]` to clear. Is
 - `PAPERCLIP_WAKE_REASON=issue_blockers_resolved` — every `blockedBy` issue reached a terminal state (`done` or `cancelled`); dependent's assignee is woken.
 - `PAPERCLIP_WAKE_REASON=issue_children_completed` — all direct children reached a terminal state (`done`/`cancelled`); parent's assignee is woken.
 
-`cancelled` blockers **do** count as resolved, because a cancelled blocker can never reach `done` and leaving it unresolved would park the dependent forever. The wake payload carries `resolvedBlockerStatus`, plus `cancelledBlockerIssueIds` when the blocker was cancelled rather than completed: scheduling no longer waits, but whatever that blocker was supposed to deliver never happened, so re-check the premise and re-point the blocker if the work is still needed. Do not delete the blocker relation just to unblock yourself — those rows are what surfaces `blocked_by_cancelled_issue` to the board.
+`cancelled` blockers **do** count as resolved, because a cancelled blocker can never reach `done` and leaving it unresolved would park the dependent forever. The payload reports two different things, so read the right one:
+
+- `resolvedBlockerStatus` (`"done"` or `"cancelled"`) and `resolvedByCancellation` (present and `true` only when it is `"cancelled"`) describe **the blocker that just terminated**.
+- `cancelledBlockerIssueIds` lists **every** cancelled blocker of your issue, and is sent whenever it is non-empty. `resolvedBlockerStatus: "done"` together with a non-empty `cancelledBlockerIssueIds` is normal and means a *different*, earlier blocker was cancelled.
+
+For any issue in `cancelledBlockerIssueIds`: scheduling no longer waits on it, but whatever it was supposed to deliver never happened — re-check the premise and re-point the blocker if the work is still needed. Do not delete the blocker relation just to unblock yourself; those rows are what surfaces `blocked_by_cancelled_issue` to the board.
 
 ## Requesting Board Approval
 

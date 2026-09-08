@@ -189,7 +189,18 @@ The response also includes `blockedBy` and `blocks` arrays showing first-class d
 }
 ```
 
-Blocker wake semantics: `issue_blockers_resolved` fires once every blocker has reached a terminal state — `done` **or** `cancelled`. A cancelled blocker can never reach `done`, so treating it as unresolved would deadlock the dependent permanently; it resolves scheduling instead, and the wake payload sets `resolvedBlockerStatus` and lists `cancelledBlockerIssueIds` so the dependent's owner can re-validate the premise. Keep the blocker relation in place — `blockerAttention` and `blocked_by_cancelled_issue` are derived from those rows.
+Blocker wake semantics: `issue_blockers_resolved` fires once every blocker has reached a terminal state — `done` **or** `cancelled`. A cancelled blocker can never reach `done`, so treating it as unresolved would deadlock the dependent permanently; it resolves scheduling instead.
+
+The payload separates the blocker that just terminated from the dependent's cancelled set:
+
+| field | meaning |
+| --- | --- |
+| `resolvedBlockerIssueId` / `resolvedBlockerStatus` | the blocker that just reached `done` or `cancelled` |
+| `resolvedByCancellation` | present (`true`) only when that blocker was `cancelled` |
+| `cancelledBlockerIssueIds` | every cancelled blocker of this issue; sent whenever non-empty, including when `resolvedBlockerStatus` is `"done"` |
+| `deferredFor: "workspace_finalize"` | this wake was held behind the workspace-finalize barrier and fired from the finalize hook instead of the issue update |
+
+Keep the blocker relation in place — `blockerAttention` and `blocked_by_cancelled_issue` are derived from those rows, and they are only computed while the issue is `blocked`, so the relation is what restores the signal if it is ever parked again.
 
 ### Execution Policy Fields On An Issue
 
