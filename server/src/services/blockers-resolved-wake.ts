@@ -29,6 +29,8 @@ export type BlockersResolvedWakeInput = {
   deferredFor?: string;
 };
 
+export const BLOCKERS_RESOLVED_WAKE_REASON = "issue_blockers_resolved" as const;
+
 export function buildBlockersResolvedWakeFields(input: BlockersResolvedWakeInput) {
   const cancelledBlockerIssueIds = input.dependent.cancelledBlockerIssueIds ?? [];
 
@@ -49,6 +51,7 @@ export function buildBlockersResolvedWakeFields(input: BlockersResolvedWakeInput
   };
 
   return {
+    reason: BLOCKERS_RESOLVED_WAKE_REASON,
     payload: {
       issueId: input.dependent.id,
       ...shared,
@@ -57,9 +60,67 @@ export function buildBlockersResolvedWakeFields(input: BlockersResolvedWakeInput
     contextSnapshot: {
       issueId: input.dependent.id,
       taskId: input.dependent.id,
-      wakeReason: "issue_blockers_resolved" as const,
+      wakeReason: BLOCKERS_RESOLVED_WAKE_REASON,
       source: input.source,
       ...shared,
     },
   };
+}
+
+/**
+ * The workspace-finalize producer.
+ *
+ * Extracted from `executeRun` so it can be exercised directly: a structural "does this file
+ * import the builder" check cannot tell whether the call is reached or what arguments it gets,
+ * and the surrounding hook needs a full run driven to a successful `workspace_finalize` before
+ * it executes.
+ *
+ * Fires the wake that the issue PATCH route could not: while a blocker is still running, the
+ * readiness check holds its dependents behind the workspace-finalize barrier, so the route sees
+ * no wakeable dependents at all. For a blocker completed mid-run this is the owner's only wake.
+ */
+export async function fireDeferredBlockerWakes(deps: {
+  blockerIssueId: string;
+  blockerIssueStatus: string | null;
+  listWakeableBlockedDependents: (issueId: string) => Promise<Array<
+    BlockersResolvedWakeDependent & { assigneeAgentId: string }
+  >>;
+  enqueueWakeup: (agentId: string, wake: Record<string, unknown>) => Promise<unknown>;
+  onError: (err: unknown, context: Record<string, unknown>) => void;
+}) {
+  // Only a `done` blocker can be held by the finalize barrier; a cancelled one never had a
+  // workspace to finalize, so it resolves its dependents through the route instead.
+  if (deps.blockerIssueStatus !== "done") return 0;
+
+  let fired = 0;
+  try {
+    const dependents = await deps.listWakeableBlockedDependents(deps.blockerIssueId);
+    for (const dependent of dependents) {
+      await deps
+        .enqueueWakeup(dependent.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          ...buildBlockersResolvedWakeFields({
+            dependent,
+            resolvedBlockerIssueId: deps.blockerIssueId,
+            resolvedBlockerStatus: deps.blockerIssueStatus,
+            source: "workspace.finalize",
+            deferredFor: "workspace_finalize",
+          }),
+        })
+        .then(() => {
+          fired += 1;
+        })
+        .catch((wakeErr) => {
+          deps.onError(wakeErr, {
+            issueId: deps.blockerIssueId,
+            dependentIssueId: dependent.id,
+            agentId: dependent.assigneeAgentId,
+          });
+        });
+    }
+  } catch (err) {
+    deps.onError(err, { issueId: deps.blockerIssueId });
+  }
+  return fired;
 }

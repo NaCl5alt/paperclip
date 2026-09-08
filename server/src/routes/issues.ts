@@ -5600,7 +5600,6 @@ export function issueRoutes(
           addWakeup(dependent.assigneeAgentId, {
             source: "automation",
             triggerDetail: "system",
-            reason: "issue_blockers_resolved",
             ...buildBlockersResolvedWakeFields({
               dependent,
               resolvedBlockerIssueId: issue.id,

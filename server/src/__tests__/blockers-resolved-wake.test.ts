@@ -2,7 +2,11 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { buildBlockersResolvedWakeFields } from "../services/blockers-resolved-wake.ts";
+import {
+  BLOCKERS_RESOLVED_WAKE_REASON,
+  buildBlockersResolvedWakeFields,
+  fireDeferredBlockerWakes,
+} from "../services/blockers-resolved-wake.ts";
 
 const SERVER_SRC = fileURLToPath(new URL("..", import.meta.url));
 
@@ -95,18 +99,120 @@ describe("buildBlockersResolvedWakeFields", () => {
     expect(fromFinalize.contextSnapshot.source).toBe("workspace.finalize");
   });
 
-  it("is the only place that builds this wake, so producers cannot drift again", () => {
+  it("is the only source file allowed to name this wake reason", () => {
     // B5 happened because two producers hand-rolled the same payload and only one was updated.
-    // For a blocker completed mid-run the finalize hook in heartbeat.ts is the ONLY wake the
-    // dependent's owner gets, so a producer that skips this builder silently ships a different
-    // contract to some owners.
-    const producers = sourceFiles(SERVER_SRC).filter((file) =>
-      readFileSync(file, "utf8").includes('reason: "issue_blockers_resolved"'),
-    );
+    // The builder now supplies `reason` as well, so any file that still spells the literal is
+    // building the wake by hand — including a second producer inside an existing file, which a
+    // per-file "does it import the builder" check could never see.
+    const offenders = sourceFiles(SERVER_SRC)
+      .filter((file) => !file.endsWith("blockers-resolved-wake.ts"))
+      .filter((file) => readFileSync(file, "utf8").includes('"issue_blockers_resolved"'));
 
-    expect(producers.length).toBeGreaterThan(1);
-    for (const file of producers) {
-      expect(readFileSync(file, "utf8"), file).toContain("buildBlockersResolvedWakeFields");
+    expect(offenders).toEqual([]);
+  });
+
+  describe("fireDeferredBlockerWakes", () => {
+    function stubs(dependents: Array<Record<string, unknown>>) {
+      const wakes: Array<{ agentId: string; wake: Record<string, unknown> }> = [];
+      const errors: unknown[] = [];
+      return {
+        wakes,
+        errors,
+        deps: {
+          listWakeableBlockedDependents: async () => dependents as never,
+          enqueueWakeup: async (agentId: string, wake: Record<string, unknown>) => {
+            wakes.push({ agentId, wake });
+          },
+          onError: (err: unknown) => errors.push(err),
+        },
+      };
     }
+
+    const dependentWithCancelled = {
+      id: "dependent-1",
+      assigneeAgentId: "agent-2",
+      blockerIssueIds: ["blocker-done", "blocker-cancelled"],
+      cancelledBlockerIssueIds: ["blocker-cancelled"],
+    };
+
+    it("hands the dependent's cancelled blockers to the owner", async () => {
+      const { wakes, deps } = stubs([dependentWithCancelled]);
+
+      const fired = await fireDeferredBlockerWakes({
+        blockerIssueId: "blocker-done",
+        blockerIssueStatus: "done",
+        ...deps,
+      });
+
+      expect(fired).toBe(1);
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0].agentId).toBe("agent-2");
+      expect(wakes[0].wake.reason).toBe(BLOCKERS_RESOLVED_WAKE_REASON);
+      expect(wakes[0].wake.payload).toMatchObject({
+        issueId: "dependent-1",
+        resolvedBlockerIssueId: "blocker-done",
+        resolvedBlockerStatus: "done",
+        cancelledBlockerIssueIds: ["blocker-cancelled"],
+        deferredFor: "workspace_finalize",
+      });
+      expect(wakes[0].wake.contextSnapshot).toMatchObject({
+        source: "workspace.finalize",
+        cancelledBlockerIssueIds: ["blocker-cancelled"],
+      });
+    });
+
+    it("does nothing unless the blocker actually reached done", async () => {
+      for (const status of ["cancelled", "in_progress", null]) {
+        const { wakes, deps } = stubs([dependentWithCancelled]);
+
+        const fired = await fireDeferredBlockerWakes({
+          blockerIssueId: "blocker-1",
+          blockerIssueStatus: status,
+          ...deps,
+        });
+
+        expect(fired, `status ${status}`).toBe(0);
+        expect(wakes, `status ${status}`).toEqual([]);
+      }
+    });
+
+    it("keeps firing the remaining dependents when one wake throws", async () => {
+      const errors: unknown[] = [];
+      const wakes: string[] = [];
+      const fired = await fireDeferredBlockerWakes({
+        blockerIssueId: "blocker-done",
+        blockerIssueStatus: "done",
+        listWakeableBlockedDependents: async () =>
+          [
+            { ...dependentWithCancelled, id: "dependent-1", assigneeAgentId: "agent-a" },
+            { ...dependentWithCancelled, id: "dependent-2", assigneeAgentId: "agent-b" },
+          ] as never,
+        enqueueWakeup: async (agentId: string) => {
+          if (agentId === "agent-a") throw new Error("queue full");
+          wakes.push(agentId);
+        },
+        onError: (err) => errors.push(err),
+      });
+
+      expect(fired).toBe(1);
+      expect(wakes).toEqual(["agent-b"]);
+      expect(errors).toHaveLength(1);
+    });
+
+    it("reports a lookup failure instead of throwing into the run finalizer", async () => {
+      const errors: unknown[] = [];
+      const fired = await fireDeferredBlockerWakes({
+        blockerIssueId: "blocker-done",
+        blockerIssueStatus: "done",
+        listWakeableBlockedDependents: async () => {
+          throw new Error("db down");
+        },
+        enqueueWakeup: async () => undefined,
+        onError: (err) => errors.push(err),
+      });
+
+      expect(fired).toBe(0);
+      expect(errors).toHaveLength(1);
+    });
   });
 });
