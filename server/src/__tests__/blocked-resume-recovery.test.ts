@@ -717,6 +717,75 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
     expect(await statusOf(issueId)).toBe("blocked");
   });
 
+  it("sees a park recorded under any activity action, not just issue.updated", async () => {
+    const { companyId, issueId } = await seedParkedIssue();
+    // Some escalations record the park under their own action name (e.g.
+    // `issue.successful_run_handoff_escalated`). If park detection keys off the action name it
+    // misses these, reads the park as much older than it is, and resumes inside the window.
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "issue.successful_run_handoff_escalated",
+      entityType: "issue",
+      entityId: issueId,
+      details: { status: "blocked", _previous: { status: "in_progress" } },
+    });
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result.resumableBlockedResumed).toBe(0);
+    expect(await statusOf(issueId)).toBe("blocked");
+    expect(await resumeActivityCount(issueId)).toBe(0);
+  });
+
+  it("leaves an approval waiting in every non-terminal approval status", async () => {
+    for (const status of ["pending", "revision_requested"]) {
+      const { companyId, issueId } = await seedParkedIssue();
+      const approvalId = randomUUID();
+      await db.insert(approvals).values({
+        id: approvalId,
+        companyId,
+        type: "request_board_approval",
+        status,
+        payload: { prompt: "Ship it?" },
+      });
+      await db.insert(issueApprovals).values({ companyId, issueId, approvalId });
+
+      const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+      expect(result.resumableBlockedResumed, `approval status ${status}`).toBe(0);
+      expect(await statusOf(issueId), `approval status ${status}`).toBe("blocked");
+      await cancelActiveRunsForCleanup(db);
+      await db.execute(sql`truncate table companies, activity_log cascade`);
+    }
+  });
+
+  it("leaves a recovery action waiting in every non-terminal action status", async () => {
+    for (const status of ["active", "escalated"]) {
+      const { companyId, agentId, issueId } = await seedParkedIssue();
+      await db.insert(issueRecoveryActions).values({
+        id: randomUUID(),
+        companyId,
+        sourceIssueId: issueId,
+        kind: "stranded_issue_recovery",
+        status,
+        ownerType: "agent",
+        ownerAgentId: agentId,
+        cause: "stranded_assigned_issue",
+        fingerprint: `stranded_assigned_issue:${issueId}`,
+        nextAction: "restore a live execution path",
+      });
+
+      const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+      expect(result.resumableBlockedResumed, `recovery status ${status}`).toBe(0);
+      expect(await statusOf(issueId), `recovery status ${status}`).toBe("blocked");
+      await cancelActiveRunsForCleanup(db);
+      await db.execute(sql`truncate table companies, activity_log cascade`);
+    }
+  });
+
   it("leaves a freshly parked issue alone until the settling window passes", async () => {
     const { issueId } = await seedParkedIssue();
     await db.update(issues).set({ updatedAt: new Date() }).where(eq(issues.id, issueId));

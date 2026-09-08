@@ -864,15 +864,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
    * sweep pass or a duplicated event all observe the same answer.
    */
   async function readBlockedResumeHistory(issue: typeof issues.$inferSelect) {
+    // Selected on what the row SAYS, not on which action name wrote it. Filtering by action name
+    // silently missed parks written under other names — `issue.successful_run_handoff_escalated`
+    // is one — which made the park read older than it was and shortened the settling window for
+    // exactly the escalations it exists to avoid fighting.
     const rows = await db
-      .select({ action: activityLog.action, details: activityLog.details, createdAt: activityLog.createdAt })
+      .select({ details: activityLog.details, createdAt: activityLog.createdAt })
       .from(activityLog)
       .where(
         and(
           eq(activityLog.companyId, issue.companyId),
           eq(activityLog.entityType, "issue"),
           eq(activityLog.entityId, issue.id),
-          inArray(activityLog.action, ["issue.created", "issue.updated"]),
+          sql`(
+            ${activityLog.details} ->> 'status' = 'blocked'
+            or ${activityLog.details} ->> 'source' = ${BLOCKED_RESUME_ACTIVITY_SOURCE}
+          )`,
         ),
       )
       .orderBy(desc(activityLog.createdAt))
@@ -1035,9 +1042,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         .catch(() => []);
 
       // `blockedByIssueIds` is deliberately OMITTED: passing it would REPLACE the blocker set, and
-      // passing `[]` would delete every `blocks` row pointing at this issue. Those rows are what
-      // `blockerAttention` and `blocked_by_cancelled_issue` read to tell the owner a premise died,
-      // so deleting them would erase the very signal this resume is supposed to hand over.
+      // passing `[]` would delete every `blocks` row pointing at this issue — irreversibly.
+      // `blockerAttention` and `blocked_by_cancelled_issue` are computed only for issues that are
+      // currently `blocked`, so neither reports this issue while it sits in `todo`; the comment
+      // below is the only hand-over the owner gets right now. Keeping the rows is what makes the
+      // board-visible signal come back if the issue is ever parked again.
       const updated = await issuesSvc.update(issue.id, { status: "todo" });
       if (!updated) {
         skipped += 1;
