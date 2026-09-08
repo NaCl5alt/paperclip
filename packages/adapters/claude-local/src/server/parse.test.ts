@@ -205,7 +205,7 @@ describe("isClaudeTransientUpstreamError", () => {
       isClaudeTransientUpstreamError({
         errorMessage: "You're out of extra usage · resets 4pm (America/Chicago)",
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("classifies Claude session-limit windows as provider quota and extracts the retry time", () => {
@@ -213,7 +213,7 @@ describe("isClaudeTransientUpstreamError", () => {
     const errorMessage = "You've hit your session limit - resets at 4pm (America/Chicago).";
 
     expect(isClaudeProviderQuotaError({ errorMessage })).toBe(true);
-    expect(isClaudeTransientUpstreamError({ errorMessage })).toBe(false);
+    expect(isClaudeTransientUpstreamError({ errorMessage })).toBe(true);
     expect(extractClaudeRetryNotBefore({ errorMessage }, now)?.toISOString()).toBe(
       "2026-04-22T21:00:00.000Z",
     );
@@ -639,6 +639,7 @@ describe("parseClaudeStreamJson usage extraction", () => {
       inputTokens: 10,
       outputTokens: 1_800,
       cachedInputTokens: 20,
+      cacheCreationInputTokens: 0,
     });
     expect(parsed.usageBasis).toBe("per_run");
   });
