@@ -1362,16 +1362,6 @@ export function LiveUpdatesProvider({ children }: { children: ReactNode }) {
   );
   useEffect(() => () => invalidationBatcher.dispose(), [invalidationBatcher]);
 
-  // Coalesce the per-event invalidation storm. Optimistic setQueryData writes
-  // still pass straight through (immediate); only invalidateQueries is batched
-  // and flushed at most a few times per second.
-  const invalidationBatcher = useMemo(() => createInvalidationBatcher(queryClient), [queryClient]);
-  const coalescingClient = useMemo(
-    () => createCoalescingQueryClient(queryClient, invalidationBatcher),
-    [queryClient, invalidationBatcher],
-  );
-  useEffect(() => () => invalidationBatcher.dispose(), [invalidationBatcher]);
-
   useEffect(() => {
     pathnameRef.current = location.pathname;
   }, [location.pathname]);

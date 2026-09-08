@@ -62,7 +62,6 @@ import {
   submitIssueThreadInteractionVerdictsSchema,
   withdrawIssueThreadInteractionSchema,
 } from "@paperclipai/shared";
-import { z } from "zod";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { logActivity } from "./activity-log.js";

@@ -3112,18 +3112,12 @@ export async function realizeExecutionWorkspace(input: {
     };
   }
 
-  const { repoRoot, branchName, worktreeParentDir, worktreePath } = await resolveExecutionWorktreeTarget({
+  let { repoRoot, branchName, worktreeParentDir, worktreePath } = await resolveExecutionWorktreeTarget({
     base: input.base,
     config: input.config,
     issue: input.issue,
     agent: input.agent,
   });
-  let branchName = sanitizeBranchName(renderedBranch);
-  const configuredParentDir = asString(rawStrategy.worktreeParentDir, "");
-  const worktreeParentDir = configuredParentDir
-    ? resolveConfiguredPath(configuredParentDir, repoRoot)
-    : path.join(repoRoot, ".paperclip", "worktrees");
-  const worktreePath = path.join(worktreeParentDir, branchName);
   let pendingForwardBranchReconcile: PendingForwardBranchReconcile | null = null;
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
     ? rawStrategy.baseRef
