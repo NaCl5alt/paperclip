@@ -107,9 +107,11 @@ describe("buildBlockersResolvedWakeFields", () => {
     // `reason:`/`wakeReason:` position is building it by hand — including a second producer
     // inside an existing file, which a per-file "does it import the builder" check cannot see.
     //
-    // Matched as a regex over the assignment rather than as a bare substring so that swapping
-    // to single quotes, a template literal, or concatenation does not slip past, and so that
-    // prose (comments, log messages, SQL) naming the reason is not falsely blocked.
+    // Matched as a regex over the assignment rather than as a bare substring, so swapping to
+    // single quotes, a template literal, or same-line concatenation does not slip past. Measured
+    // holes, accepted deliberately: a `+` pushed onto its own line, a reason passed through a
+    // variable, and a literal split across two strings. Prose is only spared when it does not
+    // take the `reason: "…"` shape — a comment written in that shape IS flagged, which errs safe.
     const producerPattern = /(reason|wakeReason)\s*:\s*(["'`]|.*\+\s*["'`])[^"'`]*issue_blockers_resolved/;
     const offenders = sourceFiles(SERVER_SRC)
       .filter((file) => file !== OWNER_MODULE && !file.endsWith(".test.ts"))

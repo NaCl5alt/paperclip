@@ -2234,6 +2234,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(JSON.stringify(recoveryAction.evidence)).not.toContain("sk-test-recovery-secret");
 
+    // The escalation parks the issue, so its activity row has to say so — `readBlockedResumeHistory`
+    // finds parks by `details.status`, and a park it cannot see makes the settling window and the
+    // per-park resume allowance run off the wrong timestamp.
+    const [parkRow] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.updated")));
+    expect(parkRow.details).toMatchObject({
+      status: "blocked",
+      previousStatus: "todo",
+      currentStatus: "blocked",
+    });
+
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
     expect(comments[0]?.body).toContain("retried dispatch");
@@ -2310,6 +2323,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ),
       );
     expect(blockerRelations).toHaveLength(0);
+
+    const [inPlaceParkRow] = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(eq(activityLog.entityId, issueId), eq(activityLog.action, "issue.updated")));
+    expect(inPlaceParkRow.details).toMatchObject({
+      status: "blocked",
+      previousStatus: "todo",
+      currentStatus: "blocked",
+    });
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
