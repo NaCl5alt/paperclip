@@ -116,11 +116,14 @@ export async function fireDeferredBlockerWakes(deps: {
             issueId: deps.blockerIssueId,
             dependentIssueId: dependent.id,
             agentId: dependent.assigneeAgentId,
+            failedStage: "enqueue_wake",
           });
         });
     }
   } catch (err) {
-    deps.onError(err, { issueId: deps.blockerIssueId });
+    // Distinguished from the per-dependent failure above so the two stay greppable apart: this
+    // one means no dependent was reached at all.
+    deps.onError(err, { issueId: deps.blockerIssueId, failedStage: "list_dependents" });
   }
   return fired;
 }

@@ -2667,8 +2667,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       entityId: input.issue.id,
       details: {
         identifier: input.issue.identifier,
-        status: "blocked",
-        previousStatus: input.previousStatus,
+        ...statusChangeActivityFields({ previousStatus: input.previousStatus, writtenStatus: "blocked" }),
         source: "recovery.reconcile_stranded_recovery_issue",
         latestRunId: input.latestRun?.id ?? null,
         latestRunStatus: input.latestRun?.status ?? null,
@@ -2833,8 +2832,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       entityId: input.issue.id,
       details: {
         identifier: input.issue.identifier,
-        status: "blocked",
-        previousStatus: input.previousStatus,
+        ...statusChangeActivityFields({ previousStatus: input.previousStatus, writtenStatus: "blocked" }),
         source: input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
           ? "recovery.reconcile_successful_run_handoff_missing_state"
           : input.recoveryCause === "workspace_validation_failed"

@@ -9,6 +9,8 @@ import {
 } from "../services/blockers-resolved-wake.ts";
 
 const SERVER_SRC = fileURLToPath(new URL("..", import.meta.url));
+// Absolute path, not a suffix match: a future `foo-blockers-resolved-wake.ts` must not be exempt.
+const OWNER_MODULE = join(SERVER_SRC, "services", "blockers-resolved-wake.ts");
 
 function sourceFiles(dir: string): string[] {
   return readdirSync(dir).flatMap((entry) => {
@@ -101,12 +103,17 @@ describe("buildBlockersResolvedWakeFields", () => {
 
   it("is the only source file allowed to name this wake reason", () => {
     // B5 happened because two producers hand-rolled the same payload and only one was updated.
-    // The builder now supplies `reason` as well, so any file that still spells the literal is
-    // building the wake by hand — including a second producer inside an existing file, which a
-    // per-file "does it import the builder" check could never see.
+    // The builder now supplies `reason` as well, so any file that still names the wake in a
+    // `reason:`/`wakeReason:` position is building it by hand — including a second producer
+    // inside an existing file, which a per-file "does it import the builder" check cannot see.
+    //
+    // Matched as a regex over the assignment rather than as a bare substring so that swapping
+    // to single quotes, a template literal, or concatenation does not slip past, and so that
+    // prose (comments, log messages, SQL) naming the reason is not falsely blocked.
+    const producerPattern = /(reason|wakeReason)\s*:\s*(["'`]|.*\+\s*["'`])[^"'`]*issue_blockers_resolved/;
     const offenders = sourceFiles(SERVER_SRC)
-      .filter((file) => !file.endsWith("blockers-resolved-wake.ts"))
-      .filter((file) => readFileSync(file, "utf8").includes('"issue_blockers_resolved"'));
+      .filter((file) => file !== OWNER_MODULE && !file.endsWith(".test.ts"))
+      .filter((file) => producerPattern.test(readFileSync(file, "utf8")));
 
     expect(offenders).toEqual([]);
   });
@@ -177,7 +184,7 @@ describe("buildBlockersResolvedWakeFields", () => {
     });
 
     it("keeps firing the remaining dependents when one wake throws", async () => {
-      const errors: unknown[] = [];
+      const errors: Array<Record<string, unknown>> = [];
       const wakes: string[] = [];
       const fired = await fireDeferredBlockerWakes({
         blockerIssueId: "blocker-done",
@@ -191,16 +198,18 @@ describe("buildBlockersResolvedWakeFields", () => {
           if (agentId === "agent-a") throw new Error("queue full");
           wakes.push(agentId);
         },
-        onError: (err) => errors.push(err),
+        onError: (err, context) => errors.push(context),
       });
 
       expect(fired).toBe(1);
       expect(wakes).toEqual(["agent-b"]);
-      expect(errors).toHaveLength(1);
+      expect(errors).toEqual([
+        expect.objectContaining({ failedStage: "enqueue_wake", dependentIssueId: "dependent-1" }),
+      ]);
     });
 
     it("reports a lookup failure instead of throwing into the run finalizer", async () => {
-      const errors: unknown[] = [];
+      const errors: Array<Record<string, unknown>> = [];
       const fired = await fireDeferredBlockerWakes({
         blockerIssueId: "blocker-done",
         blockerIssueStatus: "done",
@@ -208,11 +217,12 @@ describe("buildBlockersResolvedWakeFields", () => {
           throw new Error("db down");
         },
         enqueueWakeup: async () => undefined,
-        onError: (err) => errors.push(err),
+        onError: (err, context) => errors.push(context),
       });
 
       expect(fired).toBe(0);
-      expect(errors).toHaveLength(1);
+      // A batch-wide failure must not read like a single dependent failing.
+      expect(errors).toEqual([expect.objectContaining({ failedStage: "list_dependents" })]);
     });
   });
 });
