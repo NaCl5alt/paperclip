@@ -126,3 +126,27 @@ export function decideBlockedResume(history: BlockedResumeHistory): BlockedResum
   }
   return { resume: true };
 }
+
+/**
+ * The `details` fields an activity row uses to describe a status write.
+ *
+ * `readBlockedResumeHistory` selects park rows by `details.status === "blocked"`, not by action
+ * name, so a row that names a status it did not actually write fabricates a park: the settling
+ * window restarts and that park's resume allowance re-opens. Writers that only conditionally
+ * change the status must therefore only conditionally report it — this happened twice in one
+ * commit, in two places 2,300 lines apart, which is why it lives in one function now.
+ *
+ * `currentStatus` is always reported so readers that just want "where is it now" have a field
+ * that is never conditional.
+ */
+export function statusChangeActivityFields(input: {
+  previousStatus: string;
+  /** The status this write actually set, or undefined when it deliberately left it alone. */
+  writtenStatus?: string;
+}) {
+  const changed = input.writtenStatus !== undefined && input.writtenStatus !== input.previousStatus;
+  return {
+    ...(changed ? { status: input.writtenStatus, previousStatus: input.previousStatus } : {}),
+    currentStatus: input.writtenStatus ?? input.previousStatus,
+  };
+}

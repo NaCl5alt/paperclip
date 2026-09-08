@@ -67,6 +67,7 @@ import {
   classifyBlockedWait,
   decideBlockedResume,
   isResumableBlockedWait,
+  statusChangeActivityFields,
   type BlockedWaitSignals,
 } from "../services/recovery/blocked-wait.ts";
 
@@ -121,6 +122,32 @@ describe("classifyBlockedWait", () => {
       ),
     ).toBe("hold");
     expect(classifyBlockedWait(signals({ pendingApprovalCount: 1, unresolvedBlockerCount: 3 }))).toBe("approval");
+  });
+});
+
+describe("statusChangeActivityFields", () => {
+  it("reports a park only when the write actually parked the issue", () => {
+    expect(statusChangeActivityFields({ previousStatus: "in_progress", writtenStatus: "blocked" })).toEqual({
+      status: "blocked",
+      previousStatus: "in_progress",
+      currentStatus: "blocked",
+    });
+  });
+
+  it("does not re-announce a park on an issue that was already blocked", () => {
+    // readBlockedResumeHistory picks park rows out of activity by `details.status`, so a row
+    // claiming a park that did not happen restarts the settling window and hands back that
+    // park's resume allowance. Escalations that only add a blocker must not claim one.
+    const fields = statusChangeActivityFields({ previousStatus: "blocked", writtenStatus: "blocked" });
+    expect(fields).not.toHaveProperty("status");
+    expect(fields).not.toHaveProperty("previousStatus");
+    expect(fields).toEqual({ currentStatus: "blocked" });
+  });
+
+  it("reports where the issue is even when the write left the status alone", () => {
+    const fields = statusChangeActivityFields({ previousStatus: "blocked" });
+    expect(fields).not.toHaveProperty("status");
+    expect(fields).toEqual({ currentStatus: "blocked" });
   });
 });
 
