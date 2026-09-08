@@ -65,6 +65,12 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import {
+  classifyBlockedWait,
+  decideBlockedResume,
+  isResumableBlockedWait,
+  type BlockedWaitKind,
+} from "./blocked-wait.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
@@ -75,6 +81,10 @@ const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+const BLOCKED_RESUME_ACTIVITY_SOURCE = "recovery.reconcile_resumable_blocked_issue";
+const PENDING_INTERACTION_STATUSES = ["pending"] as const;
+const PENDING_APPROVAL_STATUSES = ["pending", "revision_requested"] as const;
+const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -172,7 +182,7 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "codex_transient_upstream",
   "claude_transient_upstream",
   "timeout",
-  // A shared checkout was contended and could not be isolated (VANA-4055).
+  // A shared checkout was contended and could not be isolated.
   // Contention is genuinely transient — the run holding the directory finishes
   // and the next attempt either takes the claim or isolates cleanly — so the
   // backed-off retry ladder is the right budget. What it must NOT be is a
@@ -217,7 +227,7 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
   "budget_exhausted",
   "issue_paused",
   "issue_dependencies_blocked",
-  // Deterministic credential failures (VANA-4048 / VANA-4041): an expired or
+  // Deterministic credential failures: an expired or
   // absent credential does not heal by retrying on the same account, so a
   // per-issue continuation retry only burns a run and re-emits the same code.
   // Treat them as non-retryable so the issue escalates straight to `blocked`;
@@ -847,6 +857,245 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     return { assigned, skipped, issueIds };
+  }
+
+  /**
+   * Reads the durable evidence needed to decide whether an automatic resume of a `blocked`
+   * issue would be a duplicate. Both facts come from `activity_log`, so a restart, a second
+   * sweep pass or a duplicated event all observe the same answer.
+   */
+  async function readBlockedResumeHistory(issue: typeof issues.$inferSelect) {
+    const rows = await db
+      .select({ action: activityLog.action, details: activityLog.details, createdAt: activityLog.createdAt })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, issue.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issue.id),
+          inArray(activityLog.action, ["issue.created", "issue.updated"]),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt))
+      .limit(500);
+
+    const resumeAts: Date[] = [];
+    let lastBlockedEntryAt: Date | null = null;
+    for (const row of rows) {
+      const details = parseObject(row.details) ?? {};
+      if (details.source === BLOCKED_RESUME_ACTIVITY_SOURCE) {
+        resumeAts.push(row.createdAt);
+        continue;
+      }
+      // Newest-first, so the first status:"blocked" write is the current park.
+      if (!lastBlockedEntryAt && details.status === "blocked") {
+        lastBlockedEntryAt = row.createdAt;
+      }
+    }
+    return { resumeAts, lastBlockedEntryAt, issueUpdatedAt: issue.updatedAt, now: new Date() };
+  }
+
+  async function collectBlockedWaitSignals(issue: typeof issues.$inferSelect, now: Date) {
+    const [
+      unresolvedBlockerIssueIds,
+      pendingInteractionCount,
+      pendingApprovalCount,
+      hasActiveRecoveryAction,
+      hasExecutionPath,
+      isPauseHeld,
+    ] = await Promise.all([
+      existingUnresolvedBlockerIssueIds(issue.companyId, issue.id),
+      db
+        .select({ id: issueThreadInteractions.id })
+        .from(issueThreadInteractions)
+        .where(
+          and(
+            eq(issueThreadInteractions.companyId, issue.companyId),
+            eq(issueThreadInteractions.issueId, issue.id),
+            inArray(issueThreadInteractions.status, [...PENDING_INTERACTION_STATUSES]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length),
+      db
+        .select({ approvalId: issueApprovals.approvalId })
+        .from(issueApprovals)
+        .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+        .where(
+          and(
+            eq(issueApprovals.companyId, issue.companyId),
+            eq(issueApprovals.issueId, issue.id),
+            inArray(approvals.status, [...PENDING_APPROVAL_STATUSES]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length),
+      db
+        .select({ id: issueRecoveryActions.id })
+        .from(issueRecoveryActions)
+        .where(
+          and(
+            eq(issueRecoveryActions.companyId, issue.companyId),
+            eq(issueRecoveryActions.sourceIssueId, issue.id),
+            inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0),
+      hasActiveExecutionPath(issue.companyId, issue.id),
+      isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc),
+    ]);
+
+    return {
+      unresolvedBlockerCount: unresolvedBlockerIssueIds.length,
+      pendingInteractionCount,
+      pendingApprovalCount,
+      monitorNextCheckAt: issue.monitorNextCheckAt ?? null,
+      hasActiveRecoveryAction,
+      hasActiveExecutionPath: hasExecutionPath,
+      isPauseHeld,
+      now,
+    };
+  }
+
+  /**
+   * Returns `blocked` issues that nothing will ever revisit back to `todo`, keeping the
+   * assignee. This repairs both a lost blocker-resolved wake and the larger class of issues
+   * that were parked in `blocked` without ever having a wait path.
+   *
+   * It deliberately does NOT close anything, and it stays away from every other kind of wait —
+   * see `classifyBlockedWait`. Resumes are capped per park and per issue by
+   * `decideBlockedResume`, so duplicate events and repeated sweeps cannot re-queue an issue and
+   * an agent that re-parks cannot be bounced forever.
+   */
+  async function reconcileResumableBlockedIssues(touchedInThisSweep: ReadonlySet<string>) {
+    const now = new Date();
+    const candidates = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "blocked"),
+          isNull(issues.assigneeUserId),
+          isNull(issues.hiddenAt),
+          sql`${issues.assigneeAgentId} is not null`,
+        ),
+      );
+
+    let resumed = 0;
+    let skipped = 0;
+    const issueIds: string[] = [];
+
+    for (const issue of candidates) {
+      const agentId = issue.assigneeAgentId;
+      if (!agentId) {
+        skipped += 1;
+        continue;
+      }
+      // An earlier stage of this same sweep may have just escalated this issue into `blocked`.
+      // Undoing that in the same pass would be a pure ping-pong.
+      if (touchedInThisSweep.has(issue.id)) {
+        skipped += 1;
+        continue;
+      }
+      const agent = await getAgent(agentId);
+      if (!agent || agent.companyId !== issue.companyId || !(await isAgentInvokable(agent))) {
+        skipped += 1;
+        continue;
+      }
+
+      const waitKind: BlockedWaitKind = classifyBlockedWait(await collectBlockedWaitSignals(issue, now));
+      if (!isResumableBlockedWait(waitKind)) {
+        skipped += 1;
+        continue;
+      }
+
+      const decision = decideBlockedResume(await readBlockedResumeHistory(issue));
+      if (!decision.resume) {
+        skipped += 1;
+        continue;
+      }
+
+      if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
+        skipped += 1;
+        continue;
+      }
+      if (await isInvocationBudgetBlocked(issue, agentId)) {
+        skipped += 1;
+        continue;
+      }
+
+      // Re-assert the (empty) blocker set explicitly rather than omitting it, so this write
+      // cannot be read as "leave the relations alone" by a future change to the update path.
+      const updated = await issuesSvc.update(issue.id, {
+        status: "todo",
+        blockedByIssueIds: [],
+      });
+      if (!updated) {
+        skipped += 1;
+        continue;
+      }
+
+      await issuesSvc.addComment(
+        issue.id,
+        [
+          "## Resumed from `blocked` — no wait path remained",
+          "",
+          "Paperclip found this issue parked in `blocked` with nothing that could ever bring it back:",
+          "no unresolved blocker, no pending approval or interaction, no scheduled monitor check,",
+          "no recovery action and no live run. It has been returned to `todo` with the same assignee.",
+          "",
+          "- If it is still genuinely waiting, record the wait as a first-class blocker, an interaction/approval, or a monitor check — otherwise it will be parked invisibly again.",
+          "- If it is finished or obsolete, close it explicitly as `done` or `cancelled`.",
+        ].join("\n"),
+        {},
+      );
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          status: "todo",
+          _previous: { status: "blocked" },
+          source: BLOCKED_RESUME_ACTIVITY_SOURCE,
+          blockedWaitKind: waitKind,
+        },
+      });
+
+      const queued = await deps.enqueueWakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_status_changed",
+        payload: withRecoveryModelProfileHint({
+          issueId: issue.id,
+          mutation: "resumable_blocked_recovery",
+        }, "normal_model"),
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: withRecoveryModelProfileHint({
+          issueId: issue.id,
+          taskId: issue.id,
+          wakeReason: "issue_status_changed",
+          source: "issue.resumable_blocked_recovery",
+        }, "normal_model"),
+      });
+
+      if (queued) {
+        resumed += 1;
+        issueIds.push(issue.id);
+      } else {
+        skipped += 1;
+      }
+    }
+
+    return { resumed, skipped, issueIds };
   }
 
   async function getCompanyIssuePrefix(companyId: string) {
@@ -2891,6 +3140,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       productiveContinuationObserved: 0,
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
+      resumableBlockedResumed: 0,
       successfulRunHandoffEscalated: 0,
       escalated: 0,
       recoveryActionRenudged: 0,
@@ -3172,6 +3422,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
     result.skipped += orphanBlockerRecovery.skipped;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
+
+    const blockedResume = await reconcileResumableBlockedIssues(new Set(result.issueIds));
+    result.resumableBlockedResumed = blockedResume.resumed;
+    result.skipped += blockedResume.skipped;
+    result.issueIds.push(...blockedResume.issueIds);
 
     await renudgeStrandedRecoveryActions(result);
 

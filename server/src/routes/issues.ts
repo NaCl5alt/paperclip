@@ -738,7 +738,7 @@ const INTERACTION_WAKE_REASON_MAX_LENGTH = 2000;
 
 // Summarize a resolved interaction so the continuation wake can surface the
 // board's decision (accept/reject + reason) instead of just "an interaction
-// resolved" (VANA-589). `outcome` falls back to the interaction status for
+// resolved". `outcome` falls back to the interaction status for
 // kinds without an explicit result.outcome; `reason` collapses the per-kind
 // reason fields and is truncated to keep the wake payload small.
 function summarizeResolvedInteractionResult(interaction: {
@@ -5588,10 +5588,16 @@ export function issueRoutes(
         }
       }
 
-      const becameDone = existing.status !== "done" && issue.status === "done";
-      if (becameDone) {
+      // A blocker resolves its dependents when it reaches EITHER terminal status. Firing only
+      // on `done` left every dependent of a cancelled blocker permanently parked, because a
+      // cancelled blocker can never transition to `done` afterwards.
+      const becameBlockerResolved =
+        !["done", "cancelled"].includes(existing.status) && ["done", "cancelled"].includes(issue.status);
+      if (becameBlockerResolved) {
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
+          const cancelledBlockerIssueIds = dependent.cancelledBlockerIssueIds ?? [];
+          const resolvedByCancellation = cancelledBlockerIssueIds.length > 0;
           addWakeup(dependent.assigneeAgentId, {
             source: "automation",
             triggerDetail: "system",
@@ -5599,7 +5605,9 @@ export function issueRoutes(
             payload: {
               issueId: dependent.id,
               resolvedBlockerIssueId: issue.id,
+              resolvedBlockerStatus: issue.status,
               blockerIssueIds: dependent.blockerIssueIds,
+              ...(resolvedByCancellation ? { cancelledBlockerIssueIds } : {}),
             },
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
@@ -5609,7 +5617,9 @@ export function issueRoutes(
               wakeReason: "issue_blockers_resolved",
               source: "issue.blockers_resolved",
               resolvedBlockerIssueId: issue.id,
+              resolvedBlockerStatus: issue.status,
               blockerIssueIds: dependent.blockerIssueIds,
+              ...(resolvedByCancellation ? { cancelledBlockerIssueIds } : {}),
             },
           });
         }
