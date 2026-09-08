@@ -24,7 +24,7 @@ if (!embeddedPostgresSupport.supported) {
 }
 
 /**
- * VANA-4041 integration coverage for the account failure gate.
+ * integration coverage for the account failure gate.
  *
  * The unit tests in `services/recovery/account-failure-gate.test.ts` pin the
  * pure classifier. They cannot see the enforcement site, and that site is the
@@ -82,6 +82,10 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       status: "active",
       requireBoardApprovalForNewAgents: false,
+      // The dispatch seed refuses to queue a run it cannot attribute to a user
+      // (heartbeat.ts resolveResponsibleUserIdForRunSeed). This fixture creates no
+      // company memberships, so the company default is the only resolution path.
+      defaultResponsibleUserId: "responsible-user",
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -113,7 +117,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
   }
 
   // `error` is required, not defaulted: arming corroborates the error code
-  // against the run's own error text (VANA-4067 B-II1), so a fixture that omits
+  // against the run's own error text, so a fixture that omits
   // it would quietly stop exercising the gate. Making the compiler ask keeps
   // every case in this file explicit about which text it is asserting on.
   async function recordTerminalRun(
@@ -242,7 +246,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
     ).not.toBeNull();
   });
 
-  // ── release condition: only observed recovery releases (VANA-4067 B-I1) ────
+  // ── release condition: only observed recovery releases ────
 
   it("stays gated when the auth handoff cancels the account's queued runs", async () => {
     const companyId = await seedCompany();
@@ -254,7 +258,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
       error: AUTH_ERROR_TEXT,
       finishedAt: minutesAgo(10),
     });
-    // Exactly what the co-shipped VANA-3914 failover produces: it reassigns the
+    // Exactly what the co-shipped failover produces: it reassigns the
     // issue away from the dead account, and every queued run on the old
     // assignee is cancelled with this code — newer than the auth failure that
     // armed the gate. Reading it as "recovery" let the handoff release the gate
@@ -423,7 +427,7 @@ describeEmbeddedPostgres("heartbeat account failure gate enforcement", () => {
       await heartbeat.wakeup(sibling, { source: "automation", triggerDetail: "issue_assigned" }),
     ).toBeNull();
   });
-  // --- the error code alone must not arm the gate (VANA-4067 B-II1) ---
+  // --- the error code alone must not arm the gate ---
 
   it("does not suppress the account when an auth code is not corroborated by the run's own error", async () => {
     const companyId = await seedCompany();

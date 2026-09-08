@@ -29,7 +29,7 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-describeEmbeddedPostgres("scheduled retry immediate promotion (VANA-751 Fix A+B)", () => {
+describeEmbeddedPostgres("scheduled retry immediate promotion", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -71,6 +71,10 @@ describeEmbeddedPostgres("scheduled retry immediate promotion (VANA-751 Fix A+B)
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
+      // The dispatch seed refuses to queue a run it cannot attribute to a user
+      // (heartbeat.ts resolveResponsibleUserIdForRunSeed). This fixture creates no
+      // company memberships, so the company default is the only resolution path.
+      defaultResponsibleUserId: "responsible-user",
     });
 
     await db.insert(agents).values({
