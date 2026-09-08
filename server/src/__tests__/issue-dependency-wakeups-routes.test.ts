@@ -369,4 +369,40 @@ describe("issue dependency wakeups in issue routes", () => {
       expect.objectContaining({ reason: "issue_blockers_resolved" }),
     );
   });
+
+  it("does not re-arm when the issue was already blocked (no into-blocked transition)", async () => {
+    mockIssueService.getById.mockResolvedValue(blockedTransitionIssue("blocked"));
+    mockIssueService.update.mockResolvedValue(blockedTransitionIssue("blocked"));
+    mockIssueService.getDependencyReadiness.mockResolvedValue(
+      readiness({ blockerIssueIds: ["issue-1"], isDependencyReady: true, allBlockersDone: true }),
+    );
+
+    const res = await request(await createApp()).patch("/api/issues/issue-2").send({ status: "blocked" });
+    expect(res.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockWakeup).not.toHaveBeenCalledWith(
+      "agent-2",
+      expect.objectContaining({ reason: "issue_blockers_resolved" }),
+    );
+  });
+
+  it("does not re-arm when the blocked issue has no assignee", async () => {
+    const unassigned = { ...blockedTransitionIssue("in_progress"), assigneeAgentId: null };
+    const unassignedBlocked = { ...blockedTransitionIssue("blocked"), assigneeAgentId: null };
+    mockIssueService.getById.mockResolvedValue(unassigned);
+    mockIssueService.update.mockResolvedValue(unassignedBlocked);
+    mockIssueService.getDependencyReadiness.mockResolvedValue(
+      readiness({ blockerIssueIds: ["issue-1"], isDependencyReady: true, allBlockersDone: true }),
+    );
+
+    const res = await request(await createApp()).patch("/api/issues/issue-2").send({ status: "blocked" });
+    expect(res.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Assert across every call (including a null-agent call) so dropping the
+    // assignee guard — which would wake a null agent — is caught.
+    const firedBlockersResolved = mockWakeup.mock.calls.some(
+      ([, wakeup]) => (wakeup as { reason?: string } | undefined)?.reason === "issue_blockers_resolved",
+    );
+    expect(firedBlockersResolved).toBe(false);
+  });
 });
