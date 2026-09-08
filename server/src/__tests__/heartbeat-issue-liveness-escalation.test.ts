@@ -484,7 +484,16 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         projectWorkspaceSourceIssueId: blockerIssueId,
       },
     });
-    expect(events.filter((event) => event.action === "issue.blockers.updated")).toHaveLength(1);
+    const blockersUpdated = events.filter((event) => event.action === "issue.blockers.updated");
+    expect(blockersUpdated).toHaveLength(1);
+    // The source issue was already `blocked`; this write only added a blocker. Claiming a park
+    // here would restart the settling window and hand back that park's automatic-resume
+    // allowance in `readBlockedResumeHistory`, which selects parks by `details.status`
+    // regardless of which action wrote the row.
+    const parkDetails = blockersUpdated[0]!.details as Record<string, unknown>;
+    expect(parkDetails).not.toHaveProperty("status");
+    expect(parkDetails).not.toHaveProperty("previousStatus");
+    expect(parkDetails.currentStatus).toBe("blocked");
   });
 
   it("skips budget-blocked direct owners and assigns recovery to the manager fallback", async () => {
