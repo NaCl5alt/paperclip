@@ -114,6 +114,7 @@ import {
   SHARED_WORKSPACE_ISOLATION_FAILURE_CODE,
 } from "./shared-workspace-writer.js";
 import { issueService } from "./issues.js";
+import { buildBlockersResolvedWakeFields } from "./blockers-resolved-wake.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -361,7 +362,7 @@ function readTransientRecoveryContractFromRun(
   return {
     errorFamily: "transient_upstream" as const,
     retryNotBefore: readTransientRetryNotBeforeFromRun(run),
-    // VANA-2662: a reset-less account/org quota exhaustion (monthly spend limit
+    // a reset-less account/org quota exhaustion (monthly spend limit
     // etc.) triggers an immediate handoff rather than the bounded-retry ladder.
     accountQuotaExhausted: resultJson.accountQuotaExhausted === true,
   };
@@ -3084,7 +3085,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     status: string | null | undefined;
     failureReason?: string | null;
   }) {
-    // VANA-4055: the run is done writing, so hand the checkout back before the
+    // the run is done writing, so hand the checkout back before the
     // next contender has to decide whether this claim is stale.
     await sharedWorkspaceClaimsSvc.releaseForRun(input.runId).catch((err) => {
       logger.warn({ err, runId: input.runId }, "failed to release shared workspace claims for heartbeat run");
@@ -5986,7 +5987,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { outcome: "promoted", run: promoted };
   }
 
-  // VANA-775: hand a transient-upstream-failed issue off to the assignee's
+  // hand a transient-upstream-failed issue off to the assignee's
   // configured `recoveryFallbackAgentId` when bounded retries are exhausted or
   // the upstream-provided retryNotBefore is too far away to keep waiting.
   async function failoverTransientUpstreamRunToRecoveryFallback(input: {
@@ -6038,7 +6039,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         currentAssigneeAgentId: issue.assigneeAgentId,
       });
     }
-    // VANA-1892: comment-driven wakes (the primary use case for this handoff)
+    // comment-driven wakes (the primary use case for this handoff)
     // routinely fire on issues parked in `blocked` or `in_review`, and the old
     // `in_progress`/`todo`-only allowlist silently dropped every such handoff
     // (top failure mode: blocked×16 / in_review×13). Every non-terminal status
@@ -6185,7 +6186,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
 
-    // VANA-3914: Claude OAuth/login breaks are account-scoped and long-lived.
+    // Claude OAuth/login breaks are account-scoped and long-lived.
     // Retrying the same adapter burns wake budget without progress, so hand off
     // to recoveryFallbackAgentId immediately (same posture as account_quota_exhausted).
     // B(2) — fallback paused — remains an ops concern outside this path.
@@ -6239,7 +6240,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           maxAttempts,
         },
       });
-      // VANA-775 Fix B(a): with bounded retries exhausted, fail the issue over
+      // Fix B(a): with bounded retries exhausted, fail the issue over
       // to the assignee's configured recovery fallback agent when one exists.
       const recoveryFallback = transientRecovery
         ? await failoverTransientUpstreamRunToRecoveryFallback({
@@ -6299,7 +6300,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
-    // VANA-2662: a reset-less account/org quota exhaustion (e.g. a monthly spend
+    // a reset-less account/org quota exhaustion (e.g. a monthly spend
     // limit) never clears on the bounded-retry timescale, so hand the issue off
     // to the configured recovery fallback agent immediately on the first failure
     // rather than grinding through the ladder. Runs before the retryNotBefore
@@ -6326,7 +6327,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
     }
-    // VANA-775 Fix B(b): when the upstream retry window (e.g. a session-limit
+    // Fix B(b): when the upstream retry window (e.g. a session-limit
     // reset) is too far away, hand the issue off to the configured recovery
     // fallback agent now instead of scheduling a long-deferred retry. When the
     // handoff is skipped (no fallback, guard failed), fall through to the
@@ -6768,7 +6769,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // Shared core for "run a scheduled retry now": stamp the retry-now request on
   // the run (and its wakeup request), promote it through the standard gate
   // evaluation, and dispatch the agent's queue immediately when promoted so the
-  // run starts without waiting for the next scheduler tick (VANA-751 Fix A+B).
+  // run starts without waiting for the next scheduler tick.
   async function requestScheduledRetryRunNow(input: {
     run: typeof heartbeatRuns.$inferSelect;
     now?: Date;
@@ -6841,7 +6842,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const promotion = await promoteScheduledRetryRun(updated, now);
     if (promotion.outcome === "promoted") {
-      // Fix B (VANA-751): start the promoted run immediately instead of leaving
+      // Fix B: start the promoted run immediately instead of leaving
       // it queued until the next scheduler tick (~30s).
       await startNextQueuedRunForAgent(promotion.run.agentId);
     }
@@ -7788,7 +7789,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (reaped.length > 0) {
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }
-    // VANA-4055: backstop for shared-checkout claims whose owning run died
+    // backstop for shared-checkout claims whose owning run died
     // without reaching the run-end release path. Without this a hard crash would
     // leave a directory claimed until its TTL expires, needlessly isolating
     // every later run into a fresh worktree.
@@ -8502,11 +8503,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       repoUrl: resolvedWorkspace.repoUrl,
       repoRef: resolvedWorkspace.repoRef,
     } satisfies ExecutionWorkspaceInput;
-    // VANA-4055: single-writer enforcement for on-disk checkouts.
+    // single-writer enforcement for on-disk checkouts.
     //
     // The claim below is taken on the directory this run is about to write to,
     // *before* `ensurePersistedExecutionWorkspaceAvailable` / `realizeExecutionWorkspace`
-    // mutate git. VANA-4049 claimed after realization, which could record a race
+    // mutate git. claimed after realization, which could record a race
     // but never win it. On contention the run is moved into its own worktree
     // rather than failed, because shared-checkout collisions are routine across
     // the fleet; fail-close is reserved for isolation being impossible.
@@ -8613,14 +8614,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       resolveIsolationCandidateCwd,
       realizeIsolated: realizeIsolatedExecutionWorkspace,
       isolationAttempts: isolationBranchNames.length,
-      // VANA-4071/4072: enforce isolation-or-fail-close only for git-managed
+      // enforce isolation-or-fail-close only for git-managed
       // checkouts. A non-git shared workspace has no worktree to isolate into
       // and no concurrent-git failure mode, so contention shares it (fail-open)
       // rather than dropping the run — which is what regressed on 2026-09-07.
       // `isGitCheckoutStrict` shares only when git *positively* reports non-git;
       // an inconclusive check (git could not run, or failed for another reason)
       // throws and is treated as git-managed, so a real checkout is never shared
-      // with a live writer on a transient git failure (the VANA-3258 hazard).
+      // with a live writer on a transient git failure.
       isCheckoutGitManaged: (cwd) => isGitCheckoutStrict(cwd),
       logger,
     }).catch((error: unknown) => {
@@ -8669,7 +8670,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       baseRefSha: executionWorkspace.baseRefSha ?? null,
     });
     if (sharedWorkspaceWriter.contention && nextExecutionWorkspaceMetadata) {
-      // VANA-4055: a worktree created only to dodge a collision has nothing
+      // a worktree created only to dodge a collision has nothing
       // pointing at it once the run ends. Mark it so operators can find and
       // close these rather than discovering them as unexplained directories.
       nextExecutionWorkspaceMetadata.sharedWorkspaceIsolation = {
@@ -8766,7 +8767,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       persistedExecutionWorkspace &&
       existingExecutionWorkspace.id !== persistedExecutionWorkspace.id &&
       existingExecutionWorkspace.status === "active" &&
-      // VANA-4055: an isolated run moved aside from a workspace another live run
+      // an isolated run moved aside from a workspace another live run
       // is still writing. Idling that row here would retire a workspace that is
       // in active use by its rightful owner.
       sharedWorkspaceWriter.mode !== "isolated"
@@ -8776,7 +8777,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         cleanupReason: null,
       });
     }
-    // VANA-4055: isolation is a per-run detour around a transient collision, not
+    // isolation is a per-run detour around a transient collision, not
     // a reconfiguration of the issue. Repointing the issue at a run-scoped
     // worktree here would make one race permanently change where the issue works.
     if (issueId && persistedExecutionWorkspace && sharedWorkspaceWriter.mode !== "isolated") {
@@ -9029,7 +9030,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(eq(heartbeatRuns.id, run.id));
       lastOutputFlushAt = pendingOutputProgress.at;
       outputProgressState.pending = null;
-      // VANA-4055: keep an observable "this writer was alive at" stamp on the
+      // keep an observable "this writer was alive at" stamp on the
       // checkout claim. Steal decisions are made on run status, not on this
       // timestamp, so a stale stamp can never hand the directory away — it is
       // here so operators reading `shared_workspace_claims` can tell a working
@@ -9559,7 +9560,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
         } else if (outcome === "failed" && livenessRun.errorCode === "claude_auth_required") {
-          // VANA-3914 defect B(1): auth breaks never enter the transient-upstream
+          // defect B(1): auth breaks never enter the transient-upstream
           // retry contract, so route them through the same scheduler entrypoint
           // that now short-circuits to recovery fallback.
           await scheduleBoundedRetryForRun(livenessRun, agent);
@@ -9595,20 +9596,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   source: "automation",
                   triggerDetail: "system",
                   reason: "issue_blockers_resolved",
-                  payload: {
-                    issueId: dependent.id,
+                  // Shared with the issue PATCH route: for a blocker completed mid-run this hook
+                  // is the only wake the dependent's owner gets, so it has to carry the same
+                  // facts — including any cancelled blocker.
+                  ...buildBlockersResolvedWakeFields({
+                    dependent,
                     resolvedBlockerIssueId: issueId,
-                    blockerIssueIds: dependent.blockerIssueIds,
-                    deferredFor: "workspace_finalize",
-                  },
-                  contextSnapshot: {
-                    issueId: dependent.id,
-                    taskId: dependent.id,
-                    wakeReason: "issue_blockers_resolved",
+                    resolvedBlockerStatus: blockerIssueStatus,
                     source: "workspace.finalize",
-                    resolvedBlockerIssueId: issueId,
-                    blockerIssueIds: dependent.blockerIssueIds,
-                  },
+                    deferredFor: "workspace_finalize",
+                  }),
                 }).catch((wakeErr) => {
                   logger.warn(
                     { err: wakeErr, issueId, dependentIssueId: dependent.id, agentId: dependent.assigneeAgentId },
@@ -10291,7 +10288,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await startNextQueuedRunForAgent(promotedRun.agentId);
   }
 
-  // VANA-4048: derive whether the credential account an agent runs under is in
+  // derive whether the credential account an agent runs under is in
   // a confirmed auth-failure state, from the account's recent terminal runs.
   // Read-only and fail-open: any error, or an account whose credential scope
   // cannot be determined, yields null so the gate can only ever suppress an
@@ -10530,7 +10527,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
     }
 
-    // VANA-4048: suppress automated wakes to an account whose credentials are in
+    // suppress automated wakes to an account whose credentials are in
     // a confirmed deterministic-failure (auth-required) state, so one dead
     // account does not fan a per-issue retry out across every issue that shares
     // it. User-initiated wakes are never suppressed — they carry human intent,
@@ -10904,7 +10901,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             return {
               kind: "coalesced" as const,
               run: mergedRun,
-              // Fix A (VANA-751): a user-initiated wake that coalesced into a
+              // Fix A: a user-initiated wake that coalesced into a
               // scheduled retry should run now instead of waiting out the
               // backoff. Promotion happens after the transaction commits so the
               // issue row lock is released first; system/timer wakes keep the
@@ -11118,7 +11115,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       if (mergedRun.status === "scheduled_retry" && opts.requestedByActorType === "user") {
-        // Fix A (VANA-751): user-initiated wakes promote the coalesced
+        // Fix A: user-initiated wakes promote the coalesced
         // scheduled retry immediately and dispatch it; system/timer wakes keep
         // the automatic-retry backoff untouched.
         const { updated, promotion } = await requestScheduledRetryRunNow({

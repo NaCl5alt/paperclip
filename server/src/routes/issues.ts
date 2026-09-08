@@ -65,6 +65,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import type { StorageService } from "../storage/types.js";
 import { validate } from "../middleware/validate.js";
 import * as serviceIndex from "../services/index.js";
+import { buildBlockersResolvedWakeFields } from "../services/blockers-resolved-wake.js";
 import {
   accessService,
   agentService,
@@ -5596,42 +5597,18 @@ export function issueRoutes(
       if (becameBlockerResolved) {
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
-          // Two different facts, and they must not be conflated:
-          //   `resolvedByCancellation` — the blocker that just terminated was cancelled;
-          //   `cancelledBlockerIssueIds` — every blocker of this dependent that was cancelled.
-          // Gating the list on the flag dropped it whenever the LAST blocker to terminate was
-          // `done` while an earlier one had been cancelled, which is the ordinary shape for a
-          // dependent with more than one blocker — the owner then never heard that a premise
-          // had died. Always send the list when it is non-empty.
-          const resolvedByCancellation = issue.status === "cancelled";
-          const cancelledBlockerIssueIds = dependent.cancelledBlockerIssueIds ?? [];
-          const cancellationFields = {
-            ...(resolvedByCancellation ? { resolvedByCancellation: true } : {}),
-            ...(cancelledBlockerIssueIds.length > 0 ? { cancelledBlockerIssueIds } : {}),
-          };
           addWakeup(dependent.assigneeAgentId, {
             source: "automation",
             triggerDetail: "system",
             reason: "issue_blockers_resolved",
-            payload: {
-              issueId: dependent.id,
+            ...buildBlockersResolvedWakeFields({
+              dependent,
               resolvedBlockerIssueId: issue.id,
               resolvedBlockerStatus: issue.status,
-              blockerIssueIds: dependent.blockerIssueIds,
-              ...cancellationFields,
-            },
+              source: "issue.blockers_resolved",
+            }),
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
-            contextSnapshot: {
-              issueId: dependent.id,
-              taskId: dependent.id,
-              wakeReason: "issue_blockers_resolved",
-              source: "issue.blockers_resolved",
-              resolvedBlockerIssueId: issue.id,
-              resolvedBlockerStatus: issue.status,
-              blockerIssueIds: dependent.blockerIssueIds,
-              ...cancellationFields,
-            },
           });
         }
       }
