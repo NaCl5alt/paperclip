@@ -93,6 +93,66 @@ describe("classifyBlockedWaitReason", () => {
     expect(r.kind).toBe("unclassifiable");
   });
 
+  // Review B1 regression: fractions / ratios / versions / progress markers must NOT be
+  // read as dates (they would set a bogus far-future monitor and suppress the nudge).
+  it.each([
+    ["Progress: 1/2 tasks done, waiting on teammate"],
+    ["aspect 4/3 ratio"],
+    ["split 2/3 done"],
+    ["確率 3/4 で失敗"],
+    ["v1/2 draft"],
+  ])("does not treat fraction/ratio/version %s as a due_date", (desc) => {
+    expect(classifyBlockedWaitReason({ description: desc, latestComment: null, nowMs: NOW }).kind).toBe(
+      "unclassifiable",
+    );
+  });
+
+  it("does not roll a recently-past year-less M/D forward a year (review B1)", () => {
+    // 9/1 with now=9/8 must not become 2027-09-01.
+    const r = classifyBlockedWaitReason({
+      description: "作成 9/1 に blocked",
+      latestComment: null,
+      nowMs: NOW,
+    });
+    expect(r.kind).toBe("unclassifiable");
+  });
+
+  it("accepts an ambiguous-day M/D only when a date cue is nearby", () => {
+    // 10/3 (day<=12) alone is ambiguous -> unclassifiable...
+    expect(
+      classifyBlockedWaitReason({ description: "note 10/3 stuff", latestComment: null, nowMs: NOW }).kind,
+    ).toBe("unclassifiable");
+    // ...but with a cue it is a due_date.
+    const r = classifyBlockedWaitReason({
+      description: "10/3 予定で再開",
+      latestComment: null,
+      nowMs: NOW,
+    });
+    expect(r.kind).toBe("due_date");
+    if (r.kind !== "due_date") throw new Error("unreachable");
+    expect(r.at.toISOString()).toBe("2026-10-03T00:00:00.000Z");
+  });
+
+  it("accepts an unambiguous day (>12) M/D without a cue", () => {
+    const r = classifyBlockedWaitReason({
+      description: "9/25 Step2 申し送り",
+      latestComment: null,
+      nowMs: NOW,
+    });
+    expect(r.kind).toBe("due_date");
+    if (r.kind !== "due_date") throw new Error("unreachable");
+    expect(r.at.toISOString()).toBe("2026-09-25T00:00:00.000Z");
+  });
+
+  it("does not treat a bare owner:/action: pair without `unblock` as external_wait (review N1)", () => {
+    const r = classifyBlockedWaitReason({
+      description: "config:\n  owner: alice\n  action: refactor module",
+      latestComment: null,
+      nowMs: NOW,
+    });
+    expect(r.kind).toBe("unclassifiable");
+  });
+
   it("does not misread a YYYY/MM/DD as a spurious year-less M/D", () => {
     const r = classifyBlockedWaitReason({
       description: "作成: 2026/09/25 時点のメモ",

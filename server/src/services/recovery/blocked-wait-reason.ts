@@ -34,15 +34,16 @@ const MAX_FUTURE_DATE_MS = 400 * 24 * 60 * 60 * 1000; // ignore absurdly-far mat
 
 // Prose unblock markers agents write today, e.g.
 //   "unblock owner=orch-comm / action=(1)KiCad導入 (2)…"
-//   "owner: orch-comm  action: install KiCad"
-// We deliberately do NOT match the structured `External owner:` form here — that is
-// already form 3 and is filtered out before classification runs.
+// We require the explicit `unblock owner=` marker (not a bare `owner:`/`action:` pair)
+// and do NOT match the structured `External owner:` form here — that is already form 3
+// and is filtered out before classification runs.
 function detectExternalWait(text: string): { owner: string; action: string } | null {
-  const owner =
-    text.match(/unblock\s+owner\s*[:=]\s*([^\n/]+?)(?:\s*[/|]|\n|$)/im)?.[1] ??
-    text.match(/(?:^|\n)\s*owner\s*[:=]\s*([^\n/]+?)(?:\s*[/|]|\n|$)/im)?.[1];
-  const action =
-    text.match(/(?:^|[\s/])action\s*[:=]\s*(.+?)(?:\n|$)/im)?.[1];
+  // Require the explicit `unblock owner=…` prose marker rather than a bare
+  // `owner:`/`action:` pair, which would false-positive on embedded YAML / GH-Actions
+  // snippets or unrelated prose (review N1). Missing it is safe: the issue falls through
+  // to the unclassifiable nudge rather than being silently marked externally-blocked.
+  const owner = text.match(/unblock\s+owner\s*[:=]\s*([^\n/]+?)(?:\s*[/|]|\n|$)/im)?.[1];
+  const action = text.match(/(?:^|[\s/])action\s*[:=]\s*(.+?)(?:\n|$)/im)?.[1];
   if (!owner || !action) return null;
   const ownerTrim = owner.trim();
   const actionTrim = action.trim();
@@ -62,19 +63,38 @@ function makeUtcDate(y: number, m: number, d: number): Date {
   return new Date(Date.UTC(y, m - 1, d));
 }
 
-// Resolve a year-less M/D (or M月D日) to the next occurrence at or after `today`
-// (in UTC): this year if still upcoming, otherwise next year.
-function resolveYearless(m: number, d: number, nowMs: number): Date | null {
+// Resolve a year-less date to a concrete UTC day.
+//   allowNextYear=true : the next occurrence at/after today (this year, else next).
+//   allowNextYear=false: only this-year and only if it is today-or-future; a
+//     recently-past date returns null instead of rolling ~1 year forward. This is
+//     used for the ambiguous ASCII `M/D` form so "9/1" (a few days ago) is NOT read
+//     as a ~360-day wait (review B1).
+function resolveYearless(
+  m: number,
+  d: number,
+  nowMs: number,
+  allowNextYear: boolean,
+): Date | null {
   const now = new Date(nowMs);
-  const thisYear = now.getUTCFullYear();
-  for (const y of [thisYear, thisYear + 1]) {
+  const todayMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const years = allowNextYear
+    ? [now.getUTCFullYear(), now.getUTCFullYear() + 1]
+    : [now.getUTCFullYear()];
+  for (const y of years) {
     if (!isValidYmd(y, m, d)) continue;
     const cand = makeUtcDate(y, m, d);
-    if (cand.getTime() >= Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())) {
-      return cand;
-    }
+    if (cand.getTime() >= todayMs) return cand;
   }
   return null;
+}
+
+// Words that mark a nearby number as a date rather than a fraction/ratio/version.
+const DATE_CUE =
+  /(?:by|due|on|until|till|deadline|date|resume|eta|期日|期限|締切|締め切り|予定|再開|着手|まで|日付|以降|頃|予定日|リリース|公開)/i;
+
+function hasDateCueNear(text: string, index: number, length: number): boolean {
+  const window = text.slice(Math.max(0, index - 16), index + length + 16);
+  return DATE_CUE.test(window);
 }
 
 function collectDates(text: string, nowMs: number): { at: Date; matchedText: string }[] {
@@ -97,17 +117,22 @@ function collectDates(text: string, nowMs: number): { at: Date; matchedText: str
     }
   }
 
-  // Year-less Japanese: M月D日 (skip ones already consumed by the full form above by
-  // requiring no preceding 年-digit is impractical; duplicates are harmless — we take
-  // the earliest future date at the end).
+  // Year-less Japanese: M月D日 — the 月/日 markers make it unambiguously a date, so we
+  // accept any valid day and allow next-year roll-forward.
   for (const mtch of text.matchAll(/(?<!\d)(\d{1,2})月\s*(\d{1,2})日/g)) {
-    push(resolveYearless(Number(mtch[1]), Number(mtch[2]), nowMs), mtch[0]);
+    push(resolveYearless(Number(mtch[1]), Number(mtch[2]), nowMs, true), mtch[0]);
   }
 
-  // Year-less M/D: require it is NOT part of a YYYY/MM/DD (negative lookbehind for a
-  // digit+slash) and NOT followed by /digit (which would make it M/D/… ).
-  for (const mtch of text.matchAll(/(?<![\d/])(\d{1,2})\/(\d{1,2})(?![\d/])/g)) {
-    push(resolveYearless(Number(mtch[1]), Number(mtch[2]), nowMs), mtch[0]);
+  // Year-less ASCII M/D — ambiguous with fractions/ratios/versions (`1/2`, `4/3`,
+  // `v1/2`). Guards (review B1): (a) no letter/digit/`/`/`_` immediately before (drops
+  // `v1/2`, YYYY/MM/DD tails); (b) accept only when the day component is > 12
+  // (unambiguously a day) OR an explicit date cue sits nearby; (c) no next-year roll.
+  for (const mtch of text.matchAll(/(?<![\d/\p{L}_])(\d{1,2})\/(\d{1,2})(?![\d/])/gu)) {
+    const mo = Number(mtch[1]);
+    const d = Number(mtch[2]);
+    const unambiguousDay = d > 12;
+    if (!unambiguousDay && !hasDateCueNear(text, mtch.index ?? 0, mtch[0].length)) continue;
+    push(resolveYearless(mo, d, nowMs, false), mtch[0]);
   }
 
   return out;
