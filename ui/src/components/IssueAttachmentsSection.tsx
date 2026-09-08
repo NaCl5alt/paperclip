@@ -1,7 +1,7 @@
 import { useMemo, useState, type DragEvent, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { IssueAttachment } from "@paperclipai/shared";
-import { ChevronDown, ChevronRight, Download, ExternalLink, FileText, Paperclip, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronRight, Download, ExternalLink, FileText, Maximize2, Paperclip, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { FoldCurtain } from "./FoldCurtain";
 import { MarkdownBody } from "./MarkdownBody";
@@ -47,14 +47,27 @@ function AttachmentActions({
   attachment,
   onDelete,
   deletePending,
+  onPreview,
 }: {
   attachment: IssueAttachment;
   onDelete: (attachmentId: string) => void;
   deletePending?: boolean;
+  onPreview?: (attachment: IssueAttachment) => void;
 }) {
   const filename = attachmentFilename(attachment);
   return (
     <div className="flex shrink-0 items-center gap-1">
+      {onPreview ? (
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          title="Browse gallery"
+          aria-label={`Browse ${filename} in gallery`}
+          onClick={() => onPreview(attachment)}
+        >
+          <Maximize2 className="h-4 w-4" />
+        </Button>
+      ) : null}
       <Button asChild variant="ghost" size="icon-sm" title="Open in new tab">
         <a href={attachmentOpenPath(attachment)} target="_blank" rel="noreferrer" aria-label={`Open ${filename}`}>
           <ExternalLink className="h-4 w-4" />
@@ -99,7 +112,7 @@ function MarkdownAttachmentCard({
   const filename = attachmentFilename(attachment);
   const [expanded, setExpanded] = useState(false);
   // Defer the fetch + markdown render until the user expands this card. Rendering
-  // every markdown attachment eagerly froze issues with many attachments (VANA-517).
+  // every markdown attachment eagerly froze issues with many attachments.
   const { data, isLoading, error } = useQuery({
     queryKey: queryKeys.issues.attachmentPreview(attachment.id),
     queryFn: () => fetchAttachmentText(attachment),
@@ -152,10 +165,12 @@ function VideoAttachmentCard({
   attachment,
   onDelete,
   deletePending,
+  onPreview,
 }: {
   attachment: IssueAttachment;
   onDelete: (attachmentId: string) => void;
   deletePending?: boolean;
+  onPreview?: (attachment: IssueAttachment) => void;
 }) {
   const filename = attachmentFilename(attachment);
   return (
@@ -166,7 +181,12 @@ function VideoAttachmentCard({
           <p className="break-words text-sm font-semibold text-foreground">{filename}</p>
           <AttachmentMeta attachment={attachment} />
         </div>
-        <AttachmentActions attachment={attachment} onDelete={onDelete} deletePending={deletePending} />
+        <AttachmentActions
+          attachment={attachment}
+          onDelete={onDelete}
+          deletePending={deletePending}
+          onPreview={onPreview}
+        />
       </div>
     </div>
   );
@@ -354,6 +374,7 @@ export function IssueAttachmentsSection({
               attachment={attachment}
               onDelete={requestDelete}
               deletePending={deletePending}
+              onPreview={onImageClick}
             />
           ))}
         </div>

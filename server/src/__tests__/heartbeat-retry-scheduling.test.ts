@@ -998,6 +998,114 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(issue?.executionRunId).toBeNull();
   });
 
+  it("does not promote a scheduled retry after the issue is handed to a human owner", async () => {
+    const companyId = randomUUID();
+    const oldAgentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const now = new Date("2026-04-20T14:30:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: oldAgentId,
+      companyId,
+      name: "ClaudeCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId,
+      companyId,
+      agentId: oldAgentId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      error: "upstream overload",
+      errorCode: "adapter_failed",
+      finishedAt: now,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "issue_assigned",
+      },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Retry human handoff",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: oldAgentId,
+      executionRunId: sourceRunId,
+      executionAgentNameKey: "claudecoder",
+      executionLockedAt: now,
+      issueNumber: 1,
+      identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-3`,
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(sourceRunId, {
+      now,
+      random: () => 0.5,
+    });
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+
+    await db.update(issues).set({
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      updatedAt: now,
+    }).where(eq(issues.id, issueId));
+
+    const promotion = await heartbeat.promoteDueScheduledRetries(scheduled.dueAt);
+    expect(promotion).toEqual({ promoted: 0, runIds: [] });
+
+    const oldRetry = await db
+      .select({
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(oldRetry).toEqual({
+      status: "cancelled",
+      errorCode: "issue_reassigned",
+    });
+
+    const issue = await db
+      .select({
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue).toMatchObject({
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      executionRunId: null,
+    });
+  });
+
   it("does not promote a scheduled retry after the issue is cancelled", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -1474,7 +1582,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(comments.some((comment) => comment.body.includes("recovery fallback agent"))).toBe(true);
   });
 
-  // VANA-1892: comment-driven wakes fire on issues parked in `blocked`/`in_review`,
+  // comment-driven wakes fire on issues parked in `blocked`/`in_review`,
   // which the old `in_progress`/`todo`-only allowlist silently dropped. `backlog`
   // was likewise excluded before and is now eligible, so it is covered here too.
   it.each(["blocked", "in_review", "backlog"] as const)(
@@ -1606,7 +1714,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(scheduledRetries).toHaveLength(0);
   });
 
-  // VANA-1892 incident reproduction: the failed run hit a session limit whose
+  // incident reproduction: the failed run hit a session limit whose
   // reset window was far in the future, so the deferred-window failover branch
   // (`retry_not_before_deferred`) fired — but the source issue was parked in
   // `blocked` (human-comment-driven wake). The old status guard dropped it here.
@@ -1701,7 +1809,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(fallbackWakeups).toHaveLength(0);
   });
 
-  // VANA-2662: reset-less account/org quota exhaustion hands off immediately at
+  // reset-less account/org quota exhaustion hands off immediately at
   // attempt 1 instead of grinding through the bounded-retry ladder.
   it("hands the account-quota-exhausted issue off immediately at attempt 1 without retrying", async () => {
     const companyId = randomUUID();
@@ -1748,7 +1856,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   });
 
 
-  // VANA-3914: claude_auth_required hands off immediately — auth breaks do not
+  // claude_auth_required hands off immediately — auth breaks do not
   // clear on the bounded-retry timescale, and they never enter the transient
   // upstream contract.
   it("hands a claude_auth_required issue off immediately at attempt 1 without retrying", async () => {

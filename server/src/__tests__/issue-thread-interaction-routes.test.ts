@@ -113,6 +113,11 @@ function registerModuleMocks() {
     }),
     issueService: () => mockIssueService,
     issueThreadInteractionService: () => mockInteractionService,
+    taskWatchdogService: () => ({
+      getActiveForIssue: vi.fn(async () => null),
+      upsertForIssue: vi.fn(),
+      disableForIssue: vi.fn(async () => null),
+    }),
     logActivity: mockLogActivity,
     projectService: () => ({}),
     routineService: () => ({
@@ -663,6 +668,21 @@ describe.sequential("issue thread interaction routes", () => {
           interactionId: "interaction-plan",
           interactionKind: "request_confirmation",
           interactionStatus: "accepted",
+          planReviewInteraction: expect.objectContaining({
+            id: "interaction-plan",
+            kind: "request_confirmation",
+            status: "accepted",
+            acceptedTargetRevision: expect.objectContaining({
+              issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              documentId: "document-plan",
+              key: "plan",
+              revisionId: "revision-plan",
+              revisionNumber: 1,
+            }),
+            result: expect.objectContaining({
+              outcome: "accepted",
+            }),
+          }),
           forceFreshSession: true,
           workspaceRefreshReason: "accepted_plan_confirmation",
         }),
@@ -872,7 +892,7 @@ describe.sequential("issue thread interaction routes", () => {
 
   it("allows the assignee agent to author an interaction on its own in_progress issue and stamps the active run id", async () => {
     // The default fixture is in_progress / assigneeAgentId = ASSIGNEE_AGENT_ID. Under the
-    // 955f2a42b ownership boundary (VANA-2496), only the checked-out assignee may author on
+    // 955f2a42b ownership boundary, only the checked-out assignee may author on
     // its own live issue, so the actor here is the assignee itself.
     const app = await createApp({
       type: "agent",
@@ -908,7 +928,7 @@ describe.sequential("issue thread interaction routes", () => {
   });
 
   it("rejects a non-assignee agent authoring an interaction on another agent's in_progress issue with 409", async () => {
-    // VANA-2496 (955f2a42b) mandatory ownership guard: a live (in_progress) issue checked out
+    // (955f2a42b) mandatory ownership guard: a live (in_progress) issue checked out
     // by another agent is off-limits to peers *even with a manager/CEO override* — the override
     // (issue:dispose) applies only to stalled, non-in_progress issues. Mirrors the canonical
     // assertion in issue-agent-mutation-ownership-routes.test.ts

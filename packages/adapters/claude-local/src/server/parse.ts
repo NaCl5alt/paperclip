@@ -7,9 +7,9 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 
 const CLAUDE_AUTH_REQUIRED_RE = /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+`?claude\s+login`?|login\s+required|requires\s+login|unauthorized|authentication\s+required)/i;
-// VANA-3914: OAuth session-expiry wording from the Claude CLI. Matched only
+// OAuth session-expiry wording from the Claude CLI. Matched only
 // against parsed.result / structured error messages — never raw stdout/stderr —
-// so a prompt that merely quotes this issue (VANA-3255) cannot flip the
+// so a prompt that merely quotes this issue cannot flip the
 // classifier. The legacy CLAUDE_AUTH_REQUIRED_RE haystack stays unchanged.
 const CLAUDE_OAUTH_SESSION_EXPIRED_RE =
   /(?:failed\s+to\s+authenticate:\s*)?oauth\s+session\s+expired(?:\s+and\s+could\s+not\s+be\s+refreshed)?/i;
@@ -18,7 +18,7 @@ const URL_RE = /(https?:\/\/[^\s'"`<>()[\]{};,!?]+[^\s'"`<>()[\]{};,!.?:]+)/gi;
 // Tool-call markup that the model is supposed to emit as a structured tool_use
 // block but occasionally writes into a plain assistant `text` block instead. When
 // that happens the tool is never executed yet the run still reports
-// subtype=success (see VANA-644). Detect the markup so the adapter can refuse to
+// subtype=success. Detect the markup so the adapter can refuse to
 // mark such a run as succeeded. The `antml:` prefix variant is also matched.
 const TOOL_INVOKE_RE = /<(?:antml:)?invoke\s+name\s*=/i;
 const TOOL_PARAMETER_RE = /<(?:antml:)?parameter\s+name\s*=/i;
@@ -50,7 +50,7 @@ const CLAUDE_TRANSIENT_UPSTREAM_RE =
 // depleted credit balance). Unlike the 5-hour / weekly *session* windows, these
 // carry no upstream reset time, so waiting out a bounded-retry ladder never
 // clears them — the heartbeat hands the issue straight to the recovery fallback
-// (VANA-2662). This deliberately excludes the session-window wording so it never
+// This deliberately excludes the session-window wording so it never
 // steals the existing `retryNotBefore` deferral path.
 const CLAUDE_ACCOUNT_QUOTA_EXHAUSTED_RE =
   /(?:monthly\s+spend\s+limit|spend\s+limit|usage[-\s]?credits|credit\s+balance\s+is\s+too\s+low|insufficient\s+credits)/i;
@@ -193,7 +193,7 @@ export function detectClaudeLoginRequired(input: {
     .filter(Boolean);
 
   const loginPrompt = messages.some((line) => CLAUDE_AUTH_REQUIRED_RE.test(line));
-  // Narrow haystack: parsed.result + structured errors only (VANA-3914 / VANA-3255).
+  // Narrow haystack: parsed.result + structured errors only.
   const terminalText = [resultText, ...structuredErrors]
     .join("\n")
     .split(/\r?\n/)
@@ -245,6 +245,24 @@ export function isClaudeMaxTurnsResult(parsed: Record<string, unknown> | null | 
   );
 }
 
+export function isClaudeRefusalResult(parsed: Record<string, unknown> | null | undefined): boolean {
+  if (!parsed) return false;
+
+  // A policy refusal exits the CLI cleanly (exitCode=0, is_error=false), so it
+  // must be detected from the structured fields rather than the failure flag.
+  const subtype = asString(parsed.subtype, "").trim().toLowerCase();
+  if (subtype === "model_refusal" || subtype === "refusal") return true;
+
+  const structuredStopReasons = [
+    parsed.stop_reason,
+    parsed.stopReason,
+    parsed.error_code,
+    parsed.errorCode,
+  ].map((value) => asString(value, "").trim().toLowerCase());
+
+  return structuredStopReasons.some((reason) => reason === "refusal");
+}
+
 export function isClaudeUnknownSessionError(parsed: Record<string, unknown>): boolean {
   const resultText = asString(parsed.result, "").trim();
   const allMessages = [resultText, ...extractClaudeErrorMessages(parsed)]
@@ -252,7 +270,31 @@ export function isClaudeUnknownSessionError(parsed: Record<string, unknown>): bo
     .filter(Boolean);
 
   return allMessages.some((msg) =>
-    /no conversation found with session id|unknown session|session .* not found/i.test(msg),
+    /no conversation found with session id|unknown session|session .* not found|not a valid UUID|--resume requires a valid session|is not a UUID|does not match any session title/i.test(
+      msg,
+    ),
+  );
+}
+
+export function isClaudePoisonedPreviousMessageIdError(parsed: Record<string, unknown>): boolean {
+  const resultText = asString(parsed.result, "").trim();
+  const allMessages = [resultText, ...extractClaudeErrorMessages(parsed)]
+    .map((msg) => msg.trim())
+    .filter(Boolean);
+
+  return allMessages.some((msg) =>
+    /diagnostics\.previous_message_id.*starts with `msg_`/i.test(msg),
+  );
+}
+
+export function isClaudeImageProcessingError(parsed: Record<string, unknown>): boolean {
+  const resultText = asString(parsed.result, "").trim();
+  const allMessages = [resultText, ...extractClaudeErrorMessages(parsed)]
+    .map((msg) => msg.trim())
+    .filter(Boolean);
+
+  return allMessages.some((msg) =>
+    /could not process image/i.test(msg),
   );
 }
 
@@ -412,7 +454,7 @@ function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: 
   return retryAt;
 }
 
-// VANA-2670: the claude stream-json stdout carries structured `rate_limit_event`
+// the claude stream-json stdout carries structured `rate_limit_event`
 // records whose `rate_limit_info.resetsAt` (unix seconds) is the authoritative
 // reset time. Measured in the field, every rejection is a same-day `five_hour`
 // window — the "monthly spend limit" copy is just the wording upstream prints for
@@ -421,7 +463,7 @@ function parseClaudeResetClockTime(clockText: string, now: Date, timeZoneHint?: 
 // reset-less quota exhaustion. Only `status === "rejected"` events are honoured:
 // `allowed_warning` overage records also carry a `resetsAt` (the calendar-month
 // boundary), and `overageResetsAt` is never used (that is the month boundary that
-// caused the VANA-2542 "stuck on a one-month fallback" misread). The last rejected
+// caused the "stuck on a one-month fallback" misread). The last rejected
 // event wins.
 export function extractClaudeRateLimitReset(input: { stdout?: string | null }): Date | null {
   const stdout = input.stdout ?? "";
@@ -451,7 +493,7 @@ export function extractClaudeRetryNotBefore(
   },
   now = new Date(),
 ): Date | null {
-  // Structured reset (rate_limit_event) beats the free-text wording (VANA-2670).
+  // Structured reset (rate_limit_event) beats the free-text wording.
   const structured = extractClaudeRateLimitReset({ stdout: input.stdout });
   if (structured) return structured;
   const haystack = buildClaudeTransientHaystack(input);
@@ -468,7 +510,7 @@ export function isClaudeTransientUpstreamError(input: {
 }): boolean {
   const parsed = input.parsed ?? null;
   // Deterministic failures are handled by their own classifiers.
-  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed))) {
+  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed) || isClaudePoisonedPreviousMessageIdError(parsed) || isClaudeImageProcessingError(parsed))) {
     return false;
   }
   const loginMeta = detectClaudeLoginRequired({
@@ -483,7 +525,7 @@ export function isClaudeTransientUpstreamError(input: {
   return CLAUDE_TRANSIENT_UPSTREAM_RE.test(haystack);
 }
 
-// VANA-2662: a reset-less account/org quota exhaustion (monthly spend limit,
+// a reset-less account/org quota exhaustion (monthly spend limit,
 // depleted credits) is a sub-class of transient-upstream — it is always also an
 // `isClaudeTransientUpstreamError`, but the heartbeat treats it specially by
 // handing the issue off immediately instead of retrying. Callers should gate on

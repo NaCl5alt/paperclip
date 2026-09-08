@@ -4,7 +4,8 @@ export { testEnvironment } from "./test.js";
 export {
   parseGeminiJsonl,
   parseAgyOutput,
-  isGeminiUnknownSessionError,
+  isGeminiSessionUnrecoverableError,
+  isGeminiTransientNetworkError,
   describeGeminiFailure,
   detectGeminiAuthRequired,
   isGeminiTurnLimitResult,

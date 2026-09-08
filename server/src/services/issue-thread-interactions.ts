@@ -41,7 +41,7 @@ import {
   suggestTasksResultSchema,
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
-import { issueService, listUnfinalizedExecutionWorkspaceIds } from "./issues.js";
+import { issueService, runWorkspaceIsFinalized } from "./issues.js";
 
 type InteractionActor = {
   agentId?: string | null;
@@ -90,7 +90,7 @@ function isRequestConfirmationLikeKind(kind: string): kind is RequestConfirmatio
 
 // Two pending confirmations from the same agent on the same issue collide when
 // they bind to the same target (or both are targetless). Creating a new one
-// auto-supersedes the old to prevent unbounded pending accumulation (VANA-589).
+// auto-supersedes the old to prevent unbounded pending accumulation.
 function requestConfirmationTargetSignature(
   target: RequestConfirmationTarget | null | undefined,
 ): string {
@@ -135,7 +135,7 @@ function hydrateInteraction(
     continuationPolicy: row.continuationPolicy as IssueThreadInteraction["continuationPolicy"],
   };
 
-  // A terminal-close expiry (VANA-2574) writes the same `issue_closed` result to
+  // A terminal-close expiry writes the same `issue_closed` result to
   // every kind, so parse that shape uniformly and fall back to the per-kind
   // result schema otherwise. The per-kind result *types* deliberately stay
   // kind-specific (so the ~30 UI/route consumers don't each grow an issue_closed
@@ -219,7 +219,7 @@ function shouldSupersedeRequestConfirmationOnUserComment(interaction: RequestCon
 
 // When an agent creates a fresh request-confirmation-like interaction, expire
 // its own prior pending confirmations on the same issue that share the new
-// target signature. This is the pending-accumulation guard (VANA-589): the
+// target signature. This is the pending-accumulation guard: the
 // resolved-interaction wake for the new card carries the live decision, while
 // stale duplicates are closed out with `superseded_by_new_request`.
 async function supersedePriorPendingConfirmations(args: {
@@ -634,7 +634,10 @@ export function issueThreadInteractionService(db: Db) {
   async function assertIssueWorkspaceFinalizedForAccept(args: {
     db: Pick<Db, "select">;
     issue: { id: string; companyId: string };
+    sourceRunId: string | null;
   }) {
+    if (!args.sourceRunId) return;
+
     const executionWorkspaceId = await args.db
       .select({ executionWorkspaceId: issues.executionWorkspaceId })
       .from(issues)
@@ -643,17 +646,18 @@ export function issueThreadInteractionService(db: Db) {
 
     if (!executionWorkspaceId) return;
 
-    const unfinalized = await listUnfinalizedExecutionWorkspaceIds(
+    const isFinalized = await runWorkspaceIsFinalized(
       args.db,
       args.issue.companyId,
-      [executionWorkspaceId],
+      executionWorkspaceId,
+      args.sourceRunId,
     );
-    if (!unfinalized.has(executionWorkspaceId)) return;
+    if (isFinalized) return;
 
     throw conflict(
-      "Cannot accept interaction: the issue's most recent run has not completed workspace_finalize. "
+      "Cannot accept interaction: the run that created this interaction has not finished syncing its workspace. "
         + "Retry once the local worktree has finished syncing.",
-      { executionWorkspaceId },
+      { executionWorkspaceId, sourceRunId: args.sourceRunId },
     );
   }
 
@@ -972,7 +976,7 @@ export function issueThreadInteractionService(db: Db) {
           // workspace_finalize gate (PAPA-440) does not apply here.
           return issueThreadInteractionService(db).acceptSuggestedTasks(issue, interactionId, data, actor);
         case "request_confirmation": {
-          await assertIssueWorkspaceFinalizedForAccept({ db, issue });
+          await assertIssueWorkspaceFinalizedForAccept({ db, issue, sourceRunId: current.sourceRunId });
           const accepted = await acceptRequestConfirmation({
             issue,
             current,
@@ -986,7 +990,7 @@ export function issueThreadInteractionService(db: Db) {
           };
         }
         case "request_checkbox_confirmation": {
-          await assertIssueWorkspaceFinalizedForAccept({ db, issue });
+          await assertIssueWorkspaceFinalizedForAccept({ db, issue, sourceRunId: current.sourceRunId });
           const accepted = await acceptRequestConfirmation({
             issue,
             current,
@@ -1440,7 +1444,7 @@ export function issueThreadInteractionService(db: Db) {
       return expired;
     },
 
-    // One-shot backfill for the terminal-close expiry rule (VANA-2574): apply the
+    // One-shot backfill for the terminal-close expiry rule: apply the
     // same rule the issue-update service now enforces going forward to the pending
     // interactions that were stranded on already-closed issues. Dry-run by
     // default — pass { dryRun: false } to write. Idempotent (status='pending'

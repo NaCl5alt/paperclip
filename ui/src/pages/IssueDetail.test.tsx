@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { Agent, Issue, IssueAttachment, IssueTreeControlPreview, IssueTreeHold, IssueWorkProduct } from "@paperclipai/shared";
+import type { Agent, Issue, IssueAttachment, IssueComment, IssueTreeControlPreview, IssueTreeHold, IssueWorkProduct } from "@paperclipai/shared";
 import type { AnchorHTMLAttributes, ButtonHTMLAttributes, ReactNode } from "react";
+import { NavigationType } from "react-router-dom";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { canBoardResolveRecoveryAction, IssueDetail } from "./IssueDetail";
+import { canBoardResolveRecoveryAction, IssueDetail, shouldScrollIssueDetailToTopOnNavigation } from "./IssueDetail";
+import { queryKeys } from "../lib/queryKeys";
 
 const mockIssuesApi = vi.hoisted(() => ({
   get: vi.fn(),
@@ -74,6 +76,7 @@ const mockPushToast = vi.hoisted(() => vi.fn());
 const mockIssuesListRender = vi.hoisted(() => vi.fn());
 const mockIssueChatThreadRender = vi.hoisted(() => vi.fn());
 const mockImageGalleryRender = vi.hoisted(() => vi.fn());
+const mockIssueWorkspaceCardRender = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/issues", () => ({
   issuesApi: mockIssuesApi,
@@ -281,11 +284,14 @@ vi.mock("../components/IssueRunLedger", () => ({
 }));
 
 vi.mock("../components/IssueWorkspaceCard", () => ({
-  IssueWorkspaceCard: () => <div>Workspace</div>,
+  IssueWorkspaceCard: (props: { onBrowseFiles?: () => void; onOpenFileByPath?: () => void }) => {
+    mockIssueWorkspaceCardRender(props);
+    return <div>Workspace</div>;
+  },
 }));
 
 vi.mock("../components/ImageGalleryModal", () => ({
-  ImageGalleryModal: (props: { images: IssueAttachment[]; initialIndex: number; open: boolean }) => {
+  ImageGalleryModal: (props: { items: IssueAttachment[]; initialIndex: number; open: boolean }) => {
     mockImageGalleryRender(props);
     return null;
   },
@@ -355,6 +361,7 @@ vi.mock("@/components/ui/sheet", () => ({
   Sheet: ({ children, open }: { children?: ReactNode; open?: boolean }) => (open ? <div>{children}</div> : null),
   SheetContent: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
   SheetHeader: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
+  SheetDescription: ({ children }: { children?: ReactNode }) => <p>{children}</p>,
   SheetTitle: ({ children }: { children?: ReactNode }) => <h2>{children}</h2>,
 }));
 
@@ -443,6 +450,23 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
     documentSummaries: [],
     ...overrides,
   } as Issue;
+}
+
+function createIssueComment(overrides: Partial<IssueComment> = {}): IssueComment {
+  return {
+    id: "comment-1",
+    companyId: "company-1",
+    issueId: "issue-1",
+    authorType: "user",
+    authorAgentId: null,
+    authorUserId: "user-1",
+    body: "Fresh comment",
+    presentation: null,
+    metadata: null,
+    createdAt: new Date("2026-04-21T00:00:05.000Z"),
+    updatedAt: new Date("2026-04-21T00:00:05.000Z"),
+    ...overrides,
+  };
 }
 
 function createAttachment(overrides: Partial<IssueAttachment> & { id: string }): IssueAttachment {
@@ -932,11 +956,14 @@ describe("IssueDetail", () => {
     });
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({
       enableIssuePlanDecompositions: false,
+      enableExperimentalFileViewer: false,
+      enableExternalObjects: false,
     });
     mockIssuesApi.listAcceptedPlanDecompositions.mockResolvedValue([]);
     mockIssuesListRender.mockClear();
     mockIssueChatThreadRender.mockClear();
     mockImageGalleryRender.mockClear();
+    mockIssueWorkspaceCardRender.mockClear();
   });
 
   afterEach(async () => {
@@ -974,6 +1001,122 @@ describe("IssueDetail", () => {
     ).toBe(false);
   });
 
+  it("does not mark the wake comment for the current live run as queued when active-run cache is stale", async () => {
+    mockIssuesApi.get.mockResolvedValue(createIssue({
+      status: "in_progress",
+      executionRunId: "run-stale",
+    }));
+    mockIssuesApi.listComments.mockResolvedValue([
+      createIssueComment({
+        id: "comment-fresh",
+        createdAt: new Date("2026-04-21T00:00:05.000Z"),
+        updatedAt: new Date("2026-04-21T00:00:05.000Z"),
+      }),
+    ]);
+    mockHeartbeatsApi.activeRunForIssue.mockResolvedValue({
+      id: "run-stale",
+      status: "running",
+      invocationSource: "issue",
+      triggerDetail: null,
+      contextCommentId: null,
+      contextWakeCommentId: null,
+      startedAt: "2026-04-21T00:00:00.000Z",
+      finishedAt: null,
+      createdAt: "2026-04-21T00:00:00.000Z",
+      agentId: "agent-1",
+      agentName: "Coder",
+      adapterType: "codex_local",
+      issueId: "issue-1",
+    });
+    mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([
+      {
+        id: "run-current",
+        status: "running",
+        invocationSource: "issue",
+        triggerDetail: null,
+        contextCommentId: "comment-fresh",
+        contextWakeCommentId: "comment-fresh",
+        startedAt: "2026-04-21T00:00:01.000Z",
+        finishedAt: null,
+        createdAt: "2026-04-21T00:00:01.000Z",
+        agentId: "agent-1",
+        agentName: "Coder",
+        adapterType: "codex_local",
+        issueId: "issue-1",
+      },
+    ]);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const props = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as { comments?: Array<{ id: string; queueState?: string }> };
+    const freshComment = props.comments?.find((comment) => comment.id === "comment-fresh");
+    expect(freshComment?.queueState).toBeUndefined();
+  });
+
+  it("does not optimistically queue a fresh comment from an unlocked stale active-run cache", async () => {
+    const postedComment = createDeferred<IssueComment>();
+    mockIssuesApi.get.mockResolvedValue(createIssue({
+      status: "todo",
+      executionRunId: null,
+    }));
+    mockIssuesApi.addComment.mockReturnValue(postedComment.promise);
+    queryClient.setQueryData(queryKeys.issues.activeRun("PAP-1"), {
+      id: "run-stale",
+      status: "running",
+      invocationSource: "issue",
+      triggerDetail: null,
+      contextCommentId: null,
+      contextWakeCommentId: null,
+      startedAt: "2026-04-21T00:00:00.000Z",
+      finishedAt: null,
+      createdAt: "2026-04-21T00:00:00.000Z",
+      agentId: "agent-1",
+      agentName: "Coder",
+      adapterType: "codex_local",
+      issueId: "issue-1",
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const props = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as {
+      onAdd: (body: string) => Promise<void>;
+      comments?: Array<{ body: string; clientStatus?: string; queueState?: string }>;
+    };
+    await act(async () => {
+      void props.onAdd("Fresh comment");
+      await Promise.resolve();
+    });
+    await flushReact();
+
+    const nextProps = mockIssueChatThreadRender.mock.calls.at(-1)?.[0] as {
+      comments?: Array<{ body: string; clientStatus?: string; queueState?: string }>;
+    };
+    const optimisticComment = nextProps.comments?.find((comment) => comment.body === "Fresh comment");
+    expect(optimisticComment).toMatchObject({ clientStatus: "pending" });
+    expect(optimisticComment?.queueState).toBeUndefined();
+
+    await act(async () => {
+      postedComment.resolve(createIssueComment({ body: "Fresh comment" }));
+    });
+    await flushReact();
+  });
+
   it("hides the plan decomposition panel by default", async () => {
     mockIssuesApi.get.mockResolvedValue(createIssue());
 
@@ -992,10 +1135,55 @@ describe("IssueDetail", () => {
     expect(mockIssuesApi.listAcceptedPlanDecompositions).not.toHaveBeenCalled();
   });
 
+  it("hides file viewer entry points by default", async () => {
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+
+    await flushReact();
+    await flushReact();
+
+    expect(container.querySelector('[aria-label="Open file in this issue"]')).toBeNull();
+    const latestWorkspaceProps = mockIssueWorkspaceCardRender.mock.calls.at(-1)?.[0];
+    expect(latestWorkspaceProps?.onBrowseFiles).toBeUndefined();
+    expect(latestWorkspaceProps?.onOpenFileByPath).toBeUndefined();
+  });
+
+  it("shows file viewer entry points when the experimental flag is enabled", async () => {
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableIssuePlanDecompositions: false,
+      enableExperimentalFileViewer: true,
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+
+    await flushReact();
+    await flushReact();
+
+    expect(container.querySelector('[aria-label="Open file in this issue"]')).not.toBeNull();
+    const latestWorkspaceProps = mockIssueWorkspaceCardRender.mock.calls.at(-1)?.[0];
+    expect(latestWorkspaceProps?.onBrowseFiles).toEqual(expect.any(Function));
+    expect(latestWorkspaceProps?.onOpenFileByPath).toEqual(expect.any(Function));
+  });
+
   it("shows the plan decomposition panel when the experimental flag is enabled", async () => {
     mockIssuesApi.get.mockResolvedValue(createIssue());
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({
       enableIssuePlanDecompositions: true,
+      enableExperimentalFileViewer: false,
     });
     mockIssuesApi.listAcceptedPlanDecompositions.mockResolvedValue([
       {
@@ -1561,7 +1749,152 @@ describe("IssueDetail", () => {
     expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0]).toMatchObject({
       issueWorkMode: "planning",
     });
-    expect(container.textContent).toContain("Planning");
+    expect(container.textContent).toContain("Plan mode");
+  });
+
+  it("passes ask work mode to the issue chat thread and renders the ask badge", async () => {
+    mockIssuesApi.get.mockResolvedValue(createIssue({ workMode: "ask" }));
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0]).toMatchObject({
+      issueWorkMode: "ask",
+    });
+    expect(container.textContent).toContain("Ask mode");
+  });
+
+  it("falls back to execCommand when copying the task from an insecure context", async () => {
+    const clipboardWrite = vi.fn(async () => {
+      throw new Error("Clipboard API blocked");
+    });
+    const execCommand = vi.fn(() => true);
+    const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    const originalExecCommand = Object.getOwnPropertyDescriptor(document, "execCommand");
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: clipboardWrite },
+    });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: execCommand,
+    });
+    mockIssuesApi.get.mockResolvedValue(createIssue({
+      identifier: "PAP-1",
+      title: "Copy me",
+      description: "Task body",
+    }));
+
+    try {
+      await act(async () => {
+        root.render(
+          <QueryClientProvider client={queryClient}>
+            <IssueDetail />
+          </QueryClientProvider>,
+        );
+      });
+      await flushReact();
+
+      const copyButton = Array.from(container.querySelectorAll("button"))
+        .find((button) => button.getAttribute("title") === "Copy task as markdown");
+      expect(copyButton).toBeTruthy();
+
+      await act(async () => {
+        copyButton!.click();
+        await Promise.resolve();
+      });
+
+      expect(clipboardWrite).toHaveBeenCalledWith("# PAP-1: Copy me\n\nTask body");
+      expect(execCommand).toHaveBeenCalledWith("copy");
+      expect(mockPushToast).toHaveBeenCalledWith(expect.objectContaining({
+        title: "Copied to clipboard",
+        tone: "success",
+      }));
+    } finally {
+      if (originalClipboard) {
+        Object.defineProperty(navigator, "clipboard", originalClipboard);
+      } else {
+        // @ts-expect-error test cleanup for optional browser API
+        delete navigator.clipboard;
+      }
+      if (originalExecCommand) {
+        Object.defineProperty(document, "execCommand", originalExecCommand);
+      } else {
+        // @ts-expect-error test cleanup for optional browser API
+        delete document.execCommand;
+      }
+    }
+  });
+
+  it("renders the graduated task thread without the chat flag", async () => {
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    expect(container.querySelector('[data-testid="issue-chat-thread"]')).not.toBeNull();
+    expect(mockIssueChatThreadRender).toHaveBeenCalled();
+  });
+
+  it("uses graduated Plan mode chip copy", async () => {
+    mockIssuesApi.get.mockResolvedValue(createIssue({ workMode: "planning" }));
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    expect(container.textContent).toContain("Plan mode");
+    expect(container.textContent).not.toContain("Planning");
+  });
+
+  it("passes @task mention options to the thread by default", async () => {
+    const mentionPoolIssue = {
+      ...createIssue(),
+      id: "issue-mention-1",
+      identifier: "PAP-9",
+      title: "Mentionable task",
+    };
+    mockIssuesApi.list.mockImplementation(
+      (_companyId: string, filters?: { sortField?: string }) =>
+        Promise.resolve(filters?.sortField === "updated" ? [mentionPoolIssue] : []),
+    );
+    mockIssuesApi.get.mockResolvedValue(createIssue());
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    await waitForAssertion(() => {
+      expect(mockIssueChatThreadRender.mock.calls.at(-1)?.[0].mentions).toEqual(
+        expect.arrayContaining([expect.objectContaining({ kind: "issue", issueIdentifier: "PAP-9" })]),
+      );
+    });
+    expect(mockIssuesApi.list).toHaveBeenCalledWith(
+      "company-1",
+      expect.objectContaining({ sortField: "updated" }),
+    );
   });
 
   it("forwards composer work mode changes to the issues API", async () => {
@@ -1598,11 +1931,11 @@ describe("IssueDetail", () => {
     expect(typeof lastChatThreadProps?.onWorkModeChange).toBe("function");
 
     await act(async () => {
-      lastChatThreadProps?.onWorkModeChange?.("planning");
+      lastChatThreadProps?.onWorkModeChange?.("ask");
     });
     await flushReact();
 
-    expect(mockIssuesApi.update).toHaveBeenCalledWith(issue.identifier, { workMode: "planning" });
+    expect(mockIssuesApi.update).toHaveBeenCalledWith(issue.identifier, { workMode: "ask" });
     expect(localStorage.getItem("paperclip:issue-comment-draft:issue-1")).toBe("Draft follow-up message");
     expect(container.textContent).toContain("planning-notes.txt");
     localStorage.removeItem("paperclip:issue-comment-draft:issue-1");
@@ -1665,7 +1998,8 @@ describe("IssueDetail", () => {
     expect(container.textContent).toContain("report.md");
     expect(container.textContent).toContain("Attachments1");
     expect(container.querySelectorAll("video")).toHaveLength(1);
-    expect(mockImageGalleryRender.mock.calls.at(-1)?.[0].images.map((attachment: IssueAttachment) => attachment.id)).toEqual([
+    expect(mockImageGalleryRender.mock.calls.at(-1)?.[0].items.map((attachment: IssueAttachment) => attachment.id)).toEqual([
+      videoAttachment.id,
       imageAttachment.id,
     ]);
   });
@@ -1958,5 +2292,31 @@ describe("canBoardResolveRecoveryAction", () => {
         userId: "user-1",
       }),
     ).toBe(false);
+  });
+});
+
+describe("shouldScrollIssueDetailToTopOnNavigation", () => {
+  it("does not scroll when only URL search params changed for the same issue", () => {
+    expect(shouldScrollIssueDetailToTopOnNavigation({
+      previousIssueId: "PAP-10306",
+      nextIssueId: "PAP-10306",
+      navigationType: NavigationType.Push,
+    })).toBe(false);
+  });
+
+  it("scrolls on forward navigation to a different issue", () => {
+    expect(shouldScrollIssueDetailToTopOnNavigation({
+      previousIssueId: "PAP-1",
+      nextIssueId: "PAP-2",
+      navigationType: NavigationType.Push,
+    })).toBe(true);
+  });
+
+  it("does not scroll on browser back or forward restoration", () => {
+    expect(shouldScrollIssueDetailToTopOnNavigation({
+      previousIssueId: "PAP-1",
+      nextIssueId: "PAP-2",
+      navigationType: NavigationType.Pop,
+    })).toBe(false);
   });
 });

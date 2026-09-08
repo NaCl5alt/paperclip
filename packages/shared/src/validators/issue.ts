@@ -24,6 +24,7 @@ import {
   ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES,
   ISSUE_THREAD_INTERACTION_KINDS,
   ISSUE_THREAD_INTERACTION_STATUSES,
+  ISSUE_WATCHDOG_DISCOVERY_KINDS,
   MODEL_PROFILE_KEYS,
   REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT,
 } from "../constants.js";
@@ -394,6 +395,14 @@ const createIssueBaseSchema = z.object({
   executionWorkspacePreference: z.enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES).optional().nullable(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
   labelIds: z.array(z.string().uuid()).optional(),
+  watchdogDiscovery: z.object({
+    kind: z.enum(ISSUE_WATCHDOG_DISCOVERY_KINDS),
+    evidenceMarkdown: multilineTextSchema.optional().nullable(),
+  }).strict().optional().nullable(),
+  watchdog: z.object({
+    agentId: z.string().uuid(),
+    instructions: multilineTextSchema.optional().nullable(),
+  }).strict().optional().nullable(),
 });
 
 export const createIssueInputSchema = createIssueBaseSchema.extend({
@@ -404,10 +413,18 @@ export const createIssueSchema = withCreateIssueStatusDefault(createIssueBaseSch
 
 export type CreateIssue = z.infer<typeof createIssueSchema>;
 
+export const upsertIssueWatchdogSchema = z.object({
+  agentId: z.string().uuid(),
+  instructions: multilineTextSchema.optional().nullable(),
+}).strict();
+
+export type UpsertIssueWatchdog = z.infer<typeof upsertIssueWatchdogSchema>;
+
 export const createChildIssueSchema = withCreateIssueStatusDefault(createIssueBaseSchema
   .omit({
     parentId: true,
     inheritExecutionWorkspaceFromIssueId: true,
+    watchdogDiscovery: true,
   })
   .extend({
     acceptanceCriteria: z.array(z.string().trim().min(1).max(500)).max(20).optional(),
@@ -430,7 +447,7 @@ export const createIssueLabelSchema = z.object({
 
 export type CreateIssueLabel = z.infer<typeof createIssueLabelSchema>;
 
-export const updateIssueSchema = createIssueBaseSchema.partial().extend({
+export const updateIssueSchema = createIssueBaseSchema.omit({ watchdog: true }).partial().extend({
   requestDepth: issueRequestDepthInputSchema.optional(),
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),
   comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
@@ -844,7 +861,7 @@ export const requestConfirmationResultSchema = z.object({
 
 // Result written to any pending interaction (all kinds) when its issue reaches a
 // terminal status (done / cancelled). Kept separate from the per-kind result
-// schemas so the terminal-close expiry is uniform across kinds (VANA-2574).
+// schemas so the terminal-close expiry is uniform across kinds.
 export const issueClosedInteractionResultSchema = z.object({
   version: z.literal(1),
   outcome: z.literal("issue_closed"),

@@ -5,6 +5,10 @@ import {
   extractClaudeRetryNotBefore,
   isClaudeAccountQuotaExhausted,
   isClaudeTransientUpstreamError,
+  isClaudePoisonedPreviousMessageIdError,
+  isClaudeRefusalResult,
+  isClaudeUnknownSessionError,
+  isClaudeImageProcessingError,
   parseClaudeStreamJson,
 } from "./parse.js";
 
@@ -124,10 +128,190 @@ describe("isClaudeTransientUpstreamError", () => {
       }),
     ).toBe(false);
   });
+
+  it("does not classify poisoned previous_message_id errors as transient", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          subtype: "success",
+          is_error: true,
+          result: "API Error: 400 diagnostics.previous_message_id: must be the `id` from a prior /v1/messages response (starts with `msg_`)",
+        },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("isClaudePoisonedPreviousMessageIdError", () => {
+  it("detects the previous_message_id 400 error in the result field", () => {
+    expect(
+      isClaudePoisonedPreviousMessageIdError({
+        subtype: "success",
+        is_error: true,
+        result: "API Error: 400 diagnostics.previous_message_id: must be the `id` from a prior /v1/messages response (starts with `msg_`)",
+      }),
+    ).toBe(true);
+  });
+
+  it("detects the error in the errors array", () => {
+    expect(
+      isClaudePoisonedPreviousMessageIdError({
+        is_error: true,
+        result: "",
+        errors: [{ message: "400 diagnostics.previous_message_id: must be the `id` from a prior /v1/messages response (starts with `msg_`)" }],
+      }),
+    ).toBe(true);
+  });
+
+  it("returns false for unrelated errors", () => {
+    expect(
+      isClaudePoisonedPreviousMessageIdError({
+        is_error: true,
+        result: "No conversation found with session id abc-123",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false for empty parsed result", () => {
+    expect(isClaudePoisonedPreviousMessageIdError({})).toBe(false);
+  });
+});
+
+describe("isClaudeRefusalResult", () => {
+  it("detects stop_reason: refusal even on a clean (is_error=false) result", () => {
+    expect(
+      isClaudeRefusalResult({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        stop_reason: "refusal",
+        result: "",
+      }),
+    ).toBe(true);
+  });
+
+  it("detects the camelCase stopReason variant", () => {
+    expect(isClaudeRefusalResult({ stopReason: "refusal" })).toBe(true);
+  });
+
+  it("detects subtype: model_refusal", () => {
+    expect(
+      isClaudeRefusalResult({ subtype: "model_refusal", is_error: false }),
+    ).toBe(true);
+  });
+
+  it("is case-insensitive and tolerant of surrounding whitespace", () => {
+    expect(isClaudeRefusalResult({ stop_reason: "  Refusal " })).toBe(true);
+  });
+
+  it("returns false for ordinary successful turns", () => {
+    expect(
+      isClaudeRefusalResult({
+        subtype: "success",
+        is_error: false,
+        stop_reason: "end_turn",
+        result: "Here is your answer.",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false for max-turns and other stop reasons", () => {
+    expect(isClaudeRefusalResult({ stop_reason: "max_turns" })).toBe(false);
+    expect(isClaudeRefusalResult({ subtype: "error_max_turns" })).toBe(false);
+  });
+
+  it("returns false for null/empty parsed result", () => {
+    expect(isClaudeRefusalResult(null)).toBe(false);
+    expect(isClaudeRefusalResult({})).toBe(false);
+  });
+});
+
+describe("isClaudeUnknownSessionError", () => {
+  it("detects the legacy 'no conversation found' message", () => {
+    expect(
+      isClaudeUnknownSessionError({
+        result: "Error: No conversation found with session id 1234",
+      }),
+    ).toBe(true);
+  });
+
+  it("detects 'session ... not found' style errors", () => {
+    expect(
+      isClaudeUnknownSessionError({
+        errors: [{ message: "Session abc123 not found" }],
+      }),
+    ).toBe(true);
+  });
+
+  it("detects '--resume requires a valid session' validation error from non-UUID input", () => {
+    expect(
+      isClaudeUnknownSessionError({
+        errors: [
+          {
+            message:
+              'Error: --resume requires a valid session ID or session title when used with --print. Usage: claude -p --resume <session-id|title>. Provided value "ses_268c2d0a5ffemYbEaeG7c86Uvo" is not a UUID and does not match any session title.',
+          },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it("returns false for unrelated error text", () => {
+    expect(
+      isClaudeUnknownSessionError({
+        result: "Some other failure",
+        errors: [{ message: "Network timeout" }],
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("isClaudeImageProcessingError", () => {
+  it("detects the 'Could not process image' 400 error in the result field", () => {
+    expect(
+      isClaudeImageProcessingError({
+        subtype: "success",
+        is_error: true,
+        result: "API Error: 400 Could not process image: image source URL has expired",
+      }),
+    ).toBe(true);
+  });
+
+  it("detects the error in the errors array", () => {
+    expect(
+      isClaudeImageProcessingError({
+        is_error: true,
+        result: "",
+        errors: [{ message: "400 Could not process image" }],
+      }),
+    ).toBe(true);
+  });
+
+  it("is case-insensitive", () => {
+    expect(
+      isClaudeImageProcessingError({
+        is_error: true,
+        result: "could not process image attached to message",
+      }),
+    ).toBe(true);
+  });
+
+  it("returns false for unrelated errors", () => {
+    expect(
+      isClaudeImageProcessingError({
+        is_error: true,
+        result: "No conversation found with session id abc-123",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false for empty parsed result", () => {
+    expect(isClaudeImageProcessingError({})).toBe(false);
+  });
 });
 
 describe("isClaudeAccountQuotaExhausted", () => {
-  // VANA-2662: the real measured wording. In the field this run also carried an
+  // the real measured wording. In the field this run also carried an
   // `api_error_status: 429`, which is the *only* reason it was ever classified as
   // transient — so the fixtures below deliberately omit that field to prove the
   // text alone is now sufficient.
@@ -212,7 +396,7 @@ describe("detectIncompleteToolCall", () => {
   });
 });
 
-describe("parseClaudeStreamJson incompleteToolCall (VANA-644 fixture)", () => {
+describe("parseClaudeStreamJson incompleteToolCall", () => {
   it("flags a subtype=success run whose final assistant turn emitted a Bash call as text", () => {
     const trailingText = `変更を確認します。\n\n${FUNCTION_CALLS_OPEN}\n${INVOKE_OPEN}\n${PARAM_OPEN}git add -A && git commit -m "fix"${PARAM_CLOSE}\n${INVOKE_CLOSE}\n${FUNCTION_CALLS_CLOSE}`;
     const stdout = streamLines([
@@ -261,7 +445,7 @@ describe("parseClaudeStreamJson incompleteToolCall (VANA-644 fixture)", () => {
   });
 });
 
-describe("parseClaudeStreamJson usage cache tokens (VANA-1034)", () => {
+describe("parseClaudeStreamJson usage cache tokens", () => {
   it("retains cache_creation and cache_read tokens in the usage summary", () => {
     const stdout = streamLines([
       { type: "system", subtype: "init", session_id: "sess-cache", model: "claude-opus-4-8" },
@@ -342,7 +526,7 @@ describe("extractClaudeRetryNotBefore", () => {
     ).toBeNull();
   });
 
-  // VANA-2670: structured rate_limit_event.resetsAt beats the free-text wording.
+  // structured rate_limit_event.resetsAt beats the free-text wording.
   it("prefers the structured rate_limit_event reset over the spend-limit wording", () => {
     const resetsAt = 1785829800; // five_hour window, same-day reset
     const stdout = [
@@ -372,7 +556,7 @@ describe("extractClaudeRateLimitReset", () => {
 
   it("ignores allowed_warning overage events and never reads overageResetsAt", () => {
     // An allowed_warning overage record carries resetsAt at the calendar-month
-    // boundary; using it would re-introduce the VANA-2542 one-month-fallback trap.
+    // boundary; using it would re-introduce the one-month-fallback trap.
     const stdout =
       '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1788220800,"rateLimitType":"overage","overageResetsAt":1788220800}}';
     expect(extractClaudeRateLimitReset({ stdout })).toBeNull();
