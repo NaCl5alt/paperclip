@@ -6730,7 +6730,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(1);
-    expect(comments[0]?.body).toContain("Recovery owner: [RecoveryFallback]");
+    expect(commentMetadataRows(comments[0]).some((row) =>
+      row.type === "agent_link" && row.label === "Recovery owner" && row.name === "RecoveryFallback",
+    )).toBe(true);
   });
 
   it("keeps legacy owner selection for transient-upstream exhaustion when no fallback agent is configured", async () => {
