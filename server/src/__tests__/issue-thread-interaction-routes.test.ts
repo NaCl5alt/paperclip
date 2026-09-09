@@ -1735,6 +1735,18 @@ describe.sequential("issue thread interaction routes", () => {
     // assertion in issue-agent-mutation-ownership-routes.test.ts
     // ("returns 409 for in_progress issue even when dispose override is allowed"). Consistent
     // with comment POST, which is gated by the same assertAgentIssueMutationAllowed guard.
+    //
+    // The shared beforeEach stubs access.decide to allow-all, which would hand this peer the
+    // `tasks:manage_active_checkouts` override — that override legitimately bypasses the run
+    // lock (assertAgentIssueMutationAllowed checks it first), so a blanket grant would make the
+    // assertion vacuous. Deny only that action: `issue:dispose` stays allowed, which is exactly
+    // the "even with a manager/CEO override" condition this test is here to pin.
+    mockAccessDecide.mockImplementation(async (input: { action?: string }) => ({
+      allowed: input.action !== "tasks:manage_active_checkouts",
+      action: input.action,
+      reason: input.action === "tasks:manage_active_checkouts" ? "deny_no_grant" : "allow_explicit_grant",
+      explanation: "Scoped by test grant.",
+    }));
     const app = await createApp({
       type: "agent",
       agentId: CREATED_AGENT_ID,
@@ -1753,8 +1765,11 @@ describe.sequential("issue thread interaction routes", () => {
         },
       });
 
-    expect(res.status).toBe(409);
-    expect(res.body.error).toBe("Issue is checked out by another agent");
+    // upstream replaced the bare "Issue is checked out by another agent" string with the
+    // structured issue-write denial copy; the boundary and status are unchanged.
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details.code).toBe("issue_write_assignee_run_lock");
+    expect(res.body.details.boundary).toBe("Run checkout lock");
     expect(mockInteractionService.create).not.toHaveBeenCalled();
   });
 
@@ -1766,7 +1781,7 @@ describe.sequential("issue thread interaction routes", () => {
       type: "agent",
       agentId: CREATED_AGENT_ID,
       companyId: "company-1",
-      runId: "run-1",
+      runId: RUN_1,
     });
 
     const res = await request(app)
