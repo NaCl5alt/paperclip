@@ -1466,10 +1466,22 @@ describe("claude execute", () => {
         onLog: async () => {},
       });
 
-      expect(result.exitCode).toBe(1);
+      // (fork): a COMPLETE success envelope (is_error:false,
+      // subtype:"success") that still exits non-zero is our own terminal-result
+      // cleanup SIGTERMing the child after the result JSON lands. The heartbeat
+      // derives "succeeded" as `exitCode === 0 && !errorMessage`, so the adapter
+      // normalizes the reported exit code to 0 and keeps the real process exit
+      // code in resultJson for forensics. Upstream reports the raw exit code
+      // here; the fork must not, or the run is recorded adapter_failed /
+      // claude_transient_upstream again.
+      expect(result.exitCode).toBe(0);
       expect(result.errorMessage).toBeNull();
       expect(result.errorCode).toBeNull();
       expect(result.summary).toBe("Implemented the requested change.");
+      expect(result.resultJson).toMatchObject({
+        processExitCode: 1,
+        exitCodeNormalizedReason: "complete_success_nonzero_exit",
+      });
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
