@@ -360,6 +360,12 @@ export type IssueDependencyReadiness = {
   unresolvedBlockerCount: number;
   /** Blockers whose status is `done` but whose execution workspace has not yet finalized. */
   pendingFinalizeBlockerIssueIds: string[];
+  /**
+   * Blockers that were `cancelled`. They can never reach `done`, so they are treated as
+   * resolved for scheduling; they are reported separately so the dependent's owner can
+   * re-validate the premise that the cancelled blocker was supposed to establish.
+   */
+  cancelledBlockerIssueIds: string[];
   allBlockersDone: boolean;
   isDependencyReady: boolean;
 };
@@ -592,6 +598,7 @@ function createIssueDependencyReadiness(issueId: string): IssueDependencyReadine
     unresolvedBlockerIssueIds: [],
     unresolvedBlockerCount: 0,
     pendingFinalizeBlockerIssueIds: [],
+    cancelledBlockerIssueIds: [],
     allBlockersDone: true,
     isDependencyReady: true,
   };
@@ -702,9 +709,15 @@ async function listIssueDependencyReadinessMap(
   for (const row of blockerRows) {
     const current = readinessMap.get(row.issueId) ?? createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
-    // Only done blockers resolve dependents; cancelled blockers stay unresolved
-    // until an operator removes or replaces the blocker relationship explicitly.
-    if (row.blockerStatus !== "done") {
+    // `done` and `cancelled` blockers both resolve dependents. A cancelled blocker can
+    // never reach `done`, so leaving it unresolved is a permanent deadlock: the dependent
+    // can no longer move to `in_progress` and no event will ever fire for it again
+    //
+    // Cancelled blockers are still reported via `cancelledBlockerIssueIds` so callers can
+    // tell the dependent's owner to re-validate the premise instead of silently proceeding.
+    if (row.blockerStatus === "cancelled") {
+      current.cancelledBlockerIssueIds.push(row.blockerIssueId);
+    } else if (row.blockerStatus !== "done") {
       current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
       current.unresolvedBlockerCount += 1;
       current.allBlockersDone = false;
@@ -745,8 +758,8 @@ async function listUnresolvedBlockerIssueIds(
       and(
         eq(issues.companyId, companyId),
         inArray(issues.id, uniqueBlockerIssueIds),
-        // Cancelled blockers intentionally remain unresolved until the relation changes.
-        ne(issues.status, "done"),
+        // Cancelled blockers resolve alongside done ones — see listIssueDependencyReadinessMap.
+        notInArray(issues.status, ["done", "cancelled"]),
       ),
     )
     .then((rows) => rows.map((row) => row.id));
@@ -4288,6 +4301,7 @@ export function issueService(db: Db) {
           id: candidate.id,
           assigneeAgentId: candidate.assigneeAgentId!,
           blockerIssueIds: readiness.blockerIssueIds,
+          cancelledBlockerIssueIds: readiness.cancelledBlockerIssueIds,
         }));
     },
 

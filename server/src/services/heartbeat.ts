@@ -114,6 +114,7 @@ import {
   SHARED_WORKSPACE_ISOLATION_FAILURE_CODE,
 } from "./shared-workspace-writer.js";
 import { issueService } from "./issues.js";
+import { fireDeferredBlockerWakes } from "./blockers-resolved-wake.js";
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
@@ -9628,47 +9629,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // the readiness check waiting for workspace_finalize), the finalize
         // row we just recorded now lets dependents proceed. Fire wakes here.
         if (issueId && adapterFinalizeOutcome === "succeeded") {
-          try {
-            const blockerIssueStatus = await db
-              .select({ status: issues.status })
-              .from(issues)
-              .where(eq(issues.id, issueId))
-              .then((rows) => rows[0]?.status ?? null);
-            if (blockerIssueStatus === "done") {
-              const dependents = await issuesSvc.listWakeableBlockedDependents(issueId);
-              for (const dependent of dependents) {
-                await enqueueWakeup(dependent.assigneeAgentId, {
-                  source: "automation",
-                  triggerDetail: "system",
-                  reason: "issue_blockers_resolved",
-                  payload: {
-                    issueId: dependent.id,
-                    resolvedBlockerIssueId: issueId,
-                    blockerIssueIds: dependent.blockerIssueIds,
-                    deferredFor: "workspace_finalize",
-                  },
-                  contextSnapshot: {
-                    issueId: dependent.id,
-                    taskId: dependent.id,
-                    wakeReason: "issue_blockers_resolved",
-                    source: "workspace.finalize",
-                    resolvedBlockerIssueId: issueId,
-                    blockerIssueIds: dependent.blockerIssueIds,
-                  },
-                }).catch((wakeErr) => {
-                  logger.warn(
-                    { err: wakeErr, issueId, dependentIssueId: dependent.id, agentId: dependent.assigneeAgentId },
-                    "failed to fire deferred dependent wake after workspace_finalize",
-                  );
-                });
-              }
-            }
-          } catch (finalizeWakeErr) {
-            logger.warn(
-              { err: finalizeWakeErr, runId: run.id, issueId },
-              "failed to evaluate dependent wakes after workspace_finalize",
-            );
-          }
+          const blockerIssueStatus = await db
+            .select({ status: issues.status })
+            .from(issues)
+            .where(eq(issues.id, issueId))
+            .then((rows) => rows[0]?.status ?? null)
+            .catch((statusErr) => {
+              logger.warn(
+                { err: statusErr, runId: run.id, issueId },
+                "failed to read blocker status for deferred dependent wakes",
+              );
+              return null;
+            });
+          await fireDeferredBlockerWakes({
+            blockerIssueId: issueId,
+            blockerIssueStatus,
+            listWakeableBlockedDependents: (id) => issuesSvc.listWakeableBlockedDependents(id),
+            enqueueWakeup,
+            onError: (err, context) =>
+              logger.warn(
+                { err, runId: run.id, ...context },
+                "failed to fire deferred dependent wake after workspace_finalize",
+              ),
+          });
         }
       }
 

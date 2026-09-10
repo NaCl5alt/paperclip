@@ -37,7 +37,7 @@ import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
-import { issueRecoveryActionService } from "../issue-recovery-actions.js";
+import { ACTIVE_RECOVERY_ACTION_STATUSES, issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { externalWaitFromDescription, issueService } from "../issues.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
@@ -69,6 +69,13 @@ import {
   withRecoveryModelProfileHint,
 } from "./model-profile-hint.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
+import {
+  classifyBlockedWait,
+  decideBlockedResume,
+  isResumableBlockedWait,
+  statusChangeActivityFields,
+  type BlockedWaitKind,
+} from "./blocked-wait.js";
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
@@ -79,6 +86,9 @@ const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+const BLOCKED_RESUME_ACTIVITY_SOURCE = "recovery.reconcile_resumable_blocked_issue";
+const PENDING_INTERACTION_STATUSES = ["pending"] as const;
+const PENDING_APPROVAL_STATUSES = ["pending", "revision_requested"] as const;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -853,6 +863,293 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { assigned, skipped, issueIds };
   }
 
+  /**
+   * Reads the durable evidence needed to decide whether an automatic resume of a `blocked`
+   * issue would be a duplicate. Both facts come from `activity_log`, so a restart, a second
+   * sweep pass or a duplicated event all observe the same answer.
+   */
+  async function readBlockedResumeHistory(issue: typeof issues.$inferSelect) {
+    // Selected on what the row SAYS, not on which action name wrote it. Filtering by action name
+    // silently missed parks written under other names — `issue.successful_run_handoff_escalated`
+    // is one — which made the park read older than it was and shortened the settling window for
+    // exactly the escalations it exists to avoid fighting.
+    const rows = await db
+      .select({ details: activityLog.details, createdAt: activityLog.createdAt })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, issue.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issue.id),
+          sql`(
+            ${activityLog.details} ->> 'status' = 'blocked'
+            or ${activityLog.details} ->> 'source' = ${BLOCKED_RESUME_ACTIVITY_SOURCE}
+          )`,
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt))
+      .limit(500);
+
+    const resumeAts: Date[] = [];
+    let lastBlockedEntryAt: Date | null = null;
+    for (const row of rows) {
+      const details = parseObject(row.details) ?? {};
+      if (details.source === BLOCKED_RESUME_ACTIVITY_SOURCE) {
+        resumeAts.push(row.createdAt);
+        continue;
+      }
+      // Newest-first, so the first status:"blocked" write is the current park.
+      if (!lastBlockedEntryAt && details.status === "blocked") {
+        lastBlockedEntryAt = row.createdAt;
+      }
+    }
+    return { resumeAts, lastBlockedEntryAt, issueUpdatedAt: issue.updatedAt, now: new Date() };
+  }
+
+  async function collectBlockedWaitSignals(issue: typeof issues.$inferSelect, now: Date) {
+    const [
+      unresolvedBlockerIssueIds,
+      blockerRelationRowCount,
+      pendingInteractionCount,
+      pendingApprovalCount,
+      hasActiveRecoveryAction,
+      hasExecutionPath,
+      isPauseHeld,
+    ] = await Promise.all([
+      existingUnresolvedBlockerIssueIds(issue.companyId, issue.id),
+      // Total `blocks` relation ROWS pointing at this issue, counted regardless of the blocker's
+      // status. This draws the responsibility boundary against `recoverBlockedSilentSinks`
+      // zero rows means no first-class blocker ever existed, which is 4085's domain,
+      // while a single all-terminal (e.g. cancelled) row keeps the issue with dependency-resume.
+      // It must be the row count, NOT `unresolvedBlockerIssueIds.length` — see the
+      // `blockerRelationRowCount` field doc in blocked-wait.ts.
+      db
+        .select({ id: issueRelations.id })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, issue.companyId),
+            eq(issueRelations.relatedIssueId, issue.id),
+            eq(issueRelations.type, "blocks"),
+          ),
+        )
+        .then((rows) => rows.length),
+      db
+        .select({ id: issueThreadInteractions.id })
+        .from(issueThreadInteractions)
+        .where(
+          and(
+            eq(issueThreadInteractions.companyId, issue.companyId),
+            eq(issueThreadInteractions.issueId, issue.id),
+            inArray(issueThreadInteractions.status, [...PENDING_INTERACTION_STATUSES]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length),
+      db
+        .select({ approvalId: issueApprovals.approvalId })
+        .from(issueApprovals)
+        .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+        .where(
+          and(
+            eq(issueApprovals.companyId, issue.companyId),
+            eq(issueApprovals.issueId, issue.id),
+            inArray(approvals.status, [...PENDING_APPROVAL_STATUSES]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length),
+      db
+        .select({ id: issueRecoveryActions.id })
+        .from(issueRecoveryActions)
+        .where(
+          and(
+            eq(issueRecoveryActions.companyId, issue.companyId),
+            eq(issueRecoveryActions.sourceIssueId, issue.id),
+            inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows.length > 0),
+      hasActiveExecutionPath(issue.companyId, issue.id),
+      isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc),
+    ]);
+
+    return {
+      unresolvedBlockerCount: unresolvedBlockerIssueIds.length,
+      blockerRelationRowCount,
+      pendingInteractionCount,
+      pendingApprovalCount,
+      monitorNextCheckAt: issue.monitorNextCheckAt ?? null,
+      // The `External owner:` / `External action:` marker is a sanctioned `blocked` form with no
+      // column of its own, so it is read from the description — the same source 4085 uses.
+      hasExternalWaitMarker: externalWaitFromDescription(issue.description) !== null,
+      hasActiveRecoveryAction,
+      hasActiveExecutionPath: hasExecutionPath,
+      isPauseHeld,
+      now,
+    };
+  }
+
+  /**
+   * Returns `blocked` issues that nothing will ever revisit back to `todo`, keeping the
+   * assignee. This repairs both a lost blocker-resolved wake and the larger class of issues
+   * that were parked in `blocked` without ever having a wait path.
+   *
+   * It deliberately does NOT close anything, and it stays away from every other kind of wait —
+   * see `classifyBlockedWait`. Resumes are capped per park and per issue by
+   * `decideBlockedResume`, so duplicate events and repeated sweeps cannot re-queue an issue and
+   * an agent that re-parks cannot be bounced forever.
+   *
+   * The same-sweep case — an earlier stage of this very sweep escalating an issue into `blocked`
+   * — is covered by the settling window alone: this function re-reads `issues` after those
+   * escalations, and every escalation goes through `issuesSvc.update`, which stamps `updatedAt`,
+   * so the park always reads as brand new. An extra "skip ids this sweep touched" set was tried
+   * and removed: it could never decide a case the window did not already decide, and by masking
+   * the window it made any future shortening of `MIN_BLOCKED_PARK_AGE_MS` invisible to the
+   * escalation tests in heartbeat-process-recovery.test.ts.
+   */
+  async function reconcileResumableBlockedIssues() {
+    const now = new Date();
+    const candidates = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "blocked"),
+          isNull(issues.assigneeUserId),
+          isNull(issues.hiddenAt),
+          sql`${issues.assigneeAgentId} is not null`,
+        ),
+      );
+
+    let resumed = 0;
+    let skipped = 0;
+    const issueIds: string[] = [];
+
+    for (const issue of candidates) {
+      const agentId = issue.assigneeAgentId;
+      if (!agentId) {
+        skipped += 1;
+        continue;
+      }
+      const agent = await getAgent(agentId);
+      if (!agent || agent.companyId !== issue.companyId || !(await isAgentInvokable(agent))) {
+        skipped += 1;
+        continue;
+      }
+
+      const waitKind: BlockedWaitKind = classifyBlockedWait(await collectBlockedWaitSignals(issue, now));
+      if (!isResumableBlockedWait(waitKind)) {
+        skipped += 1;
+        continue;
+      }
+
+      const decision = decideBlockedResume(await readBlockedResumeHistory(issue));
+      if (!decision.resume) {
+        skipped += 1;
+        continue;
+      }
+
+      if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
+        skipped += 1;
+        continue;
+      }
+      if (await isInvocationBudgetBlocked(issue, agentId)) {
+        skipped += 1;
+        continue;
+      }
+
+      // A cancelled blocker resolves scheduling but not the premise it was supposed to establish,
+      // so it has to be named in the resume comment — it is the reason the owner may need to
+      // re-point the work rather than just pick it back up.
+      const cancelledBlockers = await issuesSvc
+        .getRelationSummaries(issue.id)
+        .then((relations) => relations.blockedBy.filter((relation) => relation.status === "cancelled"))
+        .catch(() => []);
+
+      // `blockedByIssueIds` is deliberately OMITTED: passing it would REPLACE the blocker set, and
+      // passing `[]` would delete every `blocks` row pointing at this issue — irreversibly.
+      // `blockerAttention` and `blocked_by_cancelled_issue` are computed only for issues that are
+      // currently `blocked`, so neither reports this issue while it sits in `todo`; the comment
+      // below is the only hand-over the owner gets right now. Keeping the rows is what makes the
+      // board-visible signal come back if the issue is ever parked again.
+      const updated = await issuesSvc.update(issue.id, { status: "todo" });
+      if (!updated) {
+        skipped += 1;
+        continue;
+      }
+
+      await issuesSvc.addComment(
+        issue.id,
+        [
+          "## Resumed from `blocked` — no wait path remained",
+          "",
+          "Paperclip found this issue parked in `blocked` with nothing that could ever bring it back:",
+          "no unresolved blocker, no pending approval or interaction, no scheduled monitor check,",
+          "no recovery action and no live run. It has been returned to `todo` with the same assignee.",
+          ...(cancelledBlockers.length > 0
+            ? [
+              "",
+              `- **A blocker was cancelled rather than completed: ${formatIssueLinksForComment(cancelledBlockers)}.** ` +
+                "Scheduling no longer waits on it, but whatever it was supposed to deliver never happened — " +
+                "re-check the premise before continuing, and re-point the blocker if the work is still needed.",
+            ]
+            : []),
+          "",
+          "- If it is still genuinely waiting, record the wait as a first-class blocker, an interaction/approval, or a monitor check — otherwise it will be parked invisibly again.",
+          "- If it is finished or obsolete, close it explicitly as `done` or `cancelled`.",
+        ].join("\n"),
+        {},
+      );
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          status: "todo",
+          _previous: { status: "blocked" },
+          source: BLOCKED_RESUME_ACTIVITY_SOURCE,
+          blockedWaitKind: waitKind,
+        },
+      });
+
+      const queued = await deps.enqueueWakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_status_changed",
+        payload: withRecoveryModelProfileHint({
+          issueId: issue.id,
+          mutation: "resumable_blocked_recovery",
+        }, "normal_model"),
+        requestedByActorType: "system",
+        requestedByActorId: null,
+        contextSnapshot: withRecoveryModelProfileHint({
+          issueId: issue.id,
+          taskId: issue.id,
+          wakeReason: "issue_status_changed",
+          source: "issue.resumable_blocked_recovery",
+        }, "normal_model"),
+      });
+
+      if (queued) {
+        resumed += 1;
+        issueIds.push(issue.id);
+      } else {
+        skipped += 1;
+      }
+    }
+
+    return { resumed, skipped, issueIds };
+  }
+
   async function getCompanyIssuePrefix(companyId: string) {
     return db
       .select({ issuePrefix: companies.issuePrefix })
@@ -1523,6 +1820,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         source: "recovery.scan_silent_active_runs",
         evaluationIssueId: input.evaluationIssue.id,
         blockerIssueIds: nextBlockerIds,
+        ...statusChangeActivityFields({
+          previousStatus: input.sourceIssue.status,
+          writtenStatus: "blocked",
+        }),
       },
     });
     return true;
@@ -2392,8 +2693,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       entityId: input.issue.id,
       details: {
         identifier: input.issue.identifier,
-        status: "blocked",
-        previousStatus: input.previousStatus,
+        ...statusChangeActivityFields({ previousStatus: input.previousStatus, writtenStatus: "blocked" }),
         source: "recovery.reconcile_stranded_recovery_issue",
         latestRunId: input.latestRun?.id ?? null,
         latestRunStatus: input.latestRun?.status ?? null,
@@ -2558,8 +2858,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       entityId: input.issue.id,
       details: {
         identifier: input.issue.identifier,
-        status: "blocked",
-        previousStatus: input.previousStatus,
+        ...statusChangeActivityFields({ previousStatus: input.previousStatus, writtenStatus: "blocked" }),
         source: input.recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
           ? "recovery.reconcile_successful_run_handoff_missing_state"
           : input.recoveryCause === "workspace_validation_failed"
@@ -2895,6 +3194,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       productiveContinuationObserved: 0,
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
+      resumableBlockedResumed: 0,
       successfulRunHandoffEscalated: 0,
       escalated: 0,
       recoveryActionRenudged: 0,
@@ -3176,6 +3476,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
     result.skipped += orphanBlockerRecovery.skipped;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
+
+    const blockedResume = await reconcileResumableBlockedIssues();
+    result.resumableBlockedResumed = blockedResume.resumed;
+    result.skipped += blockedResume.skipped;
+    result.issueIds.push(...blockedResume.issueIds);
 
     await renudgeStrandedRecoveryActions(result);
 
@@ -4013,8 +4318,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         findingState: input.finding.state,
         blockerIssueIds: nextBlockerIds,
         escalationIssueId: input.escalationIssueId,
-        status: update.status ?? input.issue.status,
-        previousStatus: input.issue.status,
+        ...statusChangeActivityFields({
+          previousStatus: input.issue.status,
+          writtenStatus: update.status,
+        }),
       },
     });
 
