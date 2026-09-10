@@ -909,6 +909,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   async function collectBlockedWaitSignals(issue: typeof issues.$inferSelect, now: Date) {
     const [
       unresolvedBlockerIssueIds,
+      blockerRelationRowCount,
       pendingInteractionCount,
       pendingApprovalCount,
       hasActiveRecoveryAction,
@@ -916,6 +917,23 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       isPauseHeld,
     ] = await Promise.all([
       existingUnresolvedBlockerIssueIds(issue.companyId, issue.id),
+      // Total `blocks` relation ROWS pointing at this issue, counted regardless of the blocker's
+      // status. This draws the responsibility boundary against `recoverBlockedSilentSinks`
+      // zero rows means no first-class blocker ever existed, which is 4085's domain,
+      // while a single all-terminal (e.g. cancelled) row keeps the issue with dependency-resume.
+      // It must be the row count, NOT `unresolvedBlockerIssueIds.length` — see the
+      // `blockerRelationRowCount` field doc in blocked-wait.ts.
+      db
+        .select({ id: issueRelations.id })
+        .from(issueRelations)
+        .where(
+          and(
+            eq(issueRelations.companyId, issue.companyId),
+            eq(issueRelations.relatedIssueId, issue.id),
+            eq(issueRelations.type, "blocks"),
+          ),
+        )
+        .then((rows) => rows.length),
       db
         .select({ id: issueThreadInteractions.id })
         .from(issueThreadInteractions)
@@ -959,6 +977,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     return {
       unresolvedBlockerCount: unresolvedBlockerIssueIds.length,
+      blockerRelationRowCount,
       pendingInteractionCount,
       pendingApprovalCount,
       monitorNextCheckAt: issue.monitorNextCheckAt ?? null,

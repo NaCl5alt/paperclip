@@ -29,11 +29,32 @@ export type BlockedWaitKind =
   | "dependency"
   /** A monitor re-check is scheduled in the future. */
   | "observation"
+  /**
+   * No first-class blocker relation row exists for this issue at all. Responsibility for such an
+   * issue belongs to the silent-sink recovery, NOT to
+   * dependency-resume: an issue that never had a blocker relation is either still an
+   * unstructured prose park (which 4085 structures into a monitor / external-wait marker) or one
+   * 4085 already structured (e.g. an `External owner:` / `External action:` marker, for which
+   * `BlockedWaitSignals` carries no corresponding field). Either way dependency-resume must leave
+   * it alone. This is a responsibility boundary, not an ordering workaround: it holds no matter
+   * when this sweep runs relative to 4085, so it cannot be reopened by later re-ordering the
+   * recovery call sites.
+   */
+  | "no_blocker_relation"
   /** No wait path at all — no event will ever arrive for this issue. */
   | "none";
 
 export type BlockedWaitSignals = {
   unresolvedBlockerCount: number;
+  /**
+   * Total number of `blocks` relation ROWS pointing at this issue, counted regardless of the
+   * blocker's status. This is deliberately the row count, not `unresolvedBlockerCount`: an issue
+   * whose only blocker was cancelled has `unresolvedBlockerCount === 0` but `blockerRelationRowCount
+   * === 1`, and that is exactly the permanent-deadlock case dependency-resume must still own (its
+   * single distinctive value — ). The boundary "belongs to silent-sink recovery" is
+   * therefore drawn at `blockerRelationRowCount === 0`, never at `unresolvedBlockerCount === 0`.
+   */
+  blockerRelationRowCount: number;
   pendingInteractionCount: number;
   pendingApprovalCount: number;
   monitorNextCheckAt: Date | null;
@@ -56,6 +77,12 @@ export function classifyBlockedWait(signals: BlockedWaitSignals): BlockedWaitKin
   if (signals.monitorNextCheckAt && signals.monitorNextCheckAt.getTime() > signals.now.getTime()) {
     return "observation";
   }
+  // An issue that never had a first-class blocker relation is the silent-sink recovery's domain
+  //, not dependency-resume's — see the `no_blocker_relation` doc. This is the last
+  // check before `none` so it only reclassifies issues dependency-resume would otherwise resume,
+  // while a blocker row that is merely all-terminal still falls through to `none` and
+  // stays resumable.
+  if (signals.blockerRelationRowCount === 0) return "no_blocker_relation";
   return "none";
 }
 

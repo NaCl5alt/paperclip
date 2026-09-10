@@ -76,6 +76,10 @@ const NOW = new Date("2026-09-08T00:00:00.000Z");
 function signals(overrides: Partial<BlockedWaitSignals> = {}): BlockedWaitSignals {
   return {
     unresolvedBlockerCount: 0,
+    // Default the baseline issue INTO dependency-resume's domain: it has a blocker relation row
+    // whose blocker is terminal (unresolvedBlockerCount 0), the shape that must stay
+    // resumable. Cases that exercise the silent-sink boundary override this to 0 explicitly.
+    blockerRelationRowCount: 1,
     pendingInteractionCount: 0,
     pendingApprovalCount: 0,
     monitorNextCheckAt: null,
@@ -88,10 +92,44 @@ function signals(overrides: Partial<BlockedWaitSignals> = {}): BlockedWaitSignal
 }
 
 describe("classifyBlockedWait", () => {
-  it("treats an issue with no wait path at all as resumable", () => {
-    const kind = classifyBlockedWait(signals());
+  it("treats an issue whose only blocker relation is terminal, with no other wait path, as resumable", () => {
+    // shape: one blocker relation row, but its blocker is cancelled/done so nothing live
+    // remains. This is dependency-resume's distinctive value (a permanent deadlock left by a
+    // cancelled blocker) and must stay `none`/resumable.
+    const kind = classifyBlockedWait(signals({ blockerRelationRowCount: 1, unresolvedBlockerCount: 0 }));
     expect(kind).toBe("none");
     expect(isResumableBlockedWait(kind)).toBe(true);
+  });
+
+  it("excludes an issue with no blocker relation row as the silent-sink recovery's domain", () => {
+    // Responsibility boundary: an issue that never had a first-class blocker relation
+    // belongs to recoverBlockedSilentSinks, NOT dependency-resume — whether it is still
+    // an unstructured prose park or one 4085 already structured (e.g. an External owner/action
+    // marker, for which there is no BlockedWaitSignal field). Either way it must not be resumed here.
+    const kind = classifyBlockedWait(signals({ blockerRelationRowCount: 0 }));
+    expect(kind).toBe("no_blocker_relation");
+    expect(isResumableBlockedWait(kind)).toBe(false);
+  });
+
+  it("draws the boundary at the relation ROW count, not the unresolved-blocker count", () => {
+    // A single all-terminal blocker row (unresolved 0, rows 1) stays resumable; drop the row and the
+    // same unresolved-0 issue flips to the silent-sink domain. This is the exact distinction that
+    // must not collapse to `unresolvedBlockerCount === 0`, or would be wrongly excluded.
+    expect(classifyBlockedWait(signals({ blockerRelationRowCount: 1, unresolvedBlockerCount: 0 }))).toBe("none");
+    expect(classifyBlockedWait(signals({ blockerRelationRowCount: 0, unresolvedBlockerCount: 0 }))).toBe(
+      "no_blocker_relation",
+    );
+  });
+
+  it("keeps a future monitor as observation even when no blocker relation row exists", () => {
+    // shape after 4085 structured a due date: rows 0 but a future monitor. observation is
+    // checked before the no-blocker-relation boundary, so the more specific structured wait wins;
+    // either way it is not resumable.
+    const kind = classifyBlockedWait(
+      signals({ blockerRelationRowCount: 0, monitorNextCheckAt: new Date(NOW.getTime() + 60_000) }),
+    );
+    expect(kind).toBe("observation");
+    expect(isResumableBlockedWait(kind)).toBe(false);
   });
 
   it("does not resume any wait that still has an event coming", () => {
@@ -447,7 +485,10 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
 });
 
   describe("reconcileResumableBlockedIssues", () => {
-  async function seedParkedIssue(overrides: Partial<typeof issues.$inferInsert> = {}) {
+  async function seedParkedIssue(
+    overrides: Partial<typeof issues.$inferInsert> = {},
+    options: { withTerminalBlocker?: boolean } = {},
+  ) {
     const companyId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     await db.insert(companies).values({
@@ -480,6 +521,25 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
       identifier: `${issuePrefix}-1`,
       ...overrides,
     });
+    // After an issue that never had a first-class blocker relation is the silent-sink
+    // recovery's domain and is excluded here, so a fixture that must reach the resume/settling/budget
+    // logic needs one terminal (done) blocker relation row — the shape dependency-resume
+    // still owns. Tests that assert the exclusion itself leave this off.
+    if (options.withTerminalBlocker) {
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId,
+        title: "Completed blocker",
+        status: "done",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      });
+      await db
+        .insert(issueRelations)
+        .values({ companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" });
+    }
     // Park it well outside the settling window; a freshly parked issue is deliberately left alone.
     await db
       .update(issues)
@@ -511,7 +571,7 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
   }
 
   it("returns an issue with no wait path to todo and wakes its assignee", async () => {
-    const { issueId, agentId } = await seedParkedIssue();
+    const { issueId, agentId } = await seedParkedIssue({}, { withTerminalBlocker: true });
 
     const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
 
@@ -532,8 +592,24 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
     expect(comments.some((comment) => (comment.body ?? "").includes("no wait path remained"))).toBe(true);
   });
 
-  it("does not resume twice for the same park, including across a restart", async () => {
+  it("excludes a blocked issue that never had a blocker relation as the silent-sink recovery's domain", async () => {
+    // Call-site pin for the responsibility boundary. This issue is otherwise fully
+    // resumable — parked past the settling window, invokable assignee, no prior resume, no queued
+    // wake — so the ONLY thing keeping it in `blocked` is the zero-blocker-relation exclusion.
+    // Disabling that exclusion anywhere on the path (classifyBlockedWait, the collected signal, or
+    // the reconcile call site) would flip this issue back to `todo`, which this test then catches.
     const { issueId } = await seedParkedIssue();
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result.resumableBlockedResumed).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+    expect(await statusOf(issueId)).toBe("blocked");
+    expect(await resumeActivityCount(issueId)).toBe(0);
+  });
+
+  it("does not resume twice for the same park, including across a restart", async () => {
+    const { issueId } = await seedParkedIssue({}, { withTerminalBlocker: true });
 
     await heartbeatService(db).reconcileStrandedAssignedIssues();
     // Park it again by hand WITHOUT recording a new blocked entry, i.e. the resume is still the
@@ -745,7 +821,7 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
   });
 
   it("counts every past resume, not just the most recent rows", async () => {
-    const { companyId, issueId } = await seedParkedIssue();
+    const { companyId, issueId } = await seedParkedIssue({}, { withTerminalBlocker: true });
     // Three resumes already spent, each followed by unrelated chatter. The lifetime budget is
     // only correct if the history read reaches past that chatter to all three; a window that
     // stops early undercounts and hands out a fourth resume.
@@ -786,7 +862,7 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
   });
 
   it("sees a park recorded under any activity action, not just issue.updated", async () => {
-    const { companyId, issueId } = await seedParkedIssue();
+    const { companyId, issueId } = await seedParkedIssue({}, { withTerminalBlocker: true });
     // Some escalations record the park under their own action name (e.g.
     // `issue.successful_run_handoff_escalated`). If park detection keys off the action name it
     // misses these, reads the park as much older than it is, and resumes inside the window.
@@ -855,7 +931,7 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
   });
 
   it("leaves a freshly parked issue alone until the settling window passes", async () => {
-    const { issueId } = await seedParkedIssue();
+    const { issueId } = await seedParkedIssue({}, { withTerminalBlocker: true });
     await db.update(issues).set({ updatedAt: new Date() }).where(eq(issues.id, issueId));
 
     const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
