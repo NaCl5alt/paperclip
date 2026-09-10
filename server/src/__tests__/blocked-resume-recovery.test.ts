@@ -715,7 +715,9 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
   });
 
   it("leaves an unanswered interaction waiting", async () => {
-    const { companyId, agentId, issueId } = await seedParkedIssue();
+    // withTerminalBlocker so the pending interaction is the ONLY thing keeping this blocked — a bare
+    // issue would be held by no_blocker_relation instead, leaving the interaction query unpinned.
+    const { companyId, agentId, issueId } = await seedParkedIssue({}, { withTerminalBlocker: true });
     await db.insert(issueThreadInteractions).values({
       id: randomUUID(),
       companyId,
@@ -733,7 +735,9 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
   });
 
   it("leaves an unanswered approval waiting", async () => {
-    const { companyId, issueId } = await seedParkedIssue();
+    // withTerminalBlocker so the pending approval is the sole hold; a bare issue would be caught by
+    // no_blocker_relation and pass even if the approval query were broken.
+    const { companyId, issueId } = await seedParkedIssue({}, { withTerminalBlocker: true });
     const approvalId = randomUUID();
     await db.insert(approvals).values({
       id: approvalId,
@@ -752,7 +756,8 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
   });
 
   it("leaves an issue under a pause hold alone", async () => {
-    const { companyId, issueId } = await seedParkedIssue();
+    // withTerminalBlocker so the pause hold is the sole hold, not no_blocker_relation.
+    const { companyId, issueId } = await seedParkedIssue({}, { withTerminalBlocker: true });
     await db.insert(issueTreeHolds).values({
       id: randomUUID(),
       companyId,
@@ -771,7 +776,8 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
   });
 
   it("leaves an issue owned by an active recovery action alone", async () => {
-    const { companyId, agentId, issueId } = await seedParkedIssue();
+    // withTerminalBlocker so the recovery action is the sole hold, not no_blocker_relation.
+    const { companyId, agentId, issueId } = await seedParkedIssue({}, { withTerminalBlocker: true });
     await db.insert(issueRecoveryActions).values({
       id: randomUUID(),
       companyId,
@@ -793,9 +799,12 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
   });
 
   it("leaves a scheduled observation waiting", async () => {
-    const { issueId } = await seedParkedIssue({
-      monitorNextCheckAt: new Date(Date.now() + 60 * 60 * 1000),
-    });
+    // withTerminalBlocker so the future monitor is the sole hold; a bare issue would fall to
+    // no_blocker_relation and pass even if the monitor signal were dropped.
+    const { issueId } = await seedParkedIssue(
+      { monitorNextCheckAt: new Date(Date.now() + 60 * 60 * 1000) },
+      { withTerminalBlocker: true },
+    );
 
     const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
 
@@ -804,7 +813,8 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
   });
 
   it("does not race a live run that is already holding the issue", async () => {
-    const { companyId, agentId, issueId } = await seedParkedIssue();
+    // withTerminalBlocker so the live run is the sole hold, not no_blocker_relation.
+    const { companyId, agentId, issueId } = await seedParkedIssue({}, { withTerminalBlocker: true });
     await db.insert(heartbeatRuns).values({
       id: randomUUID(),
       companyId,
@@ -885,7 +895,8 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
 
   it("leaves an approval waiting in every non-terminal approval status", async () => {
     for (const status of ["pending", "revision_requested"]) {
-      const { companyId, issueId } = await seedParkedIssue();
+      // withTerminalBlocker so the approval is the sole hold across every status, not no_blocker_relation.
+      const { companyId, issueId } = await seedParkedIssue({}, { withTerminalBlocker: true });
       const approvalId = randomUUID();
       await db.insert(approvals).values({
         id: approvalId,
@@ -907,7 +918,8 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
 
   it("leaves a recovery action waiting in every non-terminal action status", async () => {
     for (const status of ["active", "escalated"]) {
-      const { companyId, agentId, issueId } = await seedParkedIssue();
+      // withTerminalBlocker so the recovery action is the sole hold across every status.
+      const { companyId, agentId, issueId } = await seedParkedIssue({}, { withTerminalBlocker: true });
       await db.insert(issueRecoveryActions).values({
         id: randomUUID(),
         companyId,
