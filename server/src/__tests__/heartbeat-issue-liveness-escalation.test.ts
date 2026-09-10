@@ -927,6 +927,35 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(await wakeRowCountForIssue(blockedIssueId)).toBe(0);
   });
 
+  // silent-sink structuring must NOT be gated by
+  // `enableIssueGraphLivenessAutoRecovery`. That flag gates escalation-issue creation and
+  // ships `false` by default, which is what the production instance runs. Every other sink
+  // test above calls `enableAutoRecovery()` first, so none of them can see this: with the
+  // call placed after the gate the whole mechanism is inert in production. Measured
+  // 2026-09-10 on the live instance — `experimental = {}` -> flag `false` -> sat
+  // unstructured. Reverting the hoist makes this test fail while all the others stay green.
+  it("structures a silent sink even when issue-graph auto-recovery is disabled (production default)", async () => {
+    // deliberately NOT calling enableAutoRecovery()
+    const nextMonth = new Date(Date.now() + 20 * 24 * 60 * 60 * 1000);
+    const md = `${nextMonth.getUTCMonth() + 1}/${nextMonth.getUTCDate()}`;
+    const { blockedIssueId } = await seedSilentSink({
+      description: `## 申し送り\n${md} Step2 でやること。日付待ち。`,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+
+    expect(result.autoRecoveryEnabled).toBe(false);
+    expect(result.silentSinkDueDateStructured).toBe(1);
+    // The flag still does its own job: no escalation issue is created while it is off.
+    expect(result.escalationsCreated).toBe(0);
+
+    const [issue] = await db.select().from(issues).where(eq(issues.id, blockedIssueId));
+    expect(issue!.status).toBe("blocked");
+    expect(issue!.monitorNextCheckAt).not.toBeNull();
+    expect(await wakeRowCountForIssue(blockedIssueId)).toBe(0);
+  });
+
   it("structures an external-wait silent sink with External markers without waking (R2)", async () => {
     await enableAutoRecovery();
     const { blockedIssueId } = await seedSilentSink({

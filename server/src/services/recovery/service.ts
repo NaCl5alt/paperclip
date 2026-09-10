@@ -4232,16 +4232,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       silentSinkIssueIds: [] as string[],
     };
 
-    if (!autoRecoveryEnabled) {
-      result.skippedAutoRecoveryDisabled = findings.length;
-      return result;
-    }
-
-    // Silent-sink structuring is not gated by the escalation lookback window: the
-    // whole point is to rescue issues that have been quietly stuck for a long time,
-    // which the lookback would exclude. Each action moves the issue out of the
-    // silent-sink predicate (monitor/marker set) or holds off via a cooldown stamp,
-    // so a subsequent reconcile does not re-act.
+    // Silent-sink structuring runs BEFORE the `autoRecoveryEnabled` gate and is not
+    // gated by the escalation lookback window either.
+    //
+    // `enableIssueGraphLivenessAutoRecovery` gates *escalation issue creation* — a noisy,
+    // experimental behaviour that is deliberately off by default (`z.boolean().default(false)`
+    // in packages/shared/src/validators/instance.ts, and the production instance stores
+    // `experimental = {}`). Silent-sink structuring is a different and far weaker action:
+    // it never changes `status`, never creates an issue, and its only wake is one nudge per
+    // issue per 7 days. Leaving it behind the escalation flag made the whole 
+    // mechanism inert in production — measured 2026-09-10: the flag was `false`, so the
+    // early return fired every tick and (a silent sink since 2026-09-03) was
+    // never structured.
+    //
+    // Each action moves the issue out of the silent-sink predicate (monitor/marker set) or
+    // holds off via a cooldown stamp, so a subsequent reconcile does not re-act
+    //
     const sinkRecovery = await recoverBlockedSilentSinks(input, {
       runId: opts?.runId ?? null,
     });
@@ -4250,6 +4256,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.silentSinkUnclassifiableNudged = sinkRecovery.nudgedUnclassifiable;
     result.silentSinkSkipped = sinkRecovery.skipped;
     result.silentSinkIssueIds = sinkRecovery.issueIds;
+
+    if (!autoRecoveryEnabled) {
+      result.skippedAutoRecoveryDisabled = findings.length;
+      return result;
+    }
 
     for (const finding of findings) {
       if (!isLivenessFindingInsideAutoRecoveryLookback(finding, cutoff, updatedAtByIssueKey)) {
