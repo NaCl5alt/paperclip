@@ -184,6 +184,20 @@ describe("classifyBlockedWait", () => {
     ).toBe("hold");
     expect(classifyBlockedWait(signals({ pendingApprovalCount: 1, unresolvedBlockerCount: 3 }))).toBe("approval");
   });
+
+  it("names the declared external wait ahead of the relation-row boundary when both apply", () => {
+    // Both kinds are non-resumable, so swapping these two checks changes no resume decision
+    // today and no other assertion here notices it. It is pinned anyway because the kind is a
+    // reported reason, not just a boolean: `reconcileResumableBlockedIssues` already writes
+    // `blockedWaitKind` into the activity row — only on the resume path, so today that field is
+    // always "none" and never actually carries either of these two — and the moment a skip
+    // records its reason too, an issue that declares `External owner:`/`External action:`
+    // would be reported as merely lacking a blocker relation — which sends whoever reads it to
+    // the silent-sink recovery instead of to the external owner holding the issue.
+    expect(
+      classifyBlockedWait(signals({ hasExternalWaitMarker: true, blockerRelationRowCount: 0 })),
+    ).toBe("external_wait");
+  });
 });
 
 describe("statusChangeActivityFields", () => {
