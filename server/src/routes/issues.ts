@@ -65,6 +65,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import type { StorageService } from "../storage/types.js";
 import { validate } from "../middleware/validate.js";
 import * as serviceIndex from "../services/index.js";
+import { buildBlockersResolvedWakeFields } from "../services/blockers-resolved-wake.js";
 import {
   accessService,
   agentService,
@@ -5588,29 +5589,25 @@ export function issueRoutes(
         }
       }
 
-      const becameDone = existing.status !== "done" && issue.status === "done";
-      if (becameDone) {
+      // A blocker resolves its dependents when it reaches EITHER terminal status. Firing only
+      // on `done` left every dependent of a cancelled blocker permanently parked, because a
+      // cancelled blocker can never transition to `done` afterwards.
+      const becameBlockerResolved =
+        !["done", "cancelled"].includes(existing.status) && ["done", "cancelled"].includes(issue.status);
+      if (becameBlockerResolved) {
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
           addWakeup(dependent.assigneeAgentId, {
             source: "automation",
             triggerDetail: "system",
-            reason: "issue_blockers_resolved",
-            payload: {
-              issueId: dependent.id,
+            ...buildBlockersResolvedWakeFields({
+              dependent,
               resolvedBlockerIssueId: issue.id,
-              blockerIssueIds: dependent.blockerIssueIds,
-            },
+              resolvedBlockerStatus: issue.status,
+              source: "issue.blockers_resolved",
+            }),
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
-            contextSnapshot: {
-              issueId: dependent.id,
-              taskId: dependent.id,
-              wakeReason: "issue_blockers_resolved",
-              source: "issue.blockers_resolved",
-              resolvedBlockerIssueId: issue.id,
-              blockerIssueIds: dependent.blockerIssueIds,
-            },
           });
         }
       }
