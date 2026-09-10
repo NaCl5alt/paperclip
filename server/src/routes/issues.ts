@@ -5628,27 +5628,34 @@ export function issueRoutes(
           const readiness = await svc.getDependencyReadiness(issue.id);
           if (readiness.isDependencyReady && readiness.blockerIssueIds.length > 0) {
             const resolvedBlockerIssueId = readiness.blockerIssueIds[0];
+            // This backstop RE-ARMS a wake rather than reporting a fresh transition, so no blocker
+            // "just" terminated and the representative one is arbitrary. Its status must still be
+            // reported truthfully: readiness is now satisfied by `cancelled` blockers too, so a
+            // hand-built payload here would tell a dependent "your blockers resolved" while
+            // omitting `resolvedByCancellation` / `cancelledBlockerIssueIds` and never mentioning
+            // that the premise died. That is precisely the producer drift
+            // `buildBlockersResolvedWakeFields` was extracted to make impossible, and this third
+            // producer arrived from the other side of the merge.
+            const wake = buildBlockersResolvedWakeFields({
+              dependent: {
+                id: issue.id,
+                blockerIssueIds: readiness.blockerIssueIds,
+                cancelledBlockerIssueIds: readiness.cancelledBlockerIssueIds,
+              },
+              resolvedBlockerIssueId,
+              resolvedBlockerStatus: readiness.cancelledBlockerIssueIds.includes(resolvedBlockerIssueId)
+                ? "cancelled"
+                : "done",
+              source: "issue.blocked_transition_backstop",
+            });
             addWakeup(issue.assigneeAgentId, {
               source: "automation",
               triggerDetail: "system",
-              reason: "issue_blockers_resolved",
-              payload: {
-                issueId: issue.id,
-                resolvedBlockerIssueId,
-                blockerIssueIds: readiness.blockerIssueIds,
-                backstop: "blocked_transition",
-              },
+              ...wake,
+              payload: { ...wake.payload, backstop: "blocked_transition" },
+              contextSnapshot: { ...wake.contextSnapshot, backstop: "blocked_transition" },
               requestedByActorType: actor.actorType,
               requestedByActorId: actor.actorId,
-              contextSnapshot: {
-                issueId: issue.id,
-                taskId: issue.id,
-                wakeReason: "issue_blockers_resolved",
-                source: "issue.blocked_transition_backstop",
-                resolvedBlockerIssueId,
-                blockerIssueIds: readiness.blockerIssueIds,
-                backstop: "blocked_transition",
-              },
             });
           }
         } catch (err) {
