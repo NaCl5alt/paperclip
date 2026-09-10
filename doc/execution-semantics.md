@@ -323,6 +323,24 @@ Assigning an issue normally implies executable intent. When create APIs receive 
 
 An explicit assigned `backlog` issue remains valid when the creator is deliberately parking the work. It must not wake the assignee just because it has an assignee. Paperclip should make that choice visible in activity and UI so operators can distinguish intentional parking from a missed handoff.
 
+### Recovery fallback context continuity
+
+When `recoveryFallbackAgentId` receives an issue after quota, authentication, or
+transient upstream failure, the assignment wake preserves the original event's
+comment IDs, child completion summaries, and interaction outcome/reason. It also
+records the source run, source agent, and original wake reason. Cached prompts,
+native session resume parameters, credentials, and executor workspace leases are
+not transferred; the destination resolves its own execution environment normally.
+
+The first fallback wake requires history recovery (`fallbackFetchNeeded: true`)
+even when there are no triggering comments. The executor must consult current
+issue comments/documents and handle the original event before acting. A child
+review completion is not a request to repeat the original investigation, and a
+fallback is not permission to bypass a pending review or mark the issue done.
+The task prompt links the source run API/log for additional execution evidence.
+This provides explicit event continuity, not a complete native Claude transcript
+transfer or a guarantee that the model will follow the recovered context.
+
 An assigned `backlog` issue becomes a liveness problem when another issue is blocked on it and there is no explicit waiting path such as a human owner, active run, queued wake, pending interaction or approval, monitor, or open recovery action. In that case the blocked parent should surface "blocked by parked work" rather than treating the dependency chain as healthy.
 
 ### Agent-assigned `in_progress`

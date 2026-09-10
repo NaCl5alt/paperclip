@@ -25,6 +25,8 @@ import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
   TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_DEFERRAL_THRESHOLD_MS,
+  buildPaperclipWakePayload,
+  buildRecoveryFallbackTaskNote,
   heartbeatService,
 } from "../services/heartbeat.ts";
 
@@ -1474,7 +1476,83 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(comments.some((comment) => comment.body.includes("recovery fallback agent"))).toBe(true);
   });
 
-  // VANA-1892: comment-driven wakes fire on issues parked in `blocked`/`in_review`,
+  it.each(["issue_children_completed", "issue_commented", "issue_interaction_resolved"])(
+    "preserves %s context through recovery handoff and requires history recovery",
+    async (wakeReason) => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const runId = randomUUID();
+      const issueId = randomUUID();
+      const now = new Date("2026-04-21T09:00:00.000Z");
+      const { fallbackAgentId } = await seedRecoveryFallbackFixture({
+        companyId, agentId, runId, issueId, now,
+        issueStatus: "in_review",
+        scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length,
+      });
+      const commentId = randomUUID();
+      await db.insert(issueComments).values({
+        id: commentId, companyId, issueId, authorAgentId: agentId,
+        body: "Review the completed fixes; do not restart the original investigation.",
+      });
+      const childIssueId = randomUUID();
+      const eventContext = wakeReason === "issue_children_completed"
+        ? {
+            childIssueIds: [childIssueId], completedChildIssueId: childIssueId,
+            childIssueSummaries: [{ id: childIssueId, status: "done", summary: "Fix reviewed; merge still pending." }],
+            childIssueSummaryTruncated: false,
+          }
+        : wakeReason === "issue_interaction_resolved"
+          ? {
+              interactionId: randomUUID(), interactionKind: "request_confirmation",
+              interactionStatus: "rejected", interactionOutcome: "rejected",
+              interactionReason: "Keep the existing implementation; only explain the review.",
+              continuationPolicy: "wake_assignee",
+              wakeCommentId: commentId,
+            }
+          : { wakeCommentIds: [commentId] };
+      await db.update(heartbeatRuns).set({
+        contextSnapshot: {
+          issueId, wakeReason, ...eventContext,
+          resumeSessionParams: { sessionId: randomUUID() },
+          paperclipWake: { stale: true }, paperclipTaskMarkdown: "stale original task",
+          paperclipWorkspace: { cwd: "/old-executor" },
+          environment: { SECRET: "must-not-transfer" },
+        },
+      }).where(eq(heartbeatRuns.id, runId));
+
+      await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0.5 });
+      const [fallbackRun] = await db.select().from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, fallbackAgentId));
+      expect(fallbackRun).toBeDefined();
+      const context = fallbackRun!.contextSnapshot as Record<string, unknown>;
+      expect(context).toMatchObject({
+        ...eventContext, issueId, wakeReason: "issue_assigned",
+        recoveryFallbackSourceRunId: runId,
+        recoveryFallbackSourceAgentId: agentId,
+        recoveryFallbackOriginalWakeReason: wakeReason,
+      });
+      expect(context).not.toHaveProperty("resumeSessionParams");
+      expect(context).not.toHaveProperty("environment");
+      expect(context.paperclipWorkspace).not.toEqual({ cwd: "/old-executor" });
+      const wake = await buildPaperclipWakePayload({ db, companyId, contextSnapshot: context });
+      expect(wake?.fallbackFetchNeeded).toBe(true);
+      if (wakeReason === "issue_children_completed") {
+        expect(wake?.childIssueSummaries).toEqual(eventContext.childIssueSummaries);
+        expect(wake?.comments).toEqual([]);
+      } else {
+        expect(wake?.latestCommentId).toBe(commentId);
+        expect(wake?.comments[0]?.body).toContain("do not restart");
+      }
+      if (wakeReason === "issue_interaction_resolved") {
+        expect(wake?.interactionStatus).toBe("rejected");
+        expect(wake?.interactionReason).toBe(eventContext.interactionReason);
+      }
+      expect(buildRecoveryFallbackTaskNote(context)).toContain(`/api/heartbeat-runs/${runId}`);
+      expect(buildRecoveryFallbackTaskNote(context)).toContain("original conversation has not been resumed");
+    },
+  );
+
+  // comment-driven wakes fire on issues parked in `blocked`/`in_review`,
   // which the old `in_progress`/`todo`-only allowlist silently dropped. `backlog`
   // was likewise excluded before and is now eligible, so it is covered here too.
   it.each(["blocked", "in_review", "backlog"] as const)(
@@ -1606,7 +1684,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(scheduledRetries).toHaveLength(0);
   });
 
-  // VANA-1892 incident reproduction: the failed run hit a session limit whose
+  // incident reproduction: the failed run hit a session limit whose
   // reset window was far in the future, so the deferred-window failover branch
   // (`retry_not_before_deferred`) fired — but the source issue was parked in
   // `blocked` (human-comment-driven wake). The old status guard dropped it here.
@@ -1701,7 +1779,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(fallbackWakeups).toHaveLength(0);
   });
 
-  // VANA-2662: reset-less account/org quota exhaustion hands off immediately at
+  // reset-less account/org quota exhaustion hands off immediately at
   // attempt 1 instead of grinding through the bounded-retry ladder.
   it("hands the account-quota-exhausted issue off immediately at attempt 1 without retrying", async () => {
     const companyId = randomUUID();
@@ -1748,7 +1826,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   });
 
 
-  // VANA-3914: claude_auth_required hands off immediately — auth breaks do not
+  // claude_auth_required hands off immediately — auth breaks do not
   // clear on the bounded-retry timescale, and they never enter the transient
   // upstream contract.
   it("hands a claude_auth_required issue off immediately at attempt 1 without retrying", async () => {
