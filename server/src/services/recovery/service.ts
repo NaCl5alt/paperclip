@@ -981,6 +981,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       pendingInteractionCount,
       pendingApprovalCount,
       monitorNextCheckAt: issue.monitorNextCheckAt ?? null,
+      // The `External owner:` / `External action:` marker is a sanctioned `blocked` form with no
+      // column of its own, so it is read from the description — the same source 4085 uses.
+      hasExternalWaitMarker: externalWaitFromDescription(issue.description) !== null,
       hasActiveRecoveryAction,
       hasActiveExecutionPath: hasExecutionPath,
       isPauseHeld,

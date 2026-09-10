@@ -83,6 +83,7 @@ function signals(overrides: Partial<BlockedWaitSignals> = {}): BlockedWaitSignal
     pendingInteractionCount: 0,
     pendingApprovalCount: 0,
     monitorNextCheckAt: null,
+    hasExternalWaitMarker: false,
     hasActiveRecoveryAction: false,
     hasActiveExecutionPath: false,
     isPauseHeld: false,
@@ -119,6 +120,28 @@ describe("classifyBlockedWait", () => {
     expect(classifyBlockedWait(signals({ blockerRelationRowCount: 0, unresolvedBlockerCount: 0 }))).toBe(
       "no_blocker_relation",
     );
+  });
+
+  it("holds an issue that declares an external wait even when it still has a blocker relation row", () => {
+    // The combination the row-count boundary alone cannot see: a blocker relation row exists (so
+    // recoverBlockedSilentSinks never considers this issue) AND the description declares an
+    // external wait. Without the marker signal this lands on `none` and gets resumed with a
+    // comment asserting no wait path remains, which the marker disproves.
+    const kind = classifyBlockedWait(
+      signals({ blockerRelationRowCount: 1, unresolvedBlockerCount: 0, hasExternalWaitMarker: true }),
+    );
+    expect(kind).toBe("external_wait");
+    expect(isResumableBlockedWait(kind)).toBe(false);
+  });
+
+  it("resumes the same issue once the external wait marker is gone", () => {
+    // Opposite pole of the test above, so a mutant that hardcodes `external_wait` cannot survive:
+    // the marker is what holds the issue, not the shape it shares with the case.
+    const kind = classifyBlockedWait(
+      signals({ blockerRelationRowCount: 1, unresolvedBlockerCount: 0, hasExternalWaitMarker: false }),
+    );
+    expect(kind).toBe("none");
+    expect(isResumableBlockedWait(kind)).toBe(true);
   });
 
   it("keeps a future monitor as observation even when no blocker relation row exists", () => {
@@ -606,6 +629,40 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
     expect(result.issueIds).not.toContain(issueId);
     expect(await statusOf(issueId)).toBe("blocked");
     expect(await resumeActivityCount(issueId)).toBe(0);
+  });
+
+  it("leaves an issue that declares an external wait alone even though it has a blocker relation row", async () => {
+    // Call-site pin for the marker gap the row-count boundary cannot close. `withTerminalBlocker`
+    // gives this issue a blocker relation row, so it is NOT excluded by `no_blocker_relation` and
+    // recoverBlockedSilentSinks never considers it either — the description marker is the sole
+    // remaining hold. Dropping the `hasExternalWaitMarker` signal at the call site or its
+    // precedence entry in classifyBlockedWait resumes this issue, which this test then catches.
+    const { issueId } = await seedParkedIssue(
+      { description: "Waiting on the vendor.\n\nExternal owner: Vendor X\nExternal action: signed quote" },
+      { withTerminalBlocker: true },
+    );
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result.resumableBlockedResumed).toBe(0);
+    expect(result.issueIds).not.toContain(issueId);
+    expect(await statusOf(issueId)).toBe("blocked");
+    expect(await resumeActivityCount(issueId)).toBe(0);
+  });
+
+  it("still resumes an otherwise identical issue whose description carries no external wait marker", async () => {
+    // Opposite pole of the test above: same shape, same terminal blocker row, prose that merely
+    // mentions a vendor without the sanctioned marker. Proves the hold above comes from the marker
+    // and not from the fixture, so a mutant that never resumes cannot pass both tests.
+    const { issueId } = await seedParkedIssue(
+      { description: "Waiting on the vendor to send a signed quote." },
+      { withTerminalBlocker: true },
+    );
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result.resumableBlockedResumed).toBe(1);
+    expect(await statusOf(issueId)).toBe("todo");
   });
 
   it("does not resume twice for the same park, including across a restart", async () => {

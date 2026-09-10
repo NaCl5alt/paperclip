@@ -30,6 +30,15 @@ export type BlockedWaitKind =
   /** A monitor re-check is scheduled in the future. */
   | "observation"
   /**
+   * The description declares an external wait (`External owner:` + `External action:`), one of the
+   * sanctioned `blocked` forms. `no_blocker_relation` does NOT cover this: it only fires at zero
+   * relation rows, so an issue that carries BOTH a marker and a blocker relation row would fall
+   * through to `none` and be resumed — and `recoverBlockedSilentSinks` never sees it,
+   * because an issue with a blocker relation row is not one of its candidates. Without this signal
+   * that issue is resumed with a comment claiming no wait path exists, which the marker disproves.
+   */
+  | "external_wait"
+  /**
    * No first-class blocker relation row exists for this issue at all. Responsibility for such an
    * issue belongs to the silent-sink recovery, NOT to
    * dependency-resume: an issue that never had a blocker relation is either still an
@@ -58,6 +67,12 @@ export type BlockedWaitSignals = {
   pendingInteractionCount: number;
   pendingApprovalCount: number;
   monitorNextCheckAt: Date | null;
+  /**
+   * The issue declares an external wait via `External owner:` / `External action:` in its
+   * description. Derived from the description because that marker is the durable form of the
+   * wait; there is no column for it.
+   */
+  hasExternalWaitMarker: boolean;
   hasActiveRecoveryAction: boolean;
   hasActiveExecutionPath: boolean;
   isPauseHeld: boolean;
@@ -82,6 +97,10 @@ export function classifyBlockedWait(signals: BlockedWaitSignals): BlockedWaitKin
   // check before `none` so it only reclassifies issues dependency-resume would otherwise resume,
   // while a blocker row that is merely all-terminal still falls through to `none` and
   // stays resumable.
+  // Ahead of the row-count boundary: a declared external wait is a real wait whether or not the
+  // issue also has a blocker relation row, and the row-count boundary alone would miss the
+  // "marker AND blocker row" combination entirely.
+  if (signals.hasExternalWaitMarker) return "external_wait";
   if (signals.blockerRelationRowCount === 0) return "no_blocker_relation";
   return "none";
 }
