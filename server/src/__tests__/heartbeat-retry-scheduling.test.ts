@@ -25,6 +25,7 @@ import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   MAX_TURN_CONTINUATION_WAKE_REASON,
   TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_DEFERRAL_THRESHOLD_MS,
+  TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_WAKE_SOURCE,
   buildPaperclipWakePayload,
   buildRecoveryFallbackTaskNote,
   heartbeatService,
@@ -1530,6 +1531,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
         recoveryFallbackSourceRunId: runId,
         recoveryFallbackSourceAgentId: agentId,
         recoveryFallbackOriginalWakeReason: wakeReason,
+        source: TRANSIENT_UPSTREAM_RECOVERY_FALLBACK_WAKE_SOURCE,
       });
       expect(context).not.toHaveProperty("resumeSessionParams");
       expect(context).not.toHaveProperty("environment");
