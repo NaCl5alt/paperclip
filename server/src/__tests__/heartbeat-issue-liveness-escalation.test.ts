@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -1589,6 +1589,8 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(result.silentSinkExternalStructured).toBe(0);
     expect(result.silentSinkUnclassifiableNudged).toBe(0);
     expect(await wakeRowCountForIssue(blockedIssueId)).toBe(0);
+  });
+
   it("handles an armed cutoff when no liveness findings exist", async () => {
     const heartbeat = heartbeatService(db);
 

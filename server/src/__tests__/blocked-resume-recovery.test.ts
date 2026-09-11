@@ -8,6 +8,7 @@ import {
   agentWakeupRequests,
   approvals,
   companies,
+  companyMemberships,
   createDb,
   environmentLeases,
   environments,
@@ -388,6 +389,15 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
+    // Every real company has an owner user; heartbeat run dispatch resolves the responsible user
+    // from it (resolveCompanyDefaultResponsibleUserId). Seed it so resume-path wakes can dispatch.
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: randomUUID(),
+      status: "active",
+      membershipRole: "owner",
+    });
     return companyId;
   }
 
@@ -533,6 +543,14 @@ describeEmbeddedPostgres("blocked issue resume mechanism", () => {
       name: "Paperclip",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
+    });
+    // Owner user so the resume wake can resolve a responsible user for run dispatch, as in prod.
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: randomUUID(),
+      status: "active",
+      membershipRole: "owner",
     });
     const agentId = randomUUID();
     await db.insert(agents).values({
