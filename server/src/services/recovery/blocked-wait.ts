@@ -169,17 +169,28 @@ export function decideBlockedResumeBatch(input: {
 }
 
 /**
- * Flattens text quoted from another issue into one inert line for a system comment. The quote is
- * reference material, not an instruction: links are reduced to their text, and newlines are
- * collapsed so the quote cannot open a heading, list or instruction block of its own.
+ * Flattens text quoted from another issue into one inert inline code span for a system comment.
+ * The quote is reference material, not an instruction. Wrapping in a code span neutralises all
+ * renderer-level link creation: markdown-link syntax, autolink literals (bare URLs / www. / email),
+ * issue-reference tokens (XYZ-NNN), and wikilinks ([[…]]) are all inert inside a code span.
+ * Block structure (headings, lists) is already broken by the newline→space collapse.
+ *
+ * Backtick escaping follows CommonMark §6.1: choose a fence of N backticks where N > the longest
+ * run of backticks in the flattened text, then pad with a space when the content starts or ends
+ * with a backtick so the delimiter is unambiguous.
  */
 export function quoteAsReference(text: string, maxChars = 280): string {
   const flat = text
     .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
     .replace(/\s+/g, " ")
     .trim();
-  if (flat.length <= maxChars) return flat;
-  return `${flat.slice(0, maxChars).trimEnd()}…`;
+  const content = flat.length <= maxChars ? flat : `${flat.slice(0, maxChars).trimEnd()}…`;
+  // Pick a backtick fence one longer than the longest run inside the content.
+  const maxRun = (content.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
+  const fence = "`".repeat(maxRun + 1);
+  // Pad with a space when content starts or ends with a backtick (CommonMark §6.1).
+  const pad = content.startsWith("`") || content.endsWith("`") ? " " : "";
+  return `${fence}${pad}${content}${pad}${fence}`;
 }
 
 export type BlockedResumeHistory = {
