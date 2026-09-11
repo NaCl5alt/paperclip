@@ -415,6 +415,12 @@ describe("resume hand-over comment", () => {
     // starts with backtick → needs space padding
     const withLeadBacktick = quoteAsReference("`leading");
     expect(withLeadBacktick).toBe("`` `leading ``");
+    // leading/trailing whitespace is trimmed before wrapping
+    expect(quoteAsReference("  spaces  ")).toBe("`spaces`");
+    // exactly maxChars chars passes through unchanged (boundary is <=, not <)
+    expect(quoteAsReference("x".repeat(280), 280)).toBe(`\`${"x".repeat(280)}\``);
+    // one over maxChars gets truncated
+    expect(quoteAsReference("x".repeat(281), 280)).toBe(`\`${"x".repeat(280)}…\``);
   });
 
   it("quotes a cancelled blocker as reference and asks for the premise decision first", () => {
