@@ -126,6 +126,62 @@ export const MAX_BLOCKED_RESUMES_PER_ISSUE = 3;
  */
 export const MIN_BLOCKED_PARK_AGE_MS = 15 * 60 * 1000;
 
+/**
+ * Version of the approved resume rule: conditions C1–C9 (candidate scope, `classifyBlockedWait`,
+ * `decideBlockedResume`, queued wake, invocation budget) plus the limits in this file. The board
+ * approves this version and a count limit, not a list of issue ids, so a change to any condition,
+ * constant or the candidate scope must not ride along under the old approval: bump this string
+ * and report the change as a new diff. The unit test pins every value that forms the rule, so such
+ * a change cannot land without also editing that pin.
+ */
+export const BLOCKED_RESUME_RULE_VERSION = "2026-09-11.v1";
+
+/**
+ * Most automatic resumes allowed per company within `BLOCKED_RESUME_WINDOW_MS`, counting both the
+ * resumes already made in the window and the ones the current sweep would make. Counting the
+ * window and not only the sweep is what stops the 30-second sweep from letting a burst through a
+ * few at a time.
+ */
+export const MAX_BLOCKED_RESUMES_PER_WINDOW = 5;
+export const BLOCKED_RESUME_WINDOW_MS = 60 * 60 * 1000;
+
+export type BlockedResumeBatchDecision =
+  | { resume: true }
+  | { resume: false; reason: "hold_open" | "over_limit" };
+
+/**
+ * All or nothing. A batch over the limit resumes none of its issues rather than the first few,
+ * because an unusually large batch is itself the sign that the rule may be misclassifying. While a
+ * hold is open nothing is resumed at all; only closing the hold releases it, and the next sweep
+ * then has to fit under the limit again, so a backlog that built up during the hold cannot drain
+ * through without a person looking at it.
+ */
+export function decideBlockedResumeBatch(input: {
+  eligibleCount: number;
+  resumedInWindow: number;
+  holdOpen: boolean;
+}): BlockedResumeBatchDecision {
+  if (input.holdOpen) return { resume: false, reason: "hold_open" };
+  if (input.resumedInWindow + input.eligibleCount > MAX_BLOCKED_RESUMES_PER_WINDOW) {
+    return { resume: false, reason: "over_limit" };
+  }
+  return { resume: true };
+}
+
+/**
+ * Flattens text quoted from another issue into one inert line for a system comment. The quote is
+ * reference material, not an instruction: links are reduced to their text, and newlines are
+ * collapsed so the quote cannot open a heading, list or instruction block of its own.
+ */
+export function quoteAsReference(text: string, maxChars = 280): string {
+  const flat = text
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (flat.length <= maxChars) return flat;
+  return `${flat.slice(0, maxChars).trimEnd()}…`;
+}
+
 export type BlockedResumeHistory = {
   /** `created_at` of every previous automatic resume of this issue, any order. */
   resumeAts: Date[];
