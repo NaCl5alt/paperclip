@@ -10167,6 +10167,8 @@ export function issueRoutes(
         dependentIssueId: string;
         resolvedBlockerIssueId: string;
         blockerIssueIds: string[];
+        cancelledBlockerIssueIds?: string[];
+        resolvedBlockerStatus: string;
         source: string;
         mutation: string;
       }) => {
@@ -10186,27 +10188,28 @@ export function issueRoutes(
             "failed to check existing dependency wake before issue update wake",
           );
         }
+        // Build through the shared producer so the cancelled-premise fields
+        // (resolvedBlockerStatus / resolvedByCancellation / cancelledBlockerIssueIds) stay on the
+        // wake. Hand-rolling this payload silently dropped them and told a dependent whose premise
+        // died only "blockers resolved".
+        const wake = buildBlockersResolvedWakeFields({
+          dependent: {
+            id: input.dependentIssueId,
+            blockerIssueIds: input.blockerIssueIds,
+            cancelledBlockerIssueIds: input.cancelledBlockerIssueIds,
+          },
+          resolvedBlockerIssueId: input.resolvedBlockerIssueId,
+          resolvedBlockerStatus: input.resolvedBlockerStatus,
+          source: input.source,
+        });
         addWakeup(input.agentId, {
           source: "automation",
           triggerDetail: "system",
-          reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-          payload: {
-            issueId: input.dependentIssueId,
-            resolvedBlockerIssueId: input.resolvedBlockerIssueId,
-            blockerIssueIds: input.blockerIssueIds,
-            mutation: input.mutation,
-          },
+          ...wake,
+          payload: { ...wake.payload, mutation: input.mutation },
           idempotencyKey,
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
-          contextSnapshot: {
-            issueId: input.dependentIssueId,
-            taskId: input.dependentIssueId,
-            wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-            source: input.source,
-            resolvedBlockerIssueId: input.resolvedBlockerIssueId,
-            blockerIssueIds: input.blockerIssueIds,
-          },
         });
       };
 
@@ -10366,6 +10369,8 @@ export function issueRoutes(
             dependentIssueId: dependent.id,
             resolvedBlockerIssueId: issue.id,
             blockerIssueIds: dependent.blockerIssueIds,
+            cancelledBlockerIssueIds: dependent.cancelledBlockerIssueIds,
+            resolvedBlockerStatus: issue.status,
             source: "issue.blockers_resolved",
             mutation: "blocker_done",
           });
@@ -10393,6 +10398,10 @@ export function issueRoutes(
             dependentIssueId: issue.id,
             resolvedBlockerIssueId,
             blockerIssueIds: readiness.blockerIssueIds,
+            cancelledBlockerIssueIds: readiness.cancelledBlockerIssueIds ?? [],
+            resolvedBlockerStatus: (readiness.cancelledBlockerIssueIds ?? []).includes(resolvedBlockerIssueId)
+              ? "cancelled"
+              : "done",
             source: "issue.blockers_restored",
             mutation: "blocked_dependency_restored",
           });
@@ -10445,56 +10454,18 @@ export function issueRoutes(
         }
       }
 
-      // State-driven backstop for coalesced blocker-resolved wakes.
-      // The event-driven wake (becameDone above) fires when a *blocker* transitions
-      // to done, but that wake can be coalesced into an absorbing run that ends
-      // before it is observed, leaving the dependent silently stuck in `blocked`.
-      // When the *dependent itself* transitions into `blocked` while every blocker
-      // is already resolved, re-derive readiness from current state and re-arm the
-      // same wake. We keep the `blocked` status rather than refusing the transition
-      // so the caller's explicit intent is preserved and the workspace-finalize
-      // barrier still gates premature resumes — `readiness.isDependencyReady`
-      // already encodes that barrier, exactly as listWakeableBlockedDependents does.
-      const becameBlocked = existing.status !== "blocked" && issue.status === "blocked";
-      if (becameBlocked && issue.assigneeAgentId) {
-        try {
-          const readiness = await svc.getDependencyReadiness(issue.id);
-          if (readiness.isDependencyReady && readiness.blockerIssueIds.length > 0) {
-            const resolvedBlockerIssueId = readiness.blockerIssueIds[0];
-            // This backstop RE-ARMS a wake rather than reporting a fresh transition, so no blocker
-            // "just" terminated and the representative one is arbitrary. Its status must still be
-            // reported truthfully: readiness is now satisfied by `cancelled` blockers too, so a
-            // hand-built payload here would tell a dependent "your blockers resolved" while
-            // omitting `resolvedByCancellation` / `cancelledBlockerIssueIds` and never mentioning
-            // that the premise died. That is precisely the producer drift
-            // `buildBlockersResolvedWakeFields` was extracted to make impossible, and this third
-            // producer arrived from the other side of the merge.
-            const wake = buildBlockersResolvedWakeFields({
-              dependent: {
-                id: issue.id,
-                blockerIssueIds: readiness.blockerIssueIds,
-                cancelledBlockerIssueIds: readiness.cancelledBlockerIssueIds,
-              },
-              resolvedBlockerIssueId,
-              resolvedBlockerStatus: readiness.cancelledBlockerIssueIds.includes(resolvedBlockerIssueId)
-                ? "cancelled"
-                : "done",
-              source: "issue.blocked_transition_backstop",
-            });
-            addWakeup(issue.assigneeAgentId, {
-              source: "automation",
-              triggerDetail: "system",
-              ...wake,
-              payload: { ...wake.payload, backstop: "blocked_transition" },
-              contextSnapshot: { ...wake.contextSnapshot, backstop: "blocked_transition" },
-              requestedByActorType: actor.actorType,
-              requestedByActorId: actor.actorId,
-            });
-          }
-        } catch (err) {
-          logger.warn({ err, issueId: issue.id }, "failed to evaluate blocked-transition readiness backstop");
-        }
-      }
+      // The fork's PATCH-time backstop for coalesced blocker-resolved wakes used to live
+      // here: when a dependent transitioned into `blocked` while every blocker was already resolved,
+      // it re-derived readiness and re-armed the wake. Upstream's blocked-entry guard above
+      // (`Entering blocked requires unresolved blockers, a pending interaction/approval, or
+      // unblockDescriptor`) now rejects exactly that transition with 422, so this backstop became
+      // unreachable on the PATCH path. The coalesced case it protected against is covered by the
+      // state-driven sweep `reconcileResolvedDependencyWakeBackstop`, which scans blocked-and-ready
+      // issues however they got there and also routes through
+      // buildBlockersResolvedWakeFields, so the cancelled-premise fields are preserved. Keeping the
+      // PATCH backstop would also have raced upstream's `restoredBlockedReadyDependency` wake on the
+      // shared `${agentId}:${issueId}` addWakeup key, clobbering its idempotencyKey. Dropped
+      // deliberately.
 
       const becameTerminal =
         !["done", "cancelled"].includes(existing.status) && ["done", "cancelled"].includes(issue.status);
@@ -12195,6 +12166,8 @@ export function issueRoutes(
         dependentIssueId: string;
         resolvedBlockerIssueId: string;
         blockerIssueIds: string[];
+        cancelledBlockerIssueIds?: string[];
+        resolvedBlockerStatus: string;
       }) => {
         const idempotencyKey = buildIssueBlockersResolvedWakeIdempotencyKey({
           dependentIssueId: input.dependentIssueId,
@@ -12212,27 +12185,26 @@ export function issueRoutes(
             "failed to check existing dependency wake before issue comment wake",
           );
         }
+        // Same shared producer as the PATCH route, so a dependent with a cancelled premise still
+        // hears about it when the final blocker is closed via a comment.
+        const wake = buildBlockersResolvedWakeFields({
+          dependent: {
+            id: input.dependentIssueId,
+            blockerIssueIds: input.blockerIssueIds,
+            cancelledBlockerIssueIds: input.cancelledBlockerIssueIds,
+          },
+          resolvedBlockerIssueId: input.resolvedBlockerIssueId,
+          resolvedBlockerStatus: input.resolvedBlockerStatus,
+          source: "issue.blockers_resolved",
+        });
         addWakeup(input.agentId, {
           source: "automation",
           triggerDetail: "system",
-          reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-          payload: {
-            issueId: input.dependentIssueId,
-            resolvedBlockerIssueId: input.resolvedBlockerIssueId,
-            blockerIssueIds: input.blockerIssueIds,
-            mutation: "comment",
-          },
+          ...wake,
+          payload: { ...wake.payload, mutation: "comment" },
           idempotencyKey,
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
-          contextSnapshot: {
-            issueId: input.dependentIssueId,
-            taskId: input.dependentIssueId,
-            wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-            source: "issue.blockers_resolved",
-            resolvedBlockerIssueId: input.resolvedBlockerIssueId,
-            blockerIssueIds: input.blockerIssueIds,
-          },
         });
       };
 
@@ -12367,6 +12339,8 @@ export function issueRoutes(
             dependentIssueId: dependent.id,
             resolvedBlockerIssueId: currentIssue.id,
             blockerIssueIds: dependent.blockerIssueIds,
+            cancelledBlockerIssueIds: dependent.cancelledBlockerIssueIds,
+            resolvedBlockerStatus: currentIssue.status,
           });
         }
       }

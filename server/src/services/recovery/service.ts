@@ -44,18 +44,17 @@ import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { ACTIVE_RECOVERY_ACTION_STATUSES, issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
-import { externalWaitFromDescription, issueService } from "../issues.js";
-import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
+import { TERMINAL_HEARTBEAT_RUN_STATUSES, externalWaitFromDescription, issueService } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../issue-execution-policy.js";
 import {
-  ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
   buildIssueBlockersResolvedWakeIdempotencyKey,
   findExistingIssueBlockersResolvedWakeForAnyKey,
 } from "../issue-dependency-wakeups.js";
+import { buildBlockersResolvedWakeFields } from "../blockers-resolved-wake.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { getRunLogStore } from "../run-log-store.js";
 import {
@@ -6251,27 +6250,31 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         try {
+          // Route through the shared producer so the cancelled-premise fields survive here too.
+          // As the state-driven backstop for coalesced wakes, this sweep is now the path that
+          // reaches a dependent whose premise was cancelled mid-run, so omitting
+          // resolvedByCancellation / cancelledBlockerIssueIds here re-opens the gap
+          // even after the route producers are fixed.
+          const wakeFields = buildBlockersResolvedWakeFields({
+            dependent: {
+              id: candidate.id,
+              blockerIssueIds: readiness.blockerIssueIds,
+              cancelledBlockerIssueIds: readiness.cancelledBlockerIssueIds,
+            },
+            resolvedBlockerIssueId,
+            resolvedBlockerStatus: (readiness.cancelledBlockerIssueIds ?? []).includes(resolvedBlockerIssueId)
+              ? "cancelled"
+              : "done",
+            source,
+          });
           const wake = await deps.enqueueWakeup(agentId, {
             source: "automation",
             triggerDetail: "system",
-            reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-            payload: {
-              issueId: candidate.id,
-              resolvedBlockerIssueId,
-              blockerIssueIds: readiness.blockerIssueIds,
-              backstop: payloadBackstop,
-            },
+            ...wakeFields,
+            payload: { ...wakeFields.payload, backstop: payloadBackstop },
             idempotencyKey,
             requestedByActorType: "system",
             requestedByActorId,
-            contextSnapshot: {
-              issueId: candidate.id,
-              taskId: candidate.id,
-              wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-              source,
-              resolvedBlockerIssueId,
-              blockerIssueIds: readiness.blockerIssueIds,
-            },
           });
           if (!wake) {
             // enqueueWakeup returns null for normal deferred/skipped paths

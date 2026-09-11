@@ -431,96 +431,6 @@ describe("issue dependency wakeups in issue routes", () => {
     };
   }
 
-  it("re-arms the blockers-resolved wake when a dependent is set to blocked while its blocker is already done", async () => {
-    mockIssueService.getById.mockResolvedValue(blockedTransitionIssue("in_progress"));
-    mockIssueService.update.mockResolvedValue(blockedTransitionIssue("blocked"));
-    mockIssueService.getDependencyReadiness.mockResolvedValue(
-      readiness({ blockerIssueIds: ["issue-1"], isDependencyReady: true, allBlockersDone: true }),
-    );
-
-    const res = await request(await createApp()).patch("/api/issues/issue-2").send({ status: "blocked" });
-    expect(res.status).toBe(200);
-    await vi.waitFor(() => {
-      expect(mockWakeup).toHaveBeenCalledWith(
-        "agent-2",
-        expect.objectContaining({
-          reason: "issue_blockers_resolved",
-          payload: expect.objectContaining({
-            issueId: "issue-2",
-            resolvedBlockerIssueId: "issue-1",
-            backstop: "blocked_transition",
-          }),
-        }),
-      );
-    });
-  });
-
-  it("reports the cancellation when the backstop re-arms behind a cancelled blocker", async () => {
-    // Readiness is now satisfied by `cancelled` blockers too, which made this backstop
-    // newly reachable for a dependent whose premise died. It hand-built its payload, so it woke the
-    // owner with "your blockers resolved" and no cancellation fields at all. Both producers must
-    // speak through buildBlockersResolvedWakeFields or the owner is told the wrong thing.
-    mockIssueService.getById.mockResolvedValue(blockedTransitionIssue("in_progress"));
-    mockIssueService.update.mockResolvedValue(blockedTransitionIssue("blocked"));
-    mockIssueService.getDependencyReadiness.mockResolvedValue(
-      readiness({
-        blockerIssueIds: ["issue-1"],
-        cancelledBlockerIssueIds: ["issue-1"],
-        isDependencyReady: true,
-        allBlockersDone: true,
-      }),
-    );
-
-    const res = await request(await createApp()).patch("/api/issues/issue-2").send({ status: "blocked" });
-    expect(res.status).toBe(200);
-    await vi.waitFor(() => {
-      expect(mockWakeup).toHaveBeenCalledWith(
-        "agent-2",
-        expect.objectContaining({
-          reason: "issue_blockers_resolved",
-          payload: expect.objectContaining({
-            issueId: "issue-2",
-            resolvedBlockerIssueId: "issue-1",
-            resolvedBlockerStatus: "cancelled",
-            resolvedByCancellation: true,
-            cancelledBlockerIssueIds: ["issue-1"],
-            backstop: "blocked_transition",
-          }),
-          contextSnapshot: expect.objectContaining({
-            source: "issue.blocked_transition_backstop",
-            resolvedBlockerStatus: "cancelled",
-            cancelledBlockerIssueIds: ["issue-1"],
-            backstop: "blocked_transition",
-          }),
-        }),
-      );
-    });
-  });
-
-  it("reports a done blocker as done, not as a cancellation", async () => {
-    // Opposite pole, so a mutant that hardcodes "cancelled" (or always sets resolvedByCancellation)
-    // cannot survive the pair.
-    mockIssueService.getById.mockResolvedValue(blockedTransitionIssue("in_progress"));
-    mockIssueService.update.mockResolvedValue(blockedTransitionIssue("blocked"));
-    mockIssueService.getDependencyReadiness.mockResolvedValue(
-      readiness({ blockerIssueIds: ["issue-1"], isDependencyReady: true, allBlockersDone: true }),
-    );
-
-    const res = await request(await createApp()).patch("/api/issues/issue-2").send({ status: "blocked" });
-    expect(res.status).toBe(200);
-    await vi.waitFor(() => {
-      expect(mockWakeup).toHaveBeenCalledWith(
-        "agent-2",
-        expect.objectContaining({
-          payload: expect.objectContaining({ resolvedBlockerStatus: "done" }),
-        }),
-      );
-    });
-    const call = mockWakeup.mock.calls.find(([, wake]) => wake.reason === "issue_blockers_resolved");
-    expect(call?.[1].payload).not.toHaveProperty("resolvedByCancellation");
-    expect(call?.[1].payload).not.toHaveProperty("cancelledBlockerIssueIds");
-  });
-
   it("does not re-arm when a blocker is still unresolved", async () => {
     mockIssueService.getById.mockResolvedValue(blockedTransitionIssue("in_progress"));
     mockIssueService.update.mockResolvedValue(blockedTransitionIssue("blocked"));
@@ -533,20 +443,6 @@ describe("issue dependency wakeups in issue routes", () => {
         isDependencyReady: false,
       }),
     );
-
-    const res = await request(await createApp()).patch("/api/issues/issue-2").send({ status: "blocked" });
-    expect(res.status).toBe(200);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(mockWakeup).not.toHaveBeenCalledWith(
-      "agent-2",
-      expect.objectContaining({ reason: "issue_blockers_resolved" }),
-    );
-  });
-
-  it("does not re-arm when the blocked issue has no blocker relations", async () => {
-    mockIssueService.getById.mockResolvedValue(blockedTransitionIssue("in_progress"));
-    mockIssueService.update.mockResolvedValue(blockedTransitionIssue("blocked"));
-    mockIssueService.getDependencyReadiness.mockResolvedValue(readiness({ blockerIssueIds: [] }));
 
     const res = await request(await createApp()).patch("/api/issues/issue-2").send({ status: "blocked" });
     expect(res.status).toBe(200);
@@ -571,26 +467,6 @@ describe("issue dependency wakeups in issue routes", () => {
       "agent-2",
       expect.objectContaining({ reason: "issue_blockers_resolved" }),
     );
-  });
-
-  it("does not re-arm when the blocked issue has no assignee", async () => {
-    const unassigned = { ...blockedTransitionIssue("in_progress"), assigneeAgentId: null };
-    const unassignedBlocked = { ...blockedTransitionIssue("blocked"), assigneeAgentId: null };
-    mockIssueService.getById.mockResolvedValue(unassigned);
-    mockIssueService.update.mockResolvedValue(unassignedBlocked);
-    mockIssueService.getDependencyReadiness.mockResolvedValue(
-      readiness({ blockerIssueIds: ["issue-1"], isDependencyReady: true, allBlockersDone: true }),
-    );
-
-    const res = await request(await createApp()).patch("/api/issues/issue-2").send({ status: "blocked" });
-    expect(res.status).toBe(200);
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    // Assert across every call (including a null-agent call) so dropping the
-    // assignee guard — which would wake a null agent — is caught.
-    const firedBlockersResolved = mockWakeup.mock.calls.some(
-      ([, wakeup]) => (wakeup as { reason?: string } | undefined)?.reason === "issue_blockers_resolved",
-    );
-    expect(firedBlockersResolved).toBe(false);
   });
 
   it("wakes dependents when the final blocker is cancelled instead of completed", async () => {
