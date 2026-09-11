@@ -33,6 +33,7 @@ import {
   readPaperclipRuntimeSkillEntries,
   renderTemplate,
   renderPaperclipWakePrompt,
+  isPaperclipRecoveryWakePayload,
   resolvePaperclipDesiredSkillNames,
   stringifyPaperclipWakePayload,
   refreshPaperclipWorkspaceEnvForExecution,
@@ -241,8 +242,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   try {
     const envConfig = parseObject(config.env);
-    const hasExplicitApiKey =
-      typeof envConfig.PAPERCLIP_API_KEY === "string" && envConfig.PAPERCLIP_API_KEY.trim().length > 0;
     const env: Record<string, string> = { ...buildPaperclipEnv(agent) };
     env.PAPERCLIP_RUN_ID = runId;
     const wakeTaskId =
@@ -291,7 +290,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       executionTargetIsRemote,
       executionCwd: effectiveExecutionCwd,
     });
-    if (!hasExplicitApiKey && authToken) {
+    if (authToken) {
       env.PAPERCLIP_API_KEY = authToken;
     }
 
@@ -325,8 +324,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timeoutSec,
         installCommand: ctx.runtimeCommandSpec?.installCommand ?? null,
         detectCommand: ctx.runtimeCommandSpec?.detectCommand ?? command,
+        onProgress: (line) => onLog("stdout", line),
+        onRuntimeProgress: ctx.onRuntimeProgress,
       });
-      restoreRemoteWorkspace = () => preparedExecutionTargetRuntime.restoreWorkspace();
+      restoreRemoteWorkspace = () =>
+        preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line));
       effectiveExecutionCwd = preparedExecutionTargetRuntime.workspaceRemoteDir ?? effectiveExecutionCwd;
       refreshPaperclipWorkspaceEnvForExecution({
         env,
@@ -409,7 +411,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
     const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(sessionId) });
     const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
-    const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
+    const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
+      ? ""
+      : renderTemplate(promptTemplate, templateData);
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
     const paperclipEnvNote = renderPaperclipEnvNote(env);
     const apiAccessNote = renderApiAccessNote(env);
@@ -472,6 +476,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timeoutSec,
         graceSec,
         onSpawn,
+        onRuntimeProgress: ctx.onRuntimeProgress,
         onLog,
       });
       return {
@@ -536,10 +541,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timedOut: false,
         errorMessage: failed ? fallbackErrorMessage : null,
         usage: {
-          inputTokens: 0,
-          outputTokens: 0,
-          cachedInputTokens: 0,
+          inputTokens: attempt.parsed.inputTokens,
+          outputTokens: attempt.parsed.outputTokens,
+          cachedInputTokens: attempt.parsed.cachedInputTokens,
         },
+        // Each `--single` invocation reports usage for just that process, not
+        // a running total for the resumed session, so the server must not
+        // delta it against the previous run's usage.
+        usageBasis: "per_run",
         sessionId: resolvedSessionId,
         sessionParams: resolvedSessionParams,
         sessionDisplayId: resolvedSessionId,
@@ -547,7 +556,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         biller: billingType === "api" ? "xai" : "grok",
         model,
         billingType,
-        costUsd: null,
+        // Subscription billing (OAuth/SuperGrok) has no marginal dollar cost per run,
+        // so we only surface costUsd for metered API-key billing.
+        costUsd: billingType === "api" ? attempt.parsed.costUsd : null,
         resultJson: {
           stopReason: attempt.parsed.stopReason,
           requestId: attempt.parsed.requestId,

@@ -6,6 +6,8 @@ import { queryKeys } from "../lib/queryKeys";
 import { getRememberedInvitePath } from "../lib/invite-memory";
 import { Button } from "@/components/ui/button";
 import { AsciiArtAnimation } from "@/components/AsciiArtAnimation";
+import { PaperclipLoading } from "@/components/AnimatedPaperclipIcon";
+import { ThemeToggle } from "@/components/ThemeToggle";
 import { Sparkles } from "lucide-react";
 
 type AuthMode = "sign_in" | "sign_up";
@@ -52,7 +54,12 @@ export function AuthPage() {
     onSuccess: async () => {
       setError(null);
       await queryClient.invalidateQueries({ queryKey: queryKeys.auth.session });
-      await queryClient.invalidateQueries({ queryKey: queryKeys.companies.all });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.health });
+      // Reset rather than invalidate: the `["companies"]` entry is shared app-wide and
+      // is not account-scoped, so invalidating leaves the previous account's list
+      // readable (and any fetch for that session in flight) until the refetch lands.
+      // Sign-in can change accounts, so drop the list outright.
+      await queryClient.resetQueries({ queryKey: queryKeys.companies.all });
       navigate(nextPath, { replace: true });
     },
     onError: (err) => {
@@ -68,13 +75,16 @@ export function AuthPage() {
   if (isSessionLoading) {
     return (
       <div className="fixed inset-0 flex items-center justify-center">
-        <p className="text-sm text-muted-foreground">Loading…</p>
+        <PaperclipLoading className="min-h-0" />
       </div>
     );
   }
 
   return (
     <div className="fixed inset-0 flex bg-background">
+      <div className="absolute top-4 right-4 z-10">
+        <ThemeToggle />
+      </div>
       {/* Left half — form */}
       <div className="w-full md:w-1/2 flex flex-col overflow-y-auto">
         <div className="w-full max-w-md mx-auto my-auto px-8 py-12">

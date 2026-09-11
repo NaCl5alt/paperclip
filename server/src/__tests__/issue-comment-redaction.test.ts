@@ -5,6 +5,7 @@ import { sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   companies,
+  companyMemberships,
   createDb,
   issueComments,
   issueReferenceMentions,
@@ -46,6 +47,7 @@ describeEmbeddedPostgres("deleted issue comment redaction", () => {
     await db.delete(issueReferenceMentions);
     await db.delete(issueComments);
     await db.delete(issues);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -70,6 +72,14 @@ describeEmbeddedPostgres("deleted issue comment redaction", () => {
       status: "todo",
       priority: "medium",
     });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "board-user-1",
+      status: "active",
+      membershipRole: "owner",
+      updatedAt: new Date(),
+    });
     return { companyId, issueId };
   }
 
@@ -83,7 +93,9 @@ describeEmbeddedPostgres("deleted issue comment redaction", () => {
         companyIds: [companyId],
         memberships: [{ companyId, membershipRole: "owner", status: "active" }],
         source: "cloud_tenant",
-        isInstanceAdmin: true,
+        // cloud_tenant actors are never instance admins — reads flow through
+        // the active company membership seeded in seedIssue().
+        isInstanceAdmin: false,
       };
       next();
     });
@@ -173,6 +185,27 @@ describeEmbeddedPostgres("deleted issue comment redaction", () => {
     ]);
     expect(JSON.stringify(wakePayload)).not.toContain("secret deleted body");
     expect(JSON.stringify(wakePayload)).not.toContain("secret metadata");
+  });
+
+  it("serializes comment timestamps as ISO strings through the redacted comments route (PAP-16607)", async () => {
+    const { companyId, issueId } = await seedIssue();
+    const commentId = randomUUID();
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId,
+      authorUserId: "board-user-1",
+      body: "ordinary comment",
+    });
+
+    const response = await request(createApp(companyId)).get(`/api/issues/${issueId}/comments`);
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body).toHaveLength(1);
+    // Secret redaction must not collapse Date instances to `{}` — the chat
+    // renderer needs parseable timestamps.
+    expect(typeof response.body[0].createdAt).toBe("string");
+    expect(Number.isNaN(new Date(response.body[0].createdAt).getTime())).toBe(false);
+    expect(typeof response.body[0].updatedAt).toBe("string");
   });
 
   it("excludes deleted comment bodies from company search", async () => {
