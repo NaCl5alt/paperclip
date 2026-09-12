@@ -169,28 +169,55 @@ export function decideBlockedResumeBatch(input: {
 }
 
 /**
+ * Strips the two path-shaped forms that make a string parse as a deliberate issue reference:
+ * the `issue://` scheme and a `…/issues/<id>` path segment. Both collapse to the bare
+ * identifier. The leading boundary keeps words that merely end in "issues" (`subissues/x`)
+ * untouched, and the loop handles a path that carries more than one `issues` segment.
+ */
+function stripIssueReferencePaths(text: string): string {
+  let out = text.replace(/\bissue:\/\/:?/gi, "");
+  for (let i = 0; i < 8; i += 1) {
+    const next = out.replace(/(^|[^\w-])(?:[^\s/]*\/)*issues\/([^\s/]*)/i, "$1$2");
+    if (next === out) break;
+    out = next;
+  }
+  return out;
+}
+
+/**
  * Flattens text quoted from another issue into one inert inline code span for a system comment.
- * The quote is reference material, not an instruction. Wrapping in a code span neutralises all
- * renderer-level link creation: markdown-link syntax, autolink literals (bare URLs / www. / email),
- * issue-reference tokens (XYZ-NNN), and wikilinks ([[…]]) are all inert inside a code span.
- * Block structure (headings, lists) is already broken by the newline→space collapse.
+ * The quote is reference material, not an instruction.
  *
- * Backtick escaping follows CommonMark §6.1: choose a fence of N backticks where N > the longest
- * run of backticks in the flattened text, then pad with a space when the content starts or ends
- * with a backtick so the delimiter is unambiguous.
+ * A code span alone is not enough. remark-gfm autolink literals and the wikilink transform do
+ * skip code spans, but `remarkLinkIssueReferences` deliberately links a code span whose value
+ * parses as an issue reference (`ui/src/lib/issue-reference.ts` — `rewriteMarkdownTree`), and its
+ * path branch fires on *any* value carrying a `…/issues/<id>` segment, multi-word quotes included.
+ * Two further steps close that route:
+ *
+ * - `stripIssueReferencePaths` removes the `issue://` and `…/issues/<id>` hooks that branch scans
+ *   for, leaving the bare identifier;
+ * - the flattened text is wrapped in quotation marks, so the span value is never *only* an
+ *   `IDENT-123` token and the bare-identifier branch cannot match either.
+ *
+ * Block structure (headings, lists) is already broken by the newline→space collapse. Empty input
+ * returns "" so callers keep their own placeholder (e.g. `"(untitled)"`) rather than rendering an
+ * empty span.
+ *
+ * Backtick fencing follows CommonMark §6.1: a fence one longer than the longest run of backticks
+ * in the content. No space padding is needed because the content always starts and ends with a
+ * quotation mark.
  */
 export function quoteAsReference(text: string, maxChars = 280): string {
-  const flat = text
-    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+  const flat = stripIssueReferencePaths(text.replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1"))
     .replace(/\s+/g, " ")
     .trim();
-  const content = flat.length <= maxChars ? flat : `${flat.slice(0, maxChars).trimEnd()}…`;
+  if (!flat) return "";
+  const body = flat.length <= maxChars ? flat : `${flat.slice(0, maxChars).trimEnd()}…`;
+  const content = `"${body}"`;
   // Pick a backtick fence one longer than the longest run inside the content.
   const maxRun = (content.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
   const fence = "`".repeat(maxRun + 1);
-  // Pad with a space when content starts or ends with a backtick (CommonMark §6.1).
-  const pad = content.startsWith("`") || content.endsWith("`") ? " " : "";
-  return `${fence}${pad}${content}${pad}${fence}`;
+  return `${fence}${content}${fence}`;
 }
 
 export type BlockedResumeHistory = {

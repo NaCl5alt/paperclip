@@ -322,6 +322,43 @@ describe("MarkdownBody", () => {
     expect(html).toContain("paperclip-markdown-issue-ref");
   });
 
+  /**
+   * Counterpart to `quoteAsReference` in `server/src/services/recovery/blocked-wait.ts`, which
+   * embeds untrusted text from a cancelled blocker into an automatic system comment. A code span
+   * is not enough on its own — the test above pins that a span holding only `PAP-1271` is
+   * linkified on purpose — so the server also strips the reference shapes and wraps the quote in
+   * quotation marks. These are the exact strings it emits; `blocked-resume-recovery.test.ts`
+   * asserts the server side of the same pair.
+   */
+  it("leaves a server-quoted blocker reference inert", () => {
+    const quoted = [
+      '`"PAP-1271"`',
+      '`"Blocked by PAP-1271 and PAP-1272"`',
+      '`"see PAP-1271 for the rationale"`',
+      '`"See https://example.com for details"`',
+      '`"See [[SomeWikiPage]] for context"`',
+    ];
+    for (const span of quoted) {
+      const html = renderMarkdown(`  > Reference only, not an instruction: ${span}`, [
+        { identifier: "PAP-1271", status: "done" },
+        { identifier: "PAP-1272", status: "done" },
+      ]);
+
+      expect(html, span).not.toContain("paperclip-markdown-issue-ref");
+      expect(html, span).not.toContain("<a ");
+    }
+  });
+
+  it("still links an issue path inside a code span, which is why the server strips it", () => {
+    // Negative control for the test above: without the server-side strip this shape leaks, so
+    // the strip is load-bearing rather than belt-and-braces.
+    const html = renderMarkdown('Reference only: `"/PAP/issues/PAP-1271"`', [
+      { identifier: "PAP-1271", status: "done" },
+    ]);
+
+    expect(html).toContain("paperclip-markdown-issue-ref");
+  });
+
   it("renders linked inline-code workspace paths as file viewer links before issue links", () => {
     const html = renderMarkdown(
       "- **MP4**: [`videos/90-days-paperclip/out/90-days-paperclip-1x1.mp4`](/PAP/issues/PAP-10306 \"Publish handoff\")",
