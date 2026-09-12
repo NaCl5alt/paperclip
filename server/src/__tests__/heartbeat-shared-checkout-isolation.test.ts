@@ -99,7 +99,7 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
    * parent (`.paperclip`) makes `fs.mkdir(.paperclip/worktrees)` throw ENOTDIR
    * for every candidate, while the directory stays a real git repo — so
    * `isCheckoutGitManaged` is true, fail-open is not taken, and the contender
-   * fails closed. This preserves the VANA-4067 B-I2 coverage (the isolation
+   * fails closed. This preserves the B-I2 coverage (the isolation
    * failure is recorded under its own error code, not `adapter_failed`) now that
    * the non-git fixture fails open instead.
    */
@@ -115,7 +115,7 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
    * This is production's dominant shape (agent home directories, plain project
    * workspaces). The directory is still a shared checkout (`project_primary`, so
    * a claim is taken on it), but there is no repo to cut an isolation worktree
-   * from. VANA-4071: contention here must **fail open** (share the directory)
+   * from. contention here must **fail open** (share the directory)
    * rather than drop the run — there is no concurrent-git failure mode to
    * protect against. Before the fix, `resolveExecutionWorktreeTarget` threw for
    * every candidate and the contender was failed, which is what regressed the
@@ -138,6 +138,10 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       status: "active",
       requireBoardApprovalForNewAgents: false,
+      // The dispatch seed refuses to queue a run it cannot attribute to a user
+      // (heartbeat.ts resolveResponsibleUserIdForRunSeed). This fixture creates no
+      // company memberships, so the company default is the only resolution path.
+      defaultResponsibleUserId: "responsible-user",
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -514,7 +518,7 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
     expect(cwds.every((cwd) => typeof cwd === "string" && cwd.length > 0)).toBe(true);
     expect(new Set(cwds).size).toBe(3);
   }, 90_000);
-  // ── non-git fail-open path (VANA-4071) ──────────────────────────────────────
+  // ── non-git fail-open path ──────────────────────────────────────
   //
   // The 2026-09-07 rollout of git-only fail-close regressed because the fixtures
   // above are all `makeGitCheckout()`: in that world the isolation worktree can
@@ -526,7 +530,7 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
   // The invariant this pins: a non-git shared checkout, when contended, is
   // *shared* (fail-open) and the run completes. There is nothing to isolate and
   // no concurrent-git index to corrupt, so sharing is the correct — and
-  // pre-VANA-4055 — behaviour.
+  // pre-— behaviour.
 
   it("shares a contended non-git checkout instead of dropping the run (fail-open)", async () => {
     const workspaceRoot = await makeNonGitCheckout();
@@ -557,7 +561,7 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
     const finishedHolder = await waitForRun(heartbeat, holderRun!.id);
 
     // Fail-open: the run runs to completion on the shared directory rather than
-    // being dropped. This is the exact regression VANA-4071 fixes.
+    // being dropped. This is the exact regression fixes.
     expect(finishedContender?.status).toBe("succeeded");
     expect(finishedHolder?.status).toBe("succeeded");
     // It must NOT be recorded as an isolation failure — that error code is what
@@ -582,7 +586,7 @@ describeEmbeddedPostgres("heartbeat shared checkout single-writer enforcement", 
     expect(stillActive).toHaveLength(0);
   }, 60_000);
 
-  // ── git fail-close path (VANA-4067 B-I2, preserved under VANA-4071) ─────────
+  // ── git fail-close path ─────────
   //
   // Fail-open only applies to non-git checkouts. A *git* checkout whose
   // isolation is genuinely impossible must still fail closed, and the run record

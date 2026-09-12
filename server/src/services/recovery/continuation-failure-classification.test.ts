@@ -10,10 +10,12 @@ function continuationRun(errorCode: string | null) {
     errorCode,
     contextSnapshot: null,
     livenessState: null,
+    startedAt: null,
+    createdAt: new Date(),
   };
 }
 
-describe("classifyContinuationFailure — deterministic credential failures (VANA-4048)", () => {
+describe("classifyContinuationFailure — deterministic credential failures", () => {
   it.each(["claude_auth_required", "acpx_auth_required", "gemini_auth_required"])(
     "treats %s as non-retryable so the issue escalates instead of retrying",
     (errorCode) => {
@@ -32,7 +34,7 @@ describe("classifyContinuationFailure — deterministic credential failures (VAN
   });
 });
 
-describe("classifyContinuationFailure — fail-closed shared checkout (VANA-4055 / VANA-4067)", () => {
+describe("classifyContinuationFailure — fail-closed shared checkout", () => {
   const code = "shared_workspace_isolation_failed";
 
   it("retries a contended checkout with the transient-infra budget", () => {

@@ -137,7 +137,7 @@ describe("IssueAttachmentsSection", () => {
     });
     await flushReact();
 
-    // Collapsed by default: no eager fetch and no preview body (VANA-517 fix).
+    // Collapsed by default: no eager fetch and no preview body.
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(container.querySelector('[data-testid="markdown-body"]')).toBeNull();
 
@@ -164,7 +164,7 @@ describe("IssueAttachmentsSection", () => {
     });
   });
 
-  it("does not eagerly fetch previews for many markdown attachments (VANA-517)", async () => {
+  it("does not eagerly fetch previews for many markdown attachments", async () => {
     const attachments = Array.from({ length: 20 }, (_, index) =>
       makeAttachment({
         id: `md-${index}`,
@@ -249,6 +249,40 @@ describe("IssueAttachmentsSection", () => {
     expect(video?.getAttribute("src")).toBe("/api/attachments/video-attachment/content");
     expect(video?.getAttribute("controls")).not.toBeNull();
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("lets video attachments open the shared media gallery", async () => {
+    const attachment = makeAttachment({
+      id: "video-attachment",
+      originalFilename: "demo.webm",
+      contentType: "video/webm",
+      contentPath: "/api/attachments/video-attachment/content",
+    });
+    const onImageClick = vi.fn();
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueAttachmentsSection
+            attachments={[attachment]}
+            onDelete={vi.fn()}
+            onImageClick={onImageClick}
+          />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    const browse = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Browse demo.webm in gallery"]',
+    );
+    expect(browse).toBeTruthy();
+
+    await act(async () => {
+      browse?.click();
+    });
+
+    expect(onImageClick).toHaveBeenCalledWith(attachment);
   });
 
   it("treats mp4 filenames as playable videos even with a generic binary content type", async () => {
@@ -336,5 +370,29 @@ describe("IssueAttachmentsSection", () => {
     expect(container.querySelector('a[aria-label="Download report.pdf"]')?.getAttribute("href")).toBe(
       "/api/attachments/pdf-attachment/content?download=1",
     );
+  });
+
+  it("can render read-only attachments without destructive controls", async () => {
+    const attachment = makeAttachment({
+      id: "read-only-pdf",
+      originalFilename: "stored-report.pdf",
+      contentType: "application/pdf",
+      contentPath: "/api/attachments/read-only-pdf/content",
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <IssueAttachmentsSection attachments={[attachment]} onImageClick={vi.fn()} />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    expect(container.textContent).toContain("stored-report.pdf");
+    expect(container.querySelector('a[aria-label="Open stored-report.pdf"]')).toBeTruthy();
+    expect(container.querySelector('a[aria-label="Download stored-report.pdf"]')).toBeTruthy();
+    expect(container.querySelector('button[title="Delete attachment"]')).toBeNull();
+    expect(container.textContent).not.toContain("Delete this attachment?");
   });
 });

@@ -3,18 +3,28 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
   activityLog,
+  agentConfigRevisions,
   agents,
   agentWakeupRequests,
+  builtInManagedResources,
   companies,
+  companySkillVersions,
+  companySkills,
+  companyMemberships,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  principalPermissionGrants,
+  routines,
+  routineTriggers,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { companyService } from "../services/companies.js";
+import { readBuiltInAgentMarker } from "../services/built-in-agent-metadata.js";
+import { builtInAgentService, reconcileBuiltInAgentsOnStartup } from "../services/built-in-agents.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -35,11 +45,19 @@ describeEmbeddedPostgres("companyService", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(routineTriggers);
+    await db.delete(routines);
+    await db.delete(builtInManagedResources);
+    await db.delete(companySkillVersions);
+    await db.delete(companySkills);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    await db.delete(agentConfigRevisions);
     await db.delete(activityLog);
     await db.delete(agents);
+    await db.delete(principalPermissionGrants);
+    await db.delete(companyMemberships);
     await db.delete(companies);
   });
 
@@ -61,6 +79,58 @@ describeEmbeddedPostgres("companyService", () => {
 
     const rows = await db.select({ issuePrefix: companies.issuePrefix }).from(companies);
     expect(rows.map((row) => row.issuePrefix).sort()).toEqual(["ARO", "AROA"]);
+  });
+
+  it("does not auto-provision bundled built-in agents for a freshly created company", async () => {
+    const created = await companyService(db).create({
+      name: "Fresh Company",
+    });
+
+    // A new company starts clean: the Reflection Coach and Summarizer are
+    // opt-in, not seeded by default for a new user.
+    const agentRows = await db.select().from(agents).where(eq(agents.companyId, created.id));
+    expect(agentRows.filter((row) => readBuiltInAgentMarker(row.metadata))).toHaveLength(0);
+
+    // Startup reconcile leaves a fresh company untouched — nothing is created.
+    await reconcileBuiltInAgentsOnStartup(db);
+    const afterReconcileRows = await db.select().from(agents).where(eq(agents.companyId, created.id));
+    expect(afterReconcileRows.filter((row) => readBuiltInAgentMarker(row.metadata))).toHaveLength(0);
+
+    // The Reflection Coach remains available to enable on demand, and enabling
+    // it materializes its bundled skill + paused routine.
+    const enabled = await builtInAgentService(db).ensure(created.id, "reflection-coach");
+    expect(enabled.agent).toMatchObject({
+      name: "Reflection Coach",
+      status: "paused",
+      budgetMonthlyCents: 0,
+    });
+
+    const [skill] = await db
+      .select()
+      .from(companySkills)
+      .where(and(
+        eq(companySkills.companyId, created.id),
+        eq(companySkills.key, "paperclipai/bundled/paperclip-operations/reflection-coach"),
+      ));
+    expect(skill).toMatchObject({
+      slug: "reflection-coach",
+    });
+
+    const [routine] = await db
+      .select()
+      .from(routines)
+      .where(and(eq(routines.companyId, created.id), eq(routines.assigneeAgentId, enabled.agentId!)));
+    expect(routine).toMatchObject({
+      status: "paused",
+      assigneeAgentId: enabled.agentId,
+      originKind: "built_in_agent_bundle",
+      originId: "reflection-coach:recent-agent-reflection",
+    });
+    const [trigger] = await db.select().from(routineTriggers).where(eq(routineTriggers.routineId, routine!.id));
+    expect(trigger).toMatchObject({
+      kind: "schedule",
+      enabled: false,
+    });
   });
 
   it("archives companies by pausing runnable agents and cancelling active runs", async () => {
@@ -799,4 +869,12 @@ describeEmbeddedPostgres("companyService", () => {
       details: { agentsPaused: 1, runsCancelled: 1 },
     });
   });
+
+  it("getById returns null (not a query error) for non-UUID refs", async () => {
+    const svc = companyService(db);
+    await expect(svc.getById("tumbly-haus-creative")).resolves.toBeNull();
+    await expect(svc.getById("not-a-uuid")).resolves.toBeNull();
+    await expect(svc.getById("")).resolves.toBeNull();
+  });
+
 });

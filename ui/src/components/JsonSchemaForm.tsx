@@ -7,7 +7,7 @@ import {
   Plus,
   Trash2,
 } from "lucide-react";
-import { isUuidLike } from "@paperclipai/shared";
+import { isUuidLike, type EnvSecretRefBinding } from "@paperclipai/shared";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -47,6 +47,7 @@ export interface JsonSchemaNode {
   description?: string;
   default?: unknown;
   enum?: unknown[];
+  examples?: unknown[];
   const?: unknown;
   format?: string;
 
@@ -106,6 +107,8 @@ export interface JsonSchemaFormProps {
   disabled?: boolean;
   /** Additional CSS class for the root container. */
   className?: string;
+  /** Label for the disclosure that hides advanced fields. Defaults to "Advanced options". */
+  advancedLabel?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -155,7 +158,7 @@ export function getDefaultForSchema(schema: JsonSchemaNode): unknown {
     case "boolean":
       return false;
     case "enum":
-      return schema.enum?.[0] ?? "";
+      return undefined;
     case "array":
       return [];
     case "object": {
@@ -187,6 +190,13 @@ export function validateField(
 
   // Skip further validation if empty and not required
   if (value === undefined || value === null || value === "") return null;
+
+  if (type === "secret-ref" && isSecretRefBinding(value)) {
+    return null;
+  }
+  if (type === "secret-ref" && typeof value === "object") {
+    return "Invalid secret reference";
+  }
 
   if (type === "string" || type === "secret-ref") {
     const str = String(value);
@@ -362,12 +372,12 @@ const FieldWrapper = React.memo(({
       </div>
       {children}
       {description && (
-        <p className="text-[12px] text-muted-foreground leading-relaxed">
+        <p className="text-xs text-muted-foreground leading-relaxed">
           {description}
         </p>
       )}
       {error && (
-        <p className="text-[12px] font-medium text-destructive">{error}</p>
+        <p className="text-xs font-medium text-destructive">{error}</p>
       )}
     </div>
   );
@@ -439,6 +449,23 @@ const BooleanField = React.memo(({
 BooleanField.displayName = "BooleanField";
 
 /**
+ * Sentinel value for the "not configured" row of an optional enum select.
+ * Radix `Select` forbids an empty-string item value, so we map the unset state
+ * onto this sentinel and translate it back to `undefined` on change.
+ */
+const ENUM_UNSET_VALUE = "__paperclip_unset__";
+
+function isSecretRefBinding(value: unknown): value is EnvSecretRefBinding {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as { type?: unknown }).type === "secret_ref" &&
+    typeof (value as { secretId?: unknown }).secretId === "string"
+  );
+}
+
+/**
  * Specialized field for enum (select) values.
  */
 const EnumField = React.memo(({
@@ -459,32 +486,63 @@ const EnumField = React.memo(({
   description?: string;
   error?: string;
   options: unknown[];
-}) => (
-  <FieldWrapper
-    label={label}
-    description={description}
-    required={isRequired}
-    error={error}
-    disabled={disabled}
-  >
-    <Select
-      value={String(value ?? "")}
-      onValueChange={onChange}
+}) => {
+  // Optional enums get a leading blank row so the user can express "not
+  // configured"; it is also the selected row when no value is set.
+  const showUnsetOption = !isRequired;
+  // When every option is numeric, coerce the selected string back to a number
+  // so the payload keeps the schema's integer/number type — a stringified "2"
+  // would otherwise fail server-side integer validation.
+  const numericOptions =
+    options.length > 0 && options.every((option) => typeof option === "number");
+
+  const isUnset = value === undefined || value === null || value === "";
+  const selectValue = isUnset
+    ? showUnsetOption
+      ? ENUM_UNSET_VALUE
+      : ""
+    : String(value);
+
+  const handleChange = (next: string) => {
+    if (next === ENUM_UNSET_VALUE) {
+      onChange(undefined);
+      return;
+    }
+    onChange(numericOptions ? Number(next) : next);
+  };
+
+  return (
+    <FieldWrapper
+      label={label}
+      description={description}
+      required={isRequired}
+      error={error}
       disabled={disabled}
     >
-      <SelectTrigger className="w-full">
-        <SelectValue placeholder="Select an option" />
-      </SelectTrigger>
-      <SelectContent>
-        {options.map((option) => (
-          <SelectItem key={String(option)} value={String(option)}>
-            {String(option)}
-          </SelectItem>
-        ))}
-      </SelectContent>
-    </Select>
-  </FieldWrapper>
-));
+      <Select
+        value={selectValue}
+        onValueChange={handleChange}
+        disabled={disabled}
+      >
+        <SelectTrigger className="w-full">
+          <SelectValue placeholder="Select an option" />
+        </SelectTrigger>
+        <SelectContent>
+          {showUnsetOption && (
+            <SelectItem value={ENUM_UNSET_VALUE} textValue="None">
+              <span className="text-muted-foreground">None</span>
+            </SelectItem>
+          )}
+          {options.map((option) => (
+            <SelectItem key={String(option)} value={String(option)}>
+              {String(option)}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </FieldWrapper>
+  );
+});
 
 EnumField.displayName = "EnumField";
 
@@ -518,9 +576,11 @@ const SecretField = React.memo(({
   const [isVisible, setIsVisible] = useState(false);
   const isTextArea = maxLength != null && maxLength > TEXTAREA_THRESHOLD;
 
+  const secretRefValue = isSecretRefBinding(value) ? value : null;
   const stringValue = typeof value === "string" ? value : "";
   const trimmed = stringValue.trim();
-  const isBoundToSecret = trimmed.length > 0 && isUuidLike(trimmed);
+  const legacySecretId = trimmed.length > 0 && isUuidLike(trimmed) ? trimmed : null;
+  const isBoundToSecret = secretRefValue !== null || legacySecretId !== null;
   const hasRawValue = stringValue.length > 0 && !isBoundToSecret;
 
   const [showRawInput, setShowRawInput] = useState(hasRawValue);
@@ -533,14 +593,20 @@ const SecretField = React.memo(({
     if (hasRawValue) setShowRawInput(true);
   }, [hasRawValue]);
 
-  const bindingValue: SecretBindingValue | null = isBoundToSecret
-    ? { secretId: trimmed }
-    : null;
+  const bindingValue: SecretBindingValue | null = secretRefValue
+    ? { secretId: secretRefValue.secretId, version: secretRefValue.version }
+    : legacySecretId
+      ? { secretId: legacySecretId }
+      : null;
 
   const handlePickerChange = useCallback(
     (next: SecretBindingValue | null) => {
       if (next) {
-        onChange(next.secretId);
+        onChange({
+          type: "secret_ref",
+          secretId: next.secretId,
+          version: next.version ?? "latest",
+        });
         setShowRawInput(false);
         setIsVisible(false);
       } else {
@@ -558,7 +624,7 @@ const SecretField = React.memo(({
           onChange={(e) => onChange(e.target.value)}
           placeholder={String(defaultValue ?? "")}
           disabled={disabled}
-          className="min-h-[140px] pr-10 font-mono text-xs"
+          className="min-h-(--sz-140px) pr-10 font-mono text-xs"
           aria-invalid={!!error}
         />
       ) : (
@@ -575,7 +641,7 @@ const SecretField = React.memo(({
           readOnly
           placeholder={String(defaultValue ?? "")}
           disabled={disabled}
-          className="min-h-[140px] pr-10 font-mono text-xs italic text-muted-foreground"
+          className="min-h-(--sz-140px) pr-10 font-mono text-xs italic text-muted-foreground"
           aria-invalid={!!error}
         />
       )}
@@ -656,7 +722,7 @@ const SecretField = React.memo(({
               {!hasRawValue ? (
                 <button
                   type="button"
-                  className="text-[11px] text-muted-foreground hover:text-foreground"
+                  className="text-(length:--text-micro) text-muted-foreground hover:text-foreground"
                   onClick={() => {
                     setShowRawInput(false);
                     setIsVisible(false);
@@ -670,7 +736,7 @@ const SecretField = React.memo(({
           ) : (
             <button
               type="button"
-              className="text-[11px] text-muted-foreground hover:text-foreground"
+              className="text-(length:--text-micro) text-muted-foreground hover:text-foreground"
               onClick={() => setShowRawInput(true)}
               disabled={disabled}
             >
@@ -689,6 +755,7 @@ SecretField.displayName = "SecretField";
  * Specialized field for numeric (number/integer) values.
  */
 const NumberField = React.memo(({
+  id,
   value,
   onChange,
   disabled,
@@ -698,7 +765,11 @@ const NumberField = React.memo(({
   error,
   defaultValue,
   type,
+  minimum,
+  maximum,
+  suggestions,
 }: {
+  id: string;
   value: unknown;
   onChange: (val: unknown) => void;
   disabled: boolean;
@@ -708,28 +779,47 @@ const NumberField = React.memo(({
   error?: string;
   defaultValue?: unknown;
   type: "number" | "integer";
-}) => (
-  <FieldWrapper
-    label={label}
-    description={description}
-    required={isRequired}
-    error={error}
-    disabled={disabled}
-  >
-    <Input
-      type="number"
-      step={type === "integer" ? "1" : "any"}
-      value={value !== undefined ? String(value) : ""}
-      onChange={(e) => {
-        const val = e.target.value;
-        onChange(val === "" ? undefined : Number(val));
-      }}
-      placeholder={String(defaultValue ?? "")}
+  minimum?: number;
+  maximum?: number;
+  suggestions?: unknown[];
+}) => {
+  const hasSuggestions = Array.isArray(suggestions) && suggestions.length > 0;
+  // Sanitize the path-based id so it is a valid CSS/HTML identifier (paths can contain "/").
+  const listId = hasSuggestions ? `${id.replace(/[^a-zA-Z0-9_-]/g, "-")}-suggestions` : undefined;
+  return (
+    <FieldWrapper
+      label={label}
+      description={description}
+      required={isRequired}
+      error={error}
       disabled={disabled}
-      aria-invalid={!!error}
-    />
-  </FieldWrapper>
-));
+    >
+      <Input
+        type="number"
+        step={type === "integer" ? "1" : "any"}
+        min={minimum}
+        max={maximum}
+        list={listId}
+        value={value !== undefined ? String(value) : ""}
+        onChange={(e) => {
+          const val = e.target.value;
+          const trimmed = val.trim();
+          onChange(trimmed === "" ? undefined : Number(trimmed));
+        }}
+        placeholder={String(defaultValue ?? "")}
+        disabled={disabled}
+        aria-invalid={!!error}
+      />
+      {listId ? (
+        <datalist id={listId}>
+          {suggestions!.map((suggestion) => (
+            <option key={String(suggestion)} value={String(suggestion)} />
+          ))}
+        </datalist>
+      ) : null}
+    </FieldWrapper>
+  );
+});
 
 NumberField.displayName = "NumberField";
 
@@ -774,7 +864,7 @@ const StringField = React.memo(({
           onChange={(e) => onChange(e.target.value)}
           placeholder={String(defaultValue ?? "")}
           disabled={disabled}
-          className="min-h-[100px]"
+          className="min-h-(--sz-100px)"
           aria-invalid={!!error}
         />
       ) : (
@@ -1044,6 +1134,7 @@ const FormField = React.memo(({
     case "integer":
       return (
         <NumberField
+          id={path}
           value={value}
           onChange={onChange}
           disabled={isReadOnly}
@@ -1053,6 +1144,9 @@ const FormField = React.memo(({
           error={error}
           defaultValue={propSchema.default}
           type={type as "number" | "integer"}
+          minimum={typeof propSchema.minimum === "number" ? propSchema.minimum : undefined}
+          maximum={typeof propSchema.maximum === "number" ? propSchema.maximum : undefined}
+          suggestions={Array.isArray(propSchema.examples) ? propSchema.examples : undefined}
         />
       );
 
@@ -1119,6 +1213,7 @@ export function JsonSchemaForm({
   errors = {},
   disabled,
   className,
+  advancedLabel = "Advanced options",
 }: JsonSchemaFormProps) {
   const type = resolveType(schema);
 
@@ -1264,7 +1359,7 @@ export function JsonSchemaForm({
             onClick={() => setIsAdvancedOpen((open) => !open)}
             aria-expanded={isAdvancedOpen}
           >
-            <span className="text-sm font-medium">Advanced options</span>
+            <span className="text-sm font-medium">{advancedLabel}</span>
             {isAdvancedOpen ? (
               <ChevronDown className="h-4 w-4 text-muted-foreground" />
             ) : (

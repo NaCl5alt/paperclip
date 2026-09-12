@@ -66,9 +66,11 @@ describe("CompanySettingsNav", () => {
   it("maps company settings routes to the expected shared tab value", () => {
     expect(getCompanySettingsTab("/company/settings")).toBe("general");
     expect(getCompanySettingsTab("/PAP/company/settings")).toBe("general");
-    expect(getCompanySettingsTab("/company/settings/environments")).toBe("environments");
-    expect(getCompanySettingsTab("/PAP/company/settings/environments")).toBe("environments");
-    expect(getCompanySettingsTab("/company/settings/cloud-upstream")).toBe("cloud-upstream");
+    expect(getCompanySettingsTab("/company/settings/environments")).toBe("instance-environments");
+    expect(getCompanySettingsTab("/company/export")).toBe("export");
+    expect(getCompanySettingsTab("/PAP/company/export")).toBe("export");
+    expect(getCompanySettingsTab("/company/import")).toBe("import");
+    expect(getCompanySettingsTab("/PAP/company/import")).toBe("import");
     expect(getCompanySettingsTab("/company/settings/members")).toBe("members");
     expect(getCompanySettingsTab("/PAP/company/settings/members")).toBe("members");
     expect(getCompanySettingsTab("/company/settings/access")).toBe("members");
@@ -77,6 +79,7 @@ describe("CompanySettingsNav", () => {
     expect(getCompanySettingsTab("/PAP/company/settings/secrets")).toBe("secrets");
     expect(getCompanySettingsTab("/company/settings/instance/profile")).toBe("instance-profile");
     expect(getCompanySettingsTab("/PAP/company/settings/instance/general")).toBe("instance-general");
+    expect(getCompanySettingsTab("/company/settings/instance/environments")).toBe("instance-environments");
     expect(getCompanySettingsTab("/company/settings/instance/access")).toBe("instance-access");
     expect(getCompanySettingsTab("/company/settings/instance/heartbeats")).toBe("instance-heartbeats");
     expect(getCompanySettingsTab("/company/settings/instance/experimental")).toBe("instance-experimental");
@@ -98,13 +101,14 @@ describe("CompanySettingsNav", () => {
         value: "members",
         items: [
           { value: "general", label: "General" },
-          { value: "environments", label: "Environments" },
-          { value: "cloud-upstream", label: "Cloud upstream" },
+          { value: "export", label: "Export" },
+          { value: "import", label: "Import" },
           { value: "members", label: "Members" },
           { value: "invites", label: "Invites" },
           { value: "secrets", label: "Secrets" },
           { value: "instance-profile", label: "Instance profile" },
           { value: "instance-general", label: "Instance general" },
+          { value: "instance-environments", label: "Instance environments" },
           { value: "instance-access", label: "Instance access" },
           { value: "instance-heartbeats", label: "Instance heartbeats" },
           { value: "instance-experimental", label: "Instance experimental" },
