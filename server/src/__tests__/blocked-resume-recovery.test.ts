@@ -437,6 +437,14 @@ describe("resume hand-over comment", () => {
     expect(quoteAsReference("/a/issues/b/issues/c")).toBe('`"c"`');
     // two separate paths in one quote — one pass over the text is not enough
     expect(quoteAsReference("see /A/issues/A-1 and /B/issues/B-2")).toBe('`"see A-1 and B-2"`');
+    // ...and neither is any fixed number of passes: the quote can carry arbitrarily many
+    const many = Array.from({ length: 30 }, (_, i) => `/P/issues/P-${i}`).join(" ");
+    expect(quoteAsReference(many, 400)).toBe(
+      `\`"${Array.from({ length: 30 }, (_, i) => `P-${i}`).join(" ")}"\``,
+    );
+    // an http(s) URL is collapsed too: the renderer only refuses a URL that is the whole value,
+    // so `see https://example.test/issues/FOO-1 now` would otherwise link
+    expect(quoteAsReference("see https://example.test/issues/FOO-1 now")).toBe('`"see FOO-1 now"`');
     // the issue:// scheme is the third shape that branch accepts
     expect(quoteAsReference("please read issue://XYZ-1234 first")).toBe('`"please read XYZ-1234 first"`');
     // a word that merely ends in "issues" is left alone

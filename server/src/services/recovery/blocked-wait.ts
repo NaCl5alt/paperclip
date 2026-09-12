@@ -170,18 +170,20 @@ export function decideBlockedResumeBatch(input: {
 
 /**
  * Strips the two path-shaped forms that make a string parse as a deliberate issue reference:
- * the `issue://` scheme and a `…/issues/<id>` path segment. Both collapse to the bare
- * identifier. The leading boundary keeps words that merely end in "issues" (`subissues/x`)
- * untouched, and the loop handles a path that carries more than one `issues` segment.
+ * the `issue://` scheme and a `…/issues/<id>` path segment. Both collapse to the bare identifier.
+ *
+ * The leading boundary keeps words that merely end in "issues" (`subissues/x`) untouched, and the
+ * replacement is global because a quote can carry any number of paths — a bounded pass leaves the
+ * surplus behind and the renderer links it.
+ *
+ * An http(s) URL carrying `/issues/<id>` is collapsed too, and that is deliberate rather than
+ * over-reach: `parseIssuePathIdFromPath` only refuses a URL when the *whole* value is one, so
+ * `"see https://example.test/issues/FOO-1 now"` still links.
  */
 function stripIssueReferencePaths(text: string): string {
-  let out = text.replace(/\bissue:\/\/:?/gi, "");
-  for (let i = 0; i < 8; i += 1) {
-    const next = out.replace(/(^|[^\w-])(?:[^\s/]*\/)*issues\/([^\s/]*)/i, "$1$2");
-    if (next === out) break;
-    out = next;
-  }
-  return out;
+  return text
+    .replace(/\bissue:\/\/:?/gi, "")
+    .replace(/(^|[^\w-])(?:[^\s/]*\/)*issues\/([^\s/]*)/gi, "$1$2");
 }
 
 /**
