@@ -14,6 +14,31 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * A GET that did not resolve within {@link GET_TIMEOUT_MS}. Distinct from
+ * {@link ApiError} (a 4xx/5xx the server actually returned) and from a plain
+ * `AbortError` (a caller intentionally cancelled), so callers can tell "the
+ * request stalled" apart from "the request failed" and offer a retry.
+ *
+ * Only idempotent GETs carry this timeout: a stalled read is what
+ * pins the UI on an indefinite loading state. Mutations are deliberately left
+ * untimed here so a slow write is never auto-aborted-and-resent, which could
+ * duplicate a server-side effect that actually completed.
+ */
+export class TimeoutError extends Error {
+  readonly isTimeout = true;
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`Request timed out after ${timeoutMs}ms`);
+    this.name = "TimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/** Default read timeout. Long enough to clear congestion, short enough to escape an indefinite spinner. */
+export const GET_TIMEOUT_MS = 30_000;
+
 export interface RequestOptions {
   /** Abort signal wired through to `fetch` and coalescing (per-caller). */
   signal?: AbortSignal;
@@ -46,11 +71,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   applyObservabilityHeaders(headers);
 
-  const res = await fetch(`${BASE}${path}`, {
-    headers,
-    credentials: "include",
-    ...init,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      headers,
+      credentials: "include",
+      ...init,
+    });
+  } catch (err) {
+    // When a GET's timeout fires we abort its controller with a TimeoutError as
+    // the reason (see coalescedGet). fetch surfaces that as a generic AbortError,
+    // so recover the original reason to distinguish "timed out" from an
+    // intentional caller abort. Any other rejection (network error) is rethrown.
+    const reason = (init?.signal as AbortSignal | undefined)?.reason;
+    if (reason instanceof TimeoutError) throw reason;
+    throw err;
+  }
   if (!res.ok) {
     const errorBody = await res.json().catch(() => null);
     throw new ApiError(
@@ -85,14 +121,25 @@ function coalescedGet<T>(path: string, options?: RequestOptions): Promise<T> {
   let entry = inflightGets.get(path);
   if (!entry) {
     const controller = new AbortController();
+    // Bound the shared read so a stalled GET cannot pin callers forever. On
+    // expiry we abort with a TimeoutError reason, which request() re-surfaces so
+    // the caller can tell a timeout apart from a 4xx/5xx or an intentional abort.
+    const timeoutId = setTimeout(() => controller.abort(new TimeoutError(GET_TIMEOUT_MS)), GET_TIMEOUT_MS);
+    const clearTimer = () => clearTimeout(timeoutId);
+    // Also drop the timer when the shared request is aborted for any other
+    // reason (e.g. the last caller released), so a released GET never leaves a
+    // pending timer behind.
+    controller.signal.addEventListener("abort", clearTimer, { once: true });
     const promise = request<T>(path, { method: "GET", signal: controller.signal });
     const created: InflightGet = { promise, controller, refs: new Set() };
     // Clear the shared entry once settled so later calls issue a fresh request.
     promise.then(
       () => {
+        clearTimer();
         if (inflightGets.get(path) === created) inflightGets.delete(path);
       },
       () => {
+        clearTimer();
         if (inflightGets.get(path) === created) inflightGets.delete(path);
       },
     );

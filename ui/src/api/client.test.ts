@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { __inflightGetCount, api, detachInflightGet } from "./client";
+import { __inflightGetCount, api, detachInflightGet, GET_TIMEOUT_MS, TimeoutError } from "./client";
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -152,5 +152,68 @@ describe("per-caller abort semantics", () => {
       name: "AbortError",
     });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+// A fetch that only settles when its signal aborts — like the real fetch, which
+// rejects with a generic AbortError DOMException (the abort *reason* lives on the
+// signal, not on the rejection).
+function fetchRejectingOnAbort() {
+  return (_url: string, init: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+    });
+}
+
+describe("GET timeout", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("rejects a stalled GET with a TimeoutError once the timeout elapses", async () => {
+    fetchMock.mockImplementation(fetchRejectingOnAbort());
+    const p = api.get("/stalled");
+    const settled = expect(p).rejects.toMatchObject({ name: "TimeoutError", isTimeout: true });
+    await vi.advanceTimersByTimeAsync(GET_TIMEOUT_MS);
+    await settled;
+    await expect(p.catch((e) => e)).resolves.toBeInstanceOf(TimeoutError);
+    // Entry cleared so a retry issues a fresh fetch.
+    expect(__inflightGetCount()).toBe(0);
+  });
+
+  it("does not fire the timeout for a GET that resolves in time", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ value: "ok" }));
+    const result = await api.get("/fast");
+    expect(result).toEqual({ value: "ok" });
+    // Advancing past the deadline must not abort anything after the fact.
+    await vi.advanceTimersByTimeAsync(GET_TIMEOUT_MS * 2);
+    expect(__inflightGetCount()).toBe(0);
+  });
+
+  it("does not time out mutations, so a slow write is never auto-aborted and resent", async () => {
+    let aborted = false;
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      init.signal?.addEventListener("abort", () => {
+        aborted = true;
+      });
+      return new Promise<Response>(() => {});
+    });
+    const p = api.post("/write", { a: 1 });
+    let settled = false;
+    void p.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await vi.advanceTimersByTimeAsync(GET_TIMEOUT_MS * 2);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // no resend
+    expect(aborted).toBe(false); // never auto-aborted
+    expect(settled).toBe(false); // stays pending — caller decides, not a client timer
   });
 });

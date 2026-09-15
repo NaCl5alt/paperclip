@@ -1,7 +1,7 @@
 import { Navigate, Outlet, useLocation } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { accessApi } from "@/api/access";
-import { ApiError } from "@/api/client";
+import { ApiError, TimeoutError } from "@/api/client";
 import { authApi } from "@/api/auth";
 import { healthApi } from "@/api/health";
 import { queryKeys } from "@/lib/queryKeys";
@@ -78,14 +78,36 @@ export function CloudAccessGate() {
     return <PaperclipLoading />;
   }
 
-  if (healthQuery.error || boardAccessQuery.error) {
+  const loadError = healthQuery.error ?? boardAccessQuery.error;
+  if (loadError) {
+    const isTimeout = loadError instanceof TimeoutError;
+    const retry = () => {
+      if (healthQuery.error) void healthQuery.refetch();
+      if (boardAccessQuery.error) void boardAccessQuery.refetch();
+    };
+    const isRetrying = healthQuery.isFetching || boardAccessQuery.isFetching;
     return (
-      <div className="mx-auto max-w-xl py-10 text-sm text-destructive">
-        {healthQuery.error instanceof Error
-          ? healthQuery.error.message
-          : boardAccessQuery.error instanceof Error
-            ? boardAccessQuery.error.message
-            : "Failed to load app state"}
+      <div className="mx-auto max-w-xl py-10">
+        <Card className="block p-6">
+          <h1 className="text-lg font-semibold text-destructive">
+            {isTimeout ? "読み込みがタイムアウトしました" : "アプリの読み込みに失敗しました"}
+          </h1>
+          <p className="mt-2 text-sm text-muted-foreground">
+            {isTimeout
+              ? "サーバーの応答に時間がかかっています。混雑している可能性があります。再試行してください。"
+              : loadError instanceof Error
+                ? loadError.message
+                : "Failed to load app state"}
+          </p>
+          <button
+            type="button"
+            onClick={retry}
+            disabled={isRetrying}
+            className="mt-4 inline-flex items-center rounded-md border border-input bg-background px-4 py-2 text-sm font-medium hover:bg-accent disabled:pointer-events-none disabled:opacity-50"
+          >
+            {isRetrying ? "再試行中…" : "再試行"}
+          </button>
+        </Card>
       </div>
     );
   }
