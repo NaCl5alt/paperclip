@@ -304,6 +304,71 @@ describe("issue activity event routes", () => {
     });
   });
 
+  function issueUpdatedActivityDetails(): Record<string, unknown> {
+    const call = mockLogActivity.mock.calls.find(
+      ([, entry]) => (entry as { action?: string }).action === "issue.updated",
+    );
+    if (!call) throw new Error("no issue.updated activity was logged");
+    return (call[1] as { details: Record<string, unknown> }).details;
+  }
+
+  it("does not write details.status when a PATCH re-sends the unchanged status while editing blockers", async () => {
+    // Regression for `readBlockedResumeHistory` selects park rows by
+    // `details.status === "blocked"`, so a PATCH that carries an unchanged `status:"blocked"`
+    // (the common shape when adding a blocker, since `blockedByIssueIds` alone replaces blockers)
+    // must not fabricate a fresh park. The requested status is reported only when it changed.
+    const issue = { ...makeIssue(), status: "blocked" };
+    const blockerId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getRelationSummaries.mockResolvedValue({
+      blockedBy: [{ id: blockerId, identifier: "PAP-10", title: "Blocker", status: "todo", priority: "medium", assigneeAgentId: null, assigneeUserId: null }],
+      blocks: [],
+    });
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issueUpdateWithReceipt(issue, patch),
+      blockedByIssueIds: [blockerId],
+      // Row-lock receipt: only the blocker relation actually changed; status stayed "blocked".
+      changes: buildIssueChanges(issue, issue, {
+        blockedByIssueIds: { from: [], to: [blockerId] },
+      }),
+    }));
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "blocked", blockedByIssueIds: [blockerId] });
+
+    expect(res.status).toBe(200);
+    const details = issueUpdatedActivityDetails();
+    // The poisoned field must be absent, so the recovery reader does not see a new park.
+    expect(details).not.toHaveProperty("status");
+    expect(details).not.toHaveProperty("previousStatus");
+    // The unconditional "where is it now" field is still reported.
+    expect(details.currentStatus).toBe("blocked");
+    // The blocker edit is still recorded.
+    expect(details.changes).toMatchObject({ blockedByIssueIds: { from: [], to: [blockerId] } });
+    expect((details.changes as Record<string, unknown>).status).toBeUndefined();
+  });
+
+  it("still writes details.status and previousStatus when a PATCH actually changes the status", async () => {
+    // Two-sided pin for a genuine transition must still record the status change,
+    // otherwise the recovery reader would never observe real parks. Guards against an
+    // over-correction that dropped `status` unconditionally.
+    const issue = { ...makeIssue(), status: "todo" };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) =>
+      issueUpdateWithReceipt(issue, patch));
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_progress" });
+
+    expect(res.status).toBe(200);
+    const details = issueUpdatedActivityDetails();
+    expect(details.status).toBe("in_progress");
+    expect(details.previousStatus).toBe("todo");
+    expect(details.currentStatus).toBe("in_progress");
+  });
+
   it("truncates long text receipt values to 200 characters and marks them updated", async () => {
     const issue = {
       ...makeIssue(),

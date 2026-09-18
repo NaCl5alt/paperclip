@@ -145,6 +145,7 @@ import {
   isReviewPathRecoveryIdempotencyConflict,
   REVIEW_PATH_RECOVERY_INSTRUCTION,
 } from "../services/recovery/review-path-recovery.js";
+import { statusChangeActivityFields } from "../services/recovery/blocked-wait.js";
 import { hydrateSuccessfulRunHandoffLiveness } from "../services/successful-run-handoff-state.js";
 import {
   TASK_WATCHDOG_ORIGIN_KIND,
@@ -9506,7 +9507,14 @@ export function issueRoutes(
         entityType: "issue",
         entityId: updated.id,
         details: {
-          ...updateFields,
+          // See the main-path site below: report `status` only on a real change, sourced from the
+          // row-lock receipt (`changes.status`), and strip the requested status from the raw spread
+          // after all `updateFields` mutations.
+          ...(({ status: _requestedStatus, ...rest }) => rest)(updateFields),
+          ...statusChangeActivityFields({
+            previousStatus: (changes.status as { from?: string } | undefined)?.from ?? existing.status,
+            writtenStatus: (changes.status as { to?: string } | undefined)?.to,
+          }),
           identifier: updated.identifier,
           authorizationReason: issueMutationAuthorizationReason,
           changes,
@@ -9789,7 +9797,18 @@ export function issueRoutes(
       entityType: "issue",
       entityId: issue.id,
       details: {
-        ...updateFields,
+        // Strip the requested `status` from the raw spread and re-add it only when the row-lock
+        // receipt shows the status actually changed. `readBlockedResumeHistory` selects park rows
+        // by `details.status === "blocked"`, so a PATCH that re-sends an unchanged `status:"blocked"`
+        // (common when editing blockers) must not fabricate a fresh park. Both the gate and the
+        // reported value come from the receipt (`issueChanges.status`) so they stay self-consistent
+        // even if `existing.status` raced. The rest-spread is taken here, after all `updateFields`
+        // mutations, so the audit payload keeps every other field it carried before.
+        ...(({ status: _requestedStatus, ...rest }) => rest)(updateFields),
+        ...statusChangeActivityFields({
+          previousStatus: (issueChanges.status as { from?: string } | undefined)?.from ?? existing.status,
+          writtenStatus: (issueChanges.status as { to?: string } | undefined)?.to,
+        }),
         identifier: issue.identifier,
         authorizationReason: issueMutationAuthorizationReason,
         changes: issueChanges,
