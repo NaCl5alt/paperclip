@@ -1,0 +1,58 @@
+{
+  "name": "agy-paperclip-adapter",
+  "version": "0.2.1",
+  "description": "Paperclip adapter for agy, the Antigravity CLI \u2014 replaces the deprecated gemini_local lane for personal use",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "paperclip",
+    "paperclip-adapter",
+    "antigravity",
+    "agy",
+    "gemini",
+    "ai-agent",
+    "orchestration"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./ui-parser": "./ui-parser.cjs"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "paperclip": {
+    "adapterUiParser": "1.0.0"
+  },
+  "files": [
+    "dist",
+    "ui-parser.cjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"test/**/*.test.js\"",
+    "verify": "npm run build && npm run test"
+  },
+  "dependencies": {
+    "@paperclipai/adapter-utils": ">=2026.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=24.11.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
