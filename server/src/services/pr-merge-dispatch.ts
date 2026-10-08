@@ -99,7 +99,12 @@ export interface PrMergeDispatchDeps {
   issues: Pick<IssueSvc, "getById" | "addComment">;
   documents: Pick<DocumentSvc, "getIssueDocumentByKey" | "upsertIssueDocument">;
   heartbeat: IssueAssignmentWakeupDeps;
-  logActivity: (input: LogActivityInput) => Promise<void>;
+  /**
+   * Return type is intentionally `unknown`: the dispatcher never reads the result, and upstream
+   * `logActivity` returns the created activity row while the deploy line returns nothing. Pinning
+   * `Promise<void>` here makes this service fail to compile on one base or the other.
+   */
+  logActivity: (input: LogActivityInput) => Promise<unknown>;
   /**
    * Resolves the owning-group manager(s) to escalate an unassigned matched target to (design §6).
    * Automatic assignee selection is intentionally out of scope for Phase 1; when omitted, an
