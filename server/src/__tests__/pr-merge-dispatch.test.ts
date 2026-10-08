@@ -170,6 +170,39 @@ describe("dispatchPrMergeWake", () => {
     expect(mocks.logActivity.mock.calls[0][0].action).toBe("dispatch.pr_merge_ignored_unmerged");
   });
 
+  // A late merge must not resurrect a closed or abandoned target.
+  it.each(["done", "cancelled"])("terminal target (%s): ignored, no comment and no wake", async (status) => {
+    const { deps, mocks } = makeDeps({ issue: makeIssue({ status }) });
+
+    const result = await dispatchPrMergeWake(deps, { targetIssueId, prNaturalKey: baseKey, source: "webhook" });
+
+    expect(result.outcome).toBe("ignored_terminal");
+    expect(mocks.addComment).not.toHaveBeenCalled();
+    expect(mocks.wakeup).not.toHaveBeenCalled();
+    // No writeback: the decision is re-evaluated from scratch on redelivery (same as ignored_unmerged).
+    expect(mocks.upsertIssueDocument).not.toHaveBeenCalled();
+    const auditArg = mocks.logActivity.mock.calls[0][0];
+    expect(auditArg.action).toBe("dispatch.pr_merge_ignored_terminal");
+    expect(auditArg.actorType).toBe("system");
+    expect(auditArg.details).toMatchObject({ outcome: "ignored_terminal", issueStatus: status });
+  });
+
+  it("merged PR with neither mergeCommitSha nor headSha: throws before any mutation", async () => {
+    const { deps, mocks } = makeDeps();
+
+    await expect(
+      dispatchPrMergeWake(deps, {
+        targetIssueId,
+        prNaturalKey: { ...baseKey, mergeCommitSha: null, headSha: null },
+        source: "webhook",
+      }),
+    ).rejects.toThrow(/missing both mergeCommitSha and headSha/);
+
+    expect(mocks.addComment).not.toHaveBeenCalled();
+    expect(mocks.wakeup).not.toHaveBeenCalled();
+    expect(mocks.upsertIssueDocument).not.toHaveBeenCalled();
+  });
+
   it("unmatched: null candidate performs no mutation", async () => {
     const { deps, mocks } = makeDeps();
 

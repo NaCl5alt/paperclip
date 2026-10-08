@@ -15,6 +15,17 @@ import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./is
  * HTTP cross-agent mutation guard (no `req.actor.type === "system"` exception口 is created).
  * Complete Mediation is enforced server-side here: the engine independently re-verifies that the
  * PR record exists on the target's `pr-links` document before performing any wake (Fail Securely).
+ *
+ * Delivery contract: **at-least-once**. The idempotency writeback happens after the comment and the
+ * wake, so if the `processedMergeShas` writeback loses its `baseRevisionId` race (or otherwise
+ * fails), a webhook redelivery re-reads the SHA as unprocessed and wakes a second time. This is the
+ * deliberate trade: a duplicate resume wake is recoverable, a dropped one strands the target. Do not
+ * "fix" it by reserving the SHA before the wake — that converts the failure mode into at-most-once
+ * and silently loses merges.
+ *
+ * Re-verification scope: the assert binds the *target identity* (repo + PR number / URL must exist
+ * on the target's pr-links), not the SHA — `mergeCommitSha`/`headSha` are trusted from the trigger.
+ * Phase 1 accepts this because the webhook path authenticates via HMAC upstream. See finding 3.
  */
 
 export const PR_LINKS_DOCUMENT_KEY = "pr-links";
@@ -29,6 +40,7 @@ export type PrMergeDispatchOutcome =
   | "duplicate"
   | "unmatched"
   | "ignored_unmerged"
+  | "ignored_terminal"
   | "unassigned_escalated";
 
 const OUTCOME_ACTION: Record<PrMergeDispatchOutcome, string> = {
@@ -36,8 +48,19 @@ const OUTCOME_ACTION: Record<PrMergeDispatchOutcome, string> = {
   duplicate: "dispatch.pr_merge_duplicate",
   unmatched: "dispatch.pr_merge_unmatched",
   ignored_unmerged: "dispatch.pr_merge_ignored_unmerged",
+  ignored_terminal: "dispatch.pr_merge_ignored_terminal",
   unassigned_escalated: "dispatch.pr_merge_unassigned_escalated",
 };
+
+/**
+ * A terminal target has nothing left to resume, so a late/stale PR merge must not mutate it.
+ * `queueIssueAssignmentWakeup` only skips `backlog`, and `addComment` does not gate on status, so
+ * without this guard a merged PR would post a system marker comment on — and wake the assignee of —
+ * an issue that was already completed or deliberately abandoned. Resurrecting a `cancelled` issue
+ * from a webhook is the worst case. The design is silent on terminal targets;
+ * this is the Fail Securely reading of it.
+ */
+const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 
 export interface PrNaturalKey {
   repo: string;
@@ -222,6 +245,14 @@ export async function dispatchPrMergeWake(
   if (key.merged !== true) {
     await audit("ignored_unmerged");
     return { outcome: "ignored_unmerged", targetIssueId: issue.id, idempotencyKey: null, escalatedAgentIds: [] };
+  }
+
+  // §3 step1b — a terminal target is never mutated or woken. Audited (not silent) so a merge that
+  // lands after closure is still traceable, and — like `ignored_unmerged` — no writeback happens,
+  // so the decision is re-evaluated from scratch if the same PR is redelivered.
+  if (TERMINAL_ISSUE_STATUSES.has(issue.status)) {
+    await audit("ignored_terminal", { issueStatus: issue.status });
+    return { outcome: "ignored_terminal", targetIssueId: issue.id, idempotencyKey: null, escalatedAgentIds: [] };
   }
 
   const idempotencyKey = key.mergeCommitSha ?? key.headSha ?? null;
